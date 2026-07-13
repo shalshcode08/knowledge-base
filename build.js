@@ -63,6 +63,26 @@ function buildContents(html) {
   );
 }
 
+function extractSections(html) {
+  const re = /<h([23])\s+([^>]*?)>([\s\S]*?)<\/h\1>/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const idMatch = m[2].match(/id="([^"]+)"/);
+    if (!idMatch) continue;
+    const tocMatch = m[2].match(/data-toc="([^"]+)"/);
+    const text = (tocMatch ? tocMatch[1] : m[3].replace(/<span class="num">[\s\S]*?<\/span>/g, ""))
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/\s+/g, " ")
+      .trim();
+    out.push({ text, id: idMatch[1] });
+  }
+  return out;
+}
+
 function buildBreadcrumb(pagePath) {
   const parts = pagePath.split("/");
   const out = [];
@@ -74,44 +94,73 @@ function buildBreadcrumb(pagePath) {
   return out.join("");
 }
 
-function render(pagePath, title, contentHtml) {
-  const prefix = rootPrefix(pagePath);
-  return shell
-    .replace(/\{\{ROOT\}\}/g, prefix)
-    .replace(/\{\{TITLE\}\}/g, title)
-    .replace(/\{\{BREADCRUMB\}\}/g, buildBreadcrumb(pagePath))
-    .replace(/\{\{SIDEBAR\}\}/g, buildSidebar(pagePath, prefix))
-    .replace(/\{\{CONTENT\}\}/g, contentHtml.trim())
-    .replace(/\{\{CONTENTS\}\}/g, buildContents(contentHtml));
+function noteMain(pagePath, prefix, contentHtml) {
+  return (
+    `<div class="overlay" id="overlay"></div>\n` +
+    `    <div class="layout">\n` +
+    `      <aside class="sidebar" id="sidebar" aria-label="Topics">\n` +
+    `${buildSidebar(pagePath, prefix)}\n` +
+    `      </aside>\n` +
+    `      <main class="content">\n` +
+    `        <article class="article">${contentHtml.trim()}</article>\n` +
+    `      </main>\n` +
+    `${buildContents(contentHtml)}\n` +
+    `    </div>`
+  );
 }
 
-function renderIndex() {
+function homeMain() {
   const cards = manifest.topics
     .map((t) => {
       const list = t.pages.length
         ? t.pages.map((p) => `<li><a href="${p.path}.html">${p.title}</a></li>`).join("")
         : `<li class="empty">nothing here yet</li>`;
-      return `<div class="topic-card"><h3>${t.name}</h3><ul>${list}</ul></div>`;
+      return `        <div class="topic-card"><h3>${t.name}</h3><ul>${list}</ul></div>`;
     })
     .join("\n");
-  const content =
-    `<div class="home">\n` +
-    `  <h1>knowledge base</h1>\n` +
-    `  <p class="subtitle">Personal notes on Java, C++, DSA and whatever else is worth writing down.</p>\n` +
-    `  <div class="topic-grid">\n${cards}\n  </div>\n` +
-    `</div>`;
+  return (
+    `<main class="home-main">\n` +
+    `      <div class="home">\n` +
+    `        <img class="home-logo" src="knowledge_base_logo.png" alt="" width="76" height="76" />\n` +
+    `        <h1>knowledge base</h1>\n` +
+    `        <div class="topic-grid">\n${cards}\n        </div>\n` +
+    `      </div>\n` +
+    `    </main>`
+  );
+}
+
+function fill(vars, main) {
   return shell
-    .replace(/\{\{ROOT\}\}/g, "")
-    .replace(/\{\{TITLE\}\}/g, "Home")
-    .replace(/\{\{BREADCRUMB\}\}/g, "")
-    .replace(/\{\{SIDEBAR\}\}/g, buildSidebar(null, ""))
-    .replace(/\{\{CONTENT\}\}/g, content)
-    .replace(/\{\{CONTENTS\}\}/g, "");
+    .replace(/\{\{ROOT\}\}/g, () => vars.root)
+    .replace(/\{\{BODYCLASS\}\}/g, () => vars.bodyClass)
+    .replace(/\{\{TITLE\}\}/g, () => vars.title)
+    .replace(/\{\{BREADCRUMB\}\}/g, () => vars.breadcrumb)
+    .replace(/\{\{MAIN\}\}/g, () => main);
+}
+
+function render(pagePath, title, contentHtml) {
+  const prefix = rootPrefix(pagePath);
+  return fill(
+    { root: prefix, bodyClass: "", title, breadcrumb: buildBreadcrumb(pagePath) },
+    noteMain(pagePath, prefix, contentHtml),
+  );
+}
+
+function renderIndex() {
+  return fill({ root: "", bodyClass: "is-home", title: "Home", breadcrumb: "" }, homeMain());
 }
 
 function copyDir(from, to) {
   if (!fs.existsSync(from)) return;
   fs.cpSync(from, to, { recursive: true });
+}
+
+function walk(dir, base = dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+    const full = path.join(dir, d.name);
+    return d.isDirectory() ? walk(full, base) : [path.relative(base, full)];
+  });
 }
 
 function main() {
@@ -120,6 +169,7 @@ function main() {
 
   let count = 0;
   const seen = new Set();
+  const searchIndex = [];
 
   for (const topic of manifest.topics) {
     for (const page of topic.pages) {
@@ -134,6 +184,12 @@ function main() {
       const outFile = path.join(DIST, page.path + ".html");
       fs.mkdirSync(path.dirname(outFile), { recursive: true });
       fs.writeFileSync(outFile, render(page.path, page.title, content));
+      searchIndex.push({
+        title: page.title,
+        topic: topic.name,
+        path: page.path,
+        sections: extractSections(content),
+      });
       count++;
       console.log(`✓ ${page.path}.html`);
     }
@@ -144,18 +200,12 @@ function main() {
   });
 
   fs.writeFileSync(path.join(DIST, "index.html"), renderIndex());
+  fs.writeFileSync(path.join(DIST, "search-index.json"), JSON.stringify(searchIndex));
   fs.copyFileSync(path.join(SRC, "styles.css"), path.join(DIST, "styles.css"));
+  fs.copyFileSync(path.join(SRC, "search.js"), path.join(DIST, "search.js"));
   copyDir(PUBLIC, DIST);
 
   console.log(`\nBuilt ${count} page(s) + index → dist/`);
-}
-
-function walk(dir, base = dir) {
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
-    const full = path.join(dir, d.name);
-    return d.isDirectory() ? walk(full, base) : [path.relative(base, full)];
-  });
 }
 
 main();

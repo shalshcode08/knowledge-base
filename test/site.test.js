@@ -152,7 +152,11 @@ test("every page has the required shell chrome", () => {
     if (!/<html lang="[^"]+"/.test(html)) problems.push(`${f}: <html> has no lang`);
     if (!/<title>[^<]+<\/title>/.test(html)) problems.push(`${f}: empty or missing <title>`);
     if (!html.includes('class="site-header"')) problems.push(`${f}: missing header`);
-    if (!html.includes('class="sidebar"')) problems.push(`${f}: missing sidebar`);
+    if (f === "index.html") {
+      if (html.includes('class="sidebar"')) problems.push(`${f}: landing must NOT have a sidebar`);
+    } else if (!html.includes('class="sidebar"')) {
+      problems.push(`${f}: missing sidebar`);
+    }
     if ((html.match(/<h1[\s>]/g) || []).length !== 1)
       problems.push(`${f}: must have exactly one <h1>`);
   }
@@ -290,4 +294,58 @@ test("formatting is consistent (prettier)", () => {
         (e.stderr || ""),
     );
   }
+});
+
+test("landing page is sidebar-free and centered", () => {
+  const html = fs.readFileSync(path.join(DIST, "index.html"), "utf8");
+  const problems = [];
+  if (!html.includes('class="home-main"'))
+    problems.push("index.html missing the centered .home-main layout");
+  if (html.includes('class="sidebar"')) problems.push("index.html should not contain a sidebar");
+  if (!html.includes('class="topic-card"')) problems.push("index.html has no topic cards");
+  assertNoProblems("landing", problems);
+});
+
+test("search assets are built and wired into every page", () => {
+  const problems = [];
+  if (!fs.existsSync(path.join(DIST, "search.js"))) problems.push("dist/search.js missing");
+  const idxPath = path.join(DIST, "search-index.json");
+  if (!fs.existsSync(idxPath)) {
+    problems.push("dist/search-index.json missing");
+    return assertNoProblems("search", problems);
+  }
+  let idx;
+  try {
+    idx = JSON.parse(fs.readFileSync(idxPath, "utf8"));
+  } catch (e) {
+    problems.push("search-index.json is not valid JSON: " + e.message);
+    return assertNoProblems("search", problems);
+  }
+  if (!Array.isArray(idx)) problems.push("search-index.json is not an array");
+  const pages = allPagePaths(MANIFEST);
+  if (idx.length !== pages.length)
+    problems.push(`search index has ${idx.length} entries, expected ${pages.length}`);
+  idx.forEach((e) => {
+    if (!e.title || !e.path || !e.topic)
+      problems.push(`search entry ${JSON.stringify(e.path)} missing title/path/topic`);
+    if (!Array.isArray(e.sections)) problems.push(`search entry "${e.path}" has no sections array`);
+  });
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    if (!/<script src="[^"]*search\.js">/.test(html))
+      problems.push(`${f}: does not load search.js`);
+    if (!html.includes('id="searchModal"')) problems.push(`${f}: missing search modal`);
+  }
+  assertNoProblems("search", problems);
+});
+
+test("logo is present and referenced on every page", () => {
+  const problems = [];
+  if (!fs.existsSync(path.join(DIST, "knowledge_base_logo.png")))
+    problems.push("dist/knowledge_base_logo.png missing");
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    if (!/knowledge_base_logo\.png/.test(html)) problems.push(`${f}: does not reference the logo`);
+  }
+  assertNoProblems("logo", problems);
 });
