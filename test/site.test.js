@@ -339,13 +339,17 @@ test("search assets are built and wired into every page", () => {
   assertNoProblems("search", problems);
 });
 
-test("logo is present and referenced on every page", () => {
+test("logo + icons are present and referenced on every page", () => {
   const problems = [];
   if (!fs.existsSync(path.join(DIST, "knowledge_base_logo.png")))
     problems.push("dist/knowledge_base_logo.png missing");
+  if (!fs.existsSync(path.join(DIST, "apple-touch-icon.png")))
+    problems.push("dist/apple-touch-icon.png missing (iOS home-screen icon)");
   for (const f of distHtmlFiles()) {
     const html = fs.readFileSync(path.join(DIST, f), "utf8");
     if (!/knowledge_base_logo\.png/.test(html)) problems.push(`${f}: does not reference the logo`);
+    if (!/rel="apple-touch-icon"/.test(html))
+      problems.push(`${f}: missing apple-touch-icon link (iOS shows a letter without it)`);
   }
-  assertNoProblems("logo", problems);
+  assertNoProblems("logo + icons", problems);
 });
