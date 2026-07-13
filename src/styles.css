@@ -603,23 +603,30 @@ footer.doc-footer {
   }
   .sidebar {
     position: fixed;
-    top: 0;
+    top: var(--header-h);
     left: 0;
     bottom: 0;
     width: 274px;
-    height: 100vh;
+    height: auto;
     z-index: 35;
     background: #fff;
-    padding-top: 20px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px 14px 32px 20px;
     border-right: 1px solid var(--border);
     transform: translateX(-100%);
     transition: transform 0.2s ease;
+  }
+  body.nav-open {
+    overflow: hidden;
   }
   body.nav-open .sidebar {
     transform: translateX(0);
   }
   body.nav-open .overlay {
     display: block;
+    top: var(--header-h);
   }
   .content {
     padding: 24px 22px 64px;
