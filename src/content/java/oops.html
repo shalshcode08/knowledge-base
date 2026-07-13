@@ -1,0 +1,2023 @@
+<h1>OOP in Java — Complete Notes</h1>
+<p class="subtitle">
+  Object-oriented programming explained from scratch in plain language, then taken down to the
+  details that matter in real code and in interviews.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> What OOP actually is</h2>
+<p class="lead">
+  Before any syntax: OOP is just a
+  <em class="term">way of organising code</em> so it mirrors how we naturally think about the world
+  — as things that have properties and can do stuff.
+</p>
+
+<p>
+  Imagine you're describing your car to a friend. You don't list a thousand loose facts. You say:
+  "It's a car. It's red, it's a Honda, it has 40,000 km on it, and it can start, accelerate, and
+  brake." You bundled two things together without thinking about it:
+</p>
+<ul class="clean">
+  <li><strong>Data</strong> — what the car <em>is</em>: colour, brand, kilometres driven.</li>
+  <li><strong>Behaviour</strong> — what the car <em>can do</em>: start, accelerate, brake.</li>
+</ul>
+<p>
+  That bundle — data + the behaviour that works on that data, kept together in one unit —
+  <strong>is an object</strong>. Object-Oriented Programming is simply the idea of building your
+  whole program out of these self-contained bundles instead of one long list of loose commands.
+</p>
+
+<div class="analogy">
+  <p>
+    The old style (<strong>procedural</strong> programming) is like a <strong>recipe</strong>: a
+    long top-to-bottom list of steps and a pile of loose ingredients on the counter. OOP is like a
+    <strong>kitchen full of appliances</strong>: the blender holds its own blades and knows how to
+    blend, the oven holds its own heating element and knows how to bake. You don't manage the blades
+    yourself — you just tell the blender "blend." Each appliance is an object.
+  </p>
+</div>
+
+<h4>Why anyone bothers with it</h4>
+<p>
+  As programs grow past a few hundred lines, loose code becomes a tangled mess where everything can
+  touch everything. OOP gives you four practical wins, and they map exactly onto the four pillars
+  you'll learn below:
+</p>
+<div class="tbl">
+  <table>
+    <tr>
+      <th>You want to…</th>
+      <th>OOP gives you</th>
+      <th>Pillar</th>
+    </tr>
+    <tr>
+      <td>Protect data from being corrupted by accident</td>
+      <td>A wall around each object's internals</td>
+      <td>Encapsulation</td>
+    </tr>
+    <tr>
+      <td>Reuse code instead of copy-pasting it</td>
+      <td>New types built on top of existing ones</td>
+      <td>Inheritance</td>
+    </tr>
+    <tr>
+      <td>Write one piece of code that works for many types</td>
+      <td>The same call behaving correctly per object</td>
+      <td>Polymorphism</td>
+    </tr>
+    <tr>
+      <td>Hide overwhelming complexity behind a simple handle</td>
+      <td>Show the <em>what</em>, hide the <em>how</em></td>
+      <td>Abstraction</td>
+    </tr>
+  </table>
+</div>
+
+<div class="key">
+  <strong>One sentence to remember</strong>
+  <p>
+    OOP = modelling your program as a collection of
+    <strong>objects</strong> (data + behaviour bundled together) that talk to each other by calling
+    each other's methods.
+  </p>
+</div>
+
+<h2 id="class-object">
+  <span class="num">01.</span> Class vs Object — the most important distinction
+</h2>
+<p class="lead">
+  Beginners mix these up constantly. Get this one crystal clear and half of OOP clicks into place.
+</p>
+
+<div class="analogy">
+  <p>
+    A <strong>class</strong> is the <strong>blueprint</strong> for a house. An
+    <strong>object</strong> is an <strong>actual house</strong> built from that blueprint. From one
+    blueprint you can build a whole street of houses — same design, but each with its own address,
+    its own paint colour, its own family living inside. The blueprint isn't a house you can live in;
+    it's the plan. The houses are the real things.
+  </p>
+</div>
+
+<p>
+  So a <em class="term">class</em> defines what something looks like and can do (the template). An
+  <em class="term">object</em> is a concrete, living copy made from that class (also called an
+  <strong>instance</strong>). "Creating an object" is often called <strong>instantiation</strong>.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Car — one blueprint, many cars</b><span class="f">Car.java</span>
+  </figcaption>
+  <pre><code class="language-java">// THE CLASS — the blueprint. This is written once.
+class Car {
+// fields (the data every car has)
+String colour;
+String brand;
+int kilometres;
+
+// a method (behaviour every car can do)
+void describe() {
+    System.out.println(brand + " in " + colour + ", " + kilometres + " km");
+}
+}
+
+public class Main {
+public static void main(String[] args) {
+    // THE OBJECTS — real cars built from the blueprint.
+    Car myCar = new Car();      // object #1
+    myCar.colour = "red";
+    myCar.brand  = "Honda";
+    myCar.kilometres = 40000;
+
+    Car herCar = new Car();     // object #2, totally independent
+    herCar.colour = "blue";
+    herCar.brand  = "Toyota";
+    herCar.kilometres = 12000;
+
+    myCar.describe();   // Honda in red, 40000 km
+    herCar.describe();  // Toyota in blue, 12000 km
+}
+}</code></pre>
+</figure>
+
+<p>
+  Notice <code>myCar</code> and <code>herCar</code> share the <em>same class</em> but hold
+  <em>different data</em>. Changing one never touches the other. That independence is exactly why
+  objects are useful.
+</p>
+
+<div class="note">
+  <strong>Vocabulary you'll hear</strong>
+  <p>
+    <strong>Instance</strong> = object. <strong>Instantiate</strong> = create an object.
+    <strong>Instance variable / field / attribute / property / member variable</strong>
+    = the data inside an object (all roughly the same thing). Interviewers switch between these
+    words freely.
+  </p>
+</div>
+
+<h2 id="members"><span class="num">02.</span> Fields, methods &amp; constructors</h2>
+<p class="lead">
+  The three things you put inside a class. Together they're called the
+  <em class="term">members</em> of the class.
+</p>
+
+<h3>Fields — the object's memory</h3>
+<p>
+  Fields hold the object's state (its data). Each object gets its own copy. In the car example,
+  <code>colour</code>, <code>brand</code> and <code>kilometres</code> are fields.
+</p>
+
+<h3>Methods — the object's actions</h3>
+<p>
+  Methods are functions that live inside a class. They usually work on that object's own fields.
+  <code>describe()</code> above is a method — it reads the object's fields and prints them.
+</p>
+
+<h3>Constructors — the "setup" routine</h3>
+<p>
+  Setting each field one line at a time (like above) is clumsy. A
+  <em class="term">constructor</em> is a special method that runs automatically the moment an object
+  is born, letting you set everything up in one go.
+</p>
+
+<div class="analogy">
+  <p>
+    A constructor is like the
+    <strong>hospital admission form</strong> filled in the second a baby is born — name, date,
+    weight recorded immediately so the baby never exists in an "unfilled" state. Every object gets
+    one at birth.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>A constructor cleans this right up</b><span class="f">Car.java</span>
+  </figcaption>
+  <pre><code class="language-java">class Car {
+String colour;
+String brand;
+int kilometres;
+
+// CONSTRUCTOR: same name as the class, no return type.
+Car(String colour, String brand, int kilometres) {
+    this.colour = colour;          // "this.colour" = the field
+    this.brand = brand;            // "colour" (right side) = the parameter
+    this.kilometres = kilometres;
+}
+
+void describe() {
+    System.out.println(brand + " in " + colour + ", " + kilometres + " km");
+}
+}
+
+// Now creating a fully-set-up car is a single clean line:
+Car myCar = new Car("red", "Honda", 40000);</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Constructor rules</strong>
+  <p>
+    Its name <strong>must match the class name exactly</strong>. It has
+    <strong>no return type</strong> (not even <code>void</code>). If you write no constructor at
+    all, Java quietly gives you a free empty one (the <strong>default constructor</strong>). The
+    moment you write <em>any</em> constructor yourself, that free one disappears.
+  </p>
+</div>
+
+<h2 id="new-this">
+  <span class="num">03.</span> The <code>new</code> and <code>this</code> keywords
+</h2>
+
+<h3><code>new</code> — the "build it" command</h3>
+<p>
+  <code>new Car(...)</code> does two jobs: it carves out memory for a fresh object, then runs the
+  constructor to fill it in. It hands you back a <em class="term">reference</em> — think of it as
+  the object's address or a remote control pointing at that object. The variable
+  <code>myCar</code> doesn't hold the car itself; it holds a pointer to where the car lives.
+</p>
+
+<div class="analogy">
+  <p>
+    A reference variable is a <strong>TV remote</strong>. The remote isn't the TV — it just points
+    at one. If two remotes are paired to the same TV, pressing volume-up on either changes the same
+    screen. Likewise, if two variables reference the same object, changing it through one is visible
+    through the other.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>The classic beginner trap: == vs .equals()</strong>
+  <p>
+    <code>==</code> asks "are these two remotes pointing at the <em>same</em> TV?" (same object in
+    memory). <code>.equals()</code> asks "do these two objects <em>look the same</em>?" (same
+    contents). For text, always compare with <code>a.equals(b)</code>, never <code>a == b</code>.
+    More on this in the <a class="link" href="#object-class">Object class</a> section.
+  </p>
+</div>
+
+<h3><code>this</code> — "the current object"</h3>
+<p>
+  Inside a method or constructor, <code>this</code> means "the specific object I'm running on right
+  now." Its two everyday uses:
+</p>
+<ul class="clean">
+  <li>
+    <strong>Disambiguation:</strong> when a parameter has the same name as a field,
+    <code>this.colour = colour</code> means "set my field to the value passed in." Without
+    <code>this</code>, Java would think you're assigning the parameter to itself.
+  </li>
+  <li>
+    <strong>Constructor chaining:</strong> <code>this(...)</code> lets one constructor call another
+    in the same class (covered under <a class="link" href="#super-this">constructor chaining</a>).
+  </li>
+</ul>
+
+<div class="divider">The Four Pillars</div>
+
+<h2 id="pillars"><span class="num">04.</span> The Four Pillars of OOP</h2>
+<p class="lead">
+  Everything else in OOP is built on these four ideas. If someone asks you "explain OOP," this is
+  the answer. Memory hook: <strong>A PIE</strong> — Abstraction, Polymorphism, Inheritance,
+  Encapsulation.
+</p>
+
+<div class="pillar-grid">
+  <div class="pcard">
+    <div class="pn">PILLAR 1</div>
+    <h4>Encapsulation</h4>
+    <p>
+      Wrap data and its methods together, and hide the internals behind a controlled interface.
+      "Keep your private stuff private."
+    </p>
+  </div>
+  <div class="pcard">
+    <div class="pn">PILLAR 2</div>
+    <h4>Inheritance</h4>
+    <p>
+      Build a new class on top of an existing one, reusing its code. "A child gets the parent's
+      traits, then adds its own."
+    </p>
+  </div>
+  <div class="pcard">
+    <div class="pn">PILLAR 3</div>
+    <h4>Polymorphism</h4>
+    <p>
+      One name, many behaviours — the same call does the right thing for whatever object it lands
+      on. "One interface, many forms."
+    </p>
+  </div>
+  <div class="pcard">
+    <div class="pn">PILLAR 4</div>
+    <h4>Abstraction</h4>
+    <p>
+      Expose only the essentials and hide the messy detail. "You drive with a steering wheel, not
+      the engine internals."
+    </p>
+  </div>
+</div>
+
+<p>
+  Encapsulation and abstraction sound similar and beginners blur them, so here's the clean split:
+  <strong>encapsulation is about <em>hiding data</em></strong> (a how-question: bundle and lock the
+  internals). <strong>Abstraction is about <em>hiding complexity</em></strong> (a what-question:
+  show a simple surface, hide the mechanism). We'll nail the difference when we reach abstraction.
+</p>
+
+<h3 id="encapsulation">Pillar 1 · Encapsulation</h3>
+<div class="analogy pillar">
+  <p>
+    A <strong>medicine capsule</strong> wraps the powder inside a shell — you swallow it without
+    touching the contents, and you can't accidentally spill or tamper with the powder. Or think of
+    an <strong>ATM</strong>: you press buttons on the outside, but the cash, the vault mechanism,
+    and the account database are sealed away. You get a clean, safe interface; the dangerous
+    internals are locked.
+  </p>
+</div>
+
+<p>
+  <em class="term">Encapsulation</em> = bundling an object's data together with the methods that
+  operate on it, then <strong>hiding the data</strong> behind those methods so nobody can reach in
+  and mess with it directly. In Java you do it with two moves:
+</p>
+<ul class="clean">
+  <li>Mark the fields <code>private</code> so outside code cannot touch them.</li>
+  <li>
+    Expose controlled <code>public</code> methods — <strong>getters</strong> (read) and
+    <strong>setters</strong> (write) — that guard access and can enforce rules.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>A bank account that can't go negative</b><span class="f">BankAccount.java</span>
+  </figcaption>
+  <pre><code class="language-java">class BankAccount {
+private double balance;          // hidden — no one outside can touch it directly
+
+public BankAccount(double opening) {
+    this.balance = Math.max(0, opening);
+}
+
+// GETTER: read-only window into the data
+public double getBalance() {
+    return balance;
+}
+
+// SETTER-style methods that ENFORCE THE RULES
+public void deposit(double amount) {
+    if (amount &lt;= 0) throw new IllegalArgumentException("Deposit must be positive");
+    balance += amount;
+}
+
+public void withdraw(double amount) {
+    if (amount &gt; balance) throw new IllegalArgumentException("Insufficient funds");
+    balance -= amount;
+}
+}
+
+// Outside code MUST go through the safe methods:
+BankAccount acc = new BankAccount(500);
+acc.deposit(200);           // ok  -&gt; 700
+acc.withdraw(1000);         // blocked: throws "Insufficient funds"
+// acc.balance = -9999;     // COMPILE ERROR: balance is private. Corruption impossible.</code></pre>
+</figure>
+
+<p>
+  Because <code>balance</code> is private, there is <strong>no way</strong> for buggy or malicious
+  code to set it to a nonsense value. Every change funnels through
+  <code>deposit</code>/<code>withdraw</code>, which enforce the rules. That's the whole point:
+  <strong>you control every entry into your object's state.</strong>
+</p>
+
+<div class="dd">
+  <div class="do">
+    <h5>✓ Why this is good</h5>
+    <ul>
+      <li>Invalid states become impossible to create.</li>
+      <li>
+        You can change how <code>balance</code> is stored later without breaking anyone's code —
+        they only ever saw the methods.
+      </li>
+      <li>Validation, logging, limits all live in one place.</li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h5>✗ Without encapsulation</h5>
+    <ul>
+      <li>A <code>public double balance</code> can be set to anything, anywhere.</li>
+      <li>One typo in some far-off file silently corrupts your data.</li>
+      <li>No single place to add a rule later.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="key">
+  <strong>Interview line</strong>
+  <p>
+    "Encapsulation is data hiding: I make fields <code>private</code> and expose
+    <code>public</code> getters/setters so the class fully controls its own state and can enforce
+    invariants." Bonus: mention it decouples the internal representation from the public API.
+  </p>
+</div>
+
+<h3 id="inheritance">Pillar 2 · Inheritance</h3>
+<div class="analogy pillar">
+  <p>
+    Traits pass down a <strong>family tree</strong>. A child inherits eye colour and height from a
+    parent, then develops their own personality on top. In code, a new class can inherit all the
+    fields and methods of an existing class, keep what fits, and add or change the rest — so you
+    write the shared parts once.
+  </p>
+</div>
+
+<p>
+  <em class="term">Inheritance</em> lets a class (the <strong>subclass</strong> / child) take on the
+  members of another class (the <strong>superclass</strong> / parent) using the
+  <code>extends</code> keyword. The relationship it models is <strong>IS-A</strong>: a
+  <code>Dog</code> IS-A <code>Animal</code>, so <code>Dog</code> extends <code>Animal</code>.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Shared code lives once in the parent</b><span class="f">Animals.java</span>
+  </figcaption>
+  <pre><code class="language-java">// PARENT / superclass
+class Animal {
+protected String name;               // protected: visible to subclasses
+
+Animal(String name) { this.name = name; }
+
+void eat()  { System.out.println(name + " is eating"); }
+void sleep(){ System.out.println(name + " is sleeping"); }
+}
+
+// CHILD / subclass — gets eat() and sleep() for free, adds bark()
+class Dog extends Animal {
+Dog(String name) {
+    super(name);                     // call the parent's constructor first
+}
+void bark() { System.out.println(name + " says woof"); }
+}
+
+Dog d = new Dog("Bruno");
+d.eat();    // inherited from Animal  -&gt; Bruno is eating
+d.sleep();  // inherited from Animal  -&gt; Bruno is sleeping
+d.bark();   // Dog's own method       -&gt; Bruno says woof</code></pre>
+</figure>
+
+<p>
+  <code>Dog</code> never re-declares <code>eat()</code> or <code>sleep()</code> — it just gets them.
+  Write the common behaviour once in <code>Animal</code>; every animal type reuses it. That's the
+  reuse win.
+</p>
+
+<h4>The <code>super</code> keyword</h4>
+<p>
+  <code>super</code> means "the parent." <code>super(name)</code> calls the parent's constructor;
+  <code>super.eat()</code> calls the parent's version of a method you may have overridden. A
+  subclass constructor must call a parent constructor first — if you don't write
+  <code>super(...)</code>, Java inserts a silent <code>super()</code> for you.
+</p>
+
+<h4>Types of inheritance in Java</h4>
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Type</th>
+      <th>Shape</th>
+      <th>Allowed in Java?</th>
+    </tr>
+    <tr>
+      <td><strong>Single</strong></td>
+      <td>B extends A</td>
+      <td class="yes">Yes</td>
+    </tr>
+    <tr>
+      <td><strong>Multilevel</strong></td>
+      <td>C extends B extends A</td>
+      <td class="yes">Yes</td>
+    </tr>
+    <tr>
+      <td><strong>Hierarchical</strong></td>
+      <td>B and C both extend A</td>
+      <td class="yes">Yes</td>
+    </tr>
+    <tr>
+      <td><strong>Multiple (via classes)</strong></td>
+      <td>D extends B and C</td>
+      <td class="no">No — banned</td>
+    </tr>
+    <tr>
+      <td><strong>Multiple (via interfaces)</strong></td>
+      <td>D implements B, C</td>
+      <td class="yes">Yes</td>
+    </tr>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Why Java bans multiple inheritance of classes — the Diamond Problem</strong>
+  <p>
+    If <code>D</code> could extend both <code>B</code> and <code>C</code>, and both provided a
+    method <code>greet()</code> with different code, then <code>d.greet()</code> would be ambiguous
+    — which one runs? This is the "diamond problem." Java sidesteps it: a class extends
+    <strong>at most one</strong> class, but can <strong>implement many interfaces</strong> (which
+    historically carried no conflicting code). You get the flexibility without the ambiguity.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Don't overuse inheritance</strong>
+  <p>
+    Inheritance couples the child tightly to the parent — a change in the parent can silently break
+    every child. A widely-taught rule is
+    <strong>"favour composition over inheritance"</strong>: often it's cleaner for a class to
+    <em>hold</em> another object (HAS-A) than to <em>extend</em> it (IS-A). Only use
+    <code>extends</code> when the child genuinely <em>is a kind of</em> the parent. See
+    <a class="link" href="#relationships">IS-A vs HAS-A</a>.
+  </p>
+</div>
+
+<h3 id="polymorphism">Pillar 3 · Polymorphism</h3>
+<p>
+  <em class="term">Polymorphism</em> literally means "many forms." One method call, written once,
+  produces the <em>right</em> behaviour depending on the actual object it runs against. It comes in
+  two flavours.
+</p>
+
+<div class="analogy pillar">
+  <p>
+    Press the <strong>"play" button</strong> on any remote — a music player plays a song, a video
+    player plays a movie, a slideshow advances a slide. One button, many outcomes, each correct for
+    the device. That's polymorphism: same instruction, appropriate response per object.
+  </p>
+</div>
+
+<h4>a) Compile-time polymorphism — Method Overloading</h4>
+<p>
+  Same method <em>name</em>, different <em>parameter lists</em>, in the same class. The compiler
+  picks which one to run based on the arguments you pass. Decided while compiling → "compile-time"
+  (also "static") polymorphism.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>One name, several signatures</b><span class="f">Calculator.java</span>
+  </figcaption>
+  <pre><code class="language-java">class Calculator {
+int add(int a, int b)            { return a + b; }
+int add(int a, int b, int c)     { return a + b + c; }   // different count
+double add(double a, double b)   { return a + b; }       // different types
+}
+
+Calculator c = new Calculator();
+c.add(2, 3);        // 5     -&gt; picks add(int,int)
+c.add(2, 3, 4);     // 9     -&gt; picks add(int,int,int)
+c.add(2.5, 1.5);    // 4.0   -&gt; picks add(double,double)</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Overloading rule</strong>
+  <p>
+    The methods must differ in
+    <strong>number or type or order of parameters</strong>. Changing <em>only</em> the return type
+    is <strong>not</strong> enough — that won't compile. The parameter list is what distinguishes
+    overloads.
+  </p>
+</div>
+
+<h4>b) Runtime polymorphism — Method Overriding</h4>
+<p>
+  A subclass <em>replaces</em> a method it inherited, giving it new behaviour with the
+  <strong>same signature</strong>. Which version runs is decided at <em>runtime</em>, based on the
+  object's actual type — a mechanism called <strong>dynamic method dispatch</strong>.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Same call, different sound — chosen at runtime</b><span class="f">Sounds.java</span>
+  </figcaption>
+  <pre><code class="language-java">class Animal {
+void speak() { System.out.println("Some generic sound"); }
+}
+class Dog extends Animal {
+@Override
+void speak() { System.out.println("Woof"); }   // overrides parent
+}
+class Cat extends Animal {
+@Override
+void speak() { System.out.println("Meow"); }
+}
+
+// The magic: a parent-typed variable can hold any child object,
+// and the CHILD'S method runs.
+Animal a1 = new Dog();
+Animal a2 = new Cat();
+a1.speak();   // Woof   (not "Some generic sound")
+a2.speak();   // Meow
+
+// This is what makes the loop below "just work" for any future animal:
+Animal[] zoo = { new Dog(), new Cat(), new Animal() };
+for (Animal a : zoo) a.speak();   // Woof, Meow, Some generic sound</code></pre>
+</figure>
+
+<p>
+  The loop is written <em>once</em> against <code>Animal</code>, yet each object responds in its own
+  way. Add a <code>Cow</code> class tomorrow and the loop needs zero changes.
+  <strong>That</strong> is the power interviewers are testing when they ask about polymorphism.
+</p>
+
+<div class="note">
+  <strong>Always write <code>@Override</code></strong>
+  <p>
+    It's an annotation that tells the compiler "I intend to override a parent method." If you
+    mistype the name or get the parameters wrong, the compiler catches it instead of silently
+    creating a brand-new unrelated method. It's optional but every professional uses it.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <tr>
+      <th></th>
+      <th>Overloading</th>
+      <th>Overriding</th>
+    </tr>
+    <tr>
+      <td>Where</td>
+      <td>Same class</td>
+      <td>Parent → child class</td>
+    </tr>
+    <tr>
+      <td>Signature</td>
+      <td>Must <span class="no">differ</span></td>
+      <td>Must be <span class="yes">identical</span></td>
+    </tr>
+    <tr>
+      <td>Resolved</td>
+      <td>Compile time (static)</td>
+      <td>Runtime (dynamic)</td>
+    </tr>
+    <tr>
+      <td>Also called</td>
+      <td>Static / early binding</td>
+      <td>Dynamic / late binding</td>
+    </tr>
+  </table>
+</div>
+
+<h3 id="abstraction">Pillar 4 · Abstraction</h3>
+<div class="analogy pillar">
+  <p>
+    You <strong>drive a car</strong> with a steering wheel, pedals, and a gear stick. You have no
+    idea (and don't need to know) how fuel injection, spark timing, or the transmission actually
+    work. The complexity is hidden behind a simple, stable set of controls. That's abstraction:
+    <strong>show what you can do, hide how it's done.</strong>
+  </p>
+</div>
+
+<p>
+  <em class="term">Abstraction</em> = exposing only the essential features of something and hiding
+  the messy implementation. You define <em>what</em> operations exist without committing to
+  <em>how</em> they work. Java gives you two tools for this: <strong>abstract classes</strong> and
+  <strong>interfaces</strong>.
+</p>
+
+<h4>Abstract classes</h4>
+<p>
+  An <code>abstract</code> class is a half-finished blueprint. It can declare
+  <em class="term">abstract methods</em> — methods with a name but <strong>no body</strong>, a
+  promise that "every real subclass must supply this." You cannot create an object of an abstract
+  class directly; you must extend it and fill in the blanks.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>"Every shape has an area — but each computes it differently"</b
+    ><span class="f">Shapes.java</span>
+  </figcaption>
+  <pre><code class="language-java">abstract class Shape {
+abstract double area();          // no body: a promise, not an implementation
+
+void printArea() {               // a normal, fully-written method (shared)
+    System.out.println("Area = " + area());
+}
+}
+
+class Circle extends Shape {
+double r;
+Circle(double r) { this.r = r; }
+@Override double area() { return Math.PI * r * r; }   // fills in the blank
+}
+
+class Rectangle extends Shape {
+double w, h;
+Rectangle(double w, double h) { this.w = w; this.h = h; }
+@Override double area() { return w * h; }
+}
+
+// Shape s = new Shape();        // COMPILE ERROR: can't instantiate an abstract class
+Shape s = new Circle(5);         // fine — Circle is concrete
+s.printArea();                   // Area = 78.53... (uses Circle's area via polymorphism)</code></pre>
+</figure>
+
+<p>
+  <code>Shape</code> guarantees every shape has an <code>area()</code> and gives them all a free
+  <code>printArea()</code>, but refuses to guess how area is calculated — that's each subclass's
+  job. Callers work with the simple idea "a shape has an area" and never see the formulas.
+</p>
+
+<div class="key">
+  <strong>Encapsulation vs Abstraction — the clean split (asked constantly)</strong>
+  <p>
+    <strong>Encapsulation</strong> hides <em>data</em> (the state) using <code>private</code> +
+    getters/setters — it's about <em>protection</em>. <strong>Abstraction</strong> hides
+    <em>implementation complexity</em> using abstract classes/interfaces — it's about
+    <em>simplicity of the interface</em>. Encapsulation = "how do I lock my data away." Abstraction
+    = "how do I present a simple surface and hide the mechanism." They often work together.
+  </p>
+</div>
+
+<h2 id="abstract-vs-interface"><span class="num">05.</span> Abstract class vs Interface</h2>
+<p class="lead">
+  Both let you achieve abstraction, and interviewers love asking you to compare them. Here's the
+  difference plus when to pick which.
+</p>
+
+<p>
+  An <em class="term">interface</em> is a pure contract: a list of method signatures a class
+  promises to provide. A class <code>implements</code> an interface, then must supply the actual
+  code for every method (unless it's abstract too). Think of it as a
+  <strong>job description</strong> — "to be a Printer, you must be able to <code>print()</code> and
+  <code>scan()</code>" — with no say in <em>how</em> you do them.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>A capability contract</b><span class="f">Payments.java</span>
+  </figcaption>
+  <pre><code class="language-java">interface PaymentMethod {
+void pay(double amount);         // implicitly public + abstract
+boolean isAvailable();
+}
+
+class UpiPayment implements PaymentMethod {
+@Override public void pay(double amount) { System.out.println("Paid " + amount + " via UPI"); }
+@Override public boolean isAvailable() { return true; }
+}
+
+class CardPayment implements PaymentMethod {
+@Override public void pay(double amount) { System.out.println("Charged " + amount + " to card"); }
+@Override public boolean isAvailable() { return true; }
+}
+
+// Code depends only on the CONTRACT, so it works with any payment type — even
+// ones written next year. This is "programming to an interface".
+void checkout(PaymentMethod method, double total) {
+if (method.isAvailable()) method.pay(total);
+}</code></pre>
+</figure>
+
+<p>
+  A class can <code>implements</code> as many interfaces as it likes — that's how Java delivers the
+  benefit of multiple inheritance safely.
+</p>
+
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Aspect</th>
+      <th>Abstract class</th>
+      <th>Interface</th>
+    </tr>
+    <tr>
+      <td>Keyword to use it</td>
+      <td><code>extends</code></td>
+      <td><code>implements</code></td>
+    </tr>
+    <tr>
+      <td>How many at once</td>
+      <td>Only <strong>one</strong> parent</td>
+      <td><strong>Many</strong> at once</td>
+    </tr>
+    <tr>
+      <td>Method bodies</td>
+      <td>Can mix abstract + concrete</td>
+      <td>
+        Traditionally none; since Java 8 allows <code>default</code>/<code>static</code>
+        methods
+      </td>
+    </tr>
+    <tr>
+      <td>Fields</td>
+      <td>Normal instance fields, any state</td>
+      <td>Only <code>public static final</code> constants</td>
+    </tr>
+    <tr>
+      <td>Constructor</td>
+      <td class="yes">Yes</td>
+      <td class="no">No</td>
+    </tr>
+    <tr>
+      <td>Access modifiers on methods</td>
+      <td>Any (public/protected/private)</td>
+      <td>Public by default</td>
+    </tr>
+    <tr>
+      <td>Models</td>
+      <td>An "is-a" with shared code/state</td>
+      <td>A "can-do" capability</td>
+    </tr>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Which one should I use?</strong>
+  <p>
+    Pick an <strong>abstract class</strong> when your subclasses are close relatives that share real
+    code and state (<code>Circle</code>, <code>Rectangle</code> both are Shapes and share
+    <code>printArea()</code>). Pick an <strong>interface</strong> when unrelated classes just need
+    to share a <em>capability</em> (a <code>Bird</code>, a <code>Plane</code>, and a
+    <code>Drone</code> can all <code>Flyable.fly()</code> without being related). Modern Java design
+    leans heavily on interfaces.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Java 8+ changed interfaces</strong>
+  <p>
+    Interfaces can now have <code>default</code> methods (with a body, so you can add new methods to
+    an interface without breaking existing implementers) and <code>static</code> methods. This
+    blurred the old line a bit — but the core distinction (state + single inheritance vs capability
+    + multiple inheritance) still holds.
+  </p>
+</div>
+
+<div class="divider">Essential mechanics</div>
+
+<h2 id="overload-override">
+  <span class="num">06.</span> Overloading vs Overriding — settle it forever
+</h2>
+<p class="lead">
+  The single most confused pair in Java interviews. You already saw both under polymorphism; here's
+  the side-by-side you can recite.
+</p>
+<p>Different names, one letter apart, opposite meanings:</p>
+<ul class="clean">
+  <li>
+    <strong>Overload</strong> = <em>same class</em>, <em>same method name</em>,
+    <em>different parameters</em>. It's about offering convenient variants of one operation. Chosen
+    by the compiler.
+  </li>
+  <li>
+    <strong>Override</strong> = <em>child class</em> replaces a <em>parent's method</em> with the
+    <em>same signature</em>. It's about changing inherited behaviour. Chosen at runtime by the
+    object's real type.
+  </li>
+</ul>
+<div class="key">
+  <strong>Mnemonic</strong>
+  <p>
+    <strong>Overl<u>oad</u></strong> → "l<u>oad</u> up more parameters" (same class, more variants).
+    <strong>Over<u>ride</u></strong> → "<u>ride</u>
+    over the parent's version" (replace inherited behaviour).
+  </p>
+</div>
+
+<h2 id="static-final">
+  <span class="num">07.</span> The <code>static</code> and <code>final</code> keywords
+</h2>
+
+<h3><code>static</code> — belongs to the class, not to any object</h3>
+<p>
+  A normal (instance) field gives every object its own copy. A
+  <code>static</code> field is shared by <strong>all</strong> objects — there's exactly one copy
+  living on the class itself.
+</p>
+<div class="analogy">
+  <p>
+    Think of a school. Each student has their own
+    <strong>roll number</strong> (instance field — one per object). But the
+    <strong>school's name</strong> is the same for everyone (static field — one shared copy). You'd
+    also count <strong>total students</strong> once for the whole school, not per student — a
+    perfect static counter.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Shared vs per-object</b><span class="f">Student.java</span>
+  </figcaption>
+  <pre><code class="language-java">class Student {
+static String school = "Delhi Public School";  // shared by ALL students
+static int totalStudents = 0;                   // one shared counter
+String name;                                    // each student their own
+
+Student(String name) {
+    this.name = name;
+    totalStudents++;                            // bumps the single shared count
+}
+
+static int getTotal() { return totalStudents; } // static method: no object needed
+}
+
+new Student("Asha");
+new Student("Ravi");
+System.out.println(Student.getTotal());   // 2   -&gt; called on the CLASS, not an object
+System.out.println(Student.school);       // Delhi Public School</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Static method limitation</strong>
+  <p>
+    A <code>static</code> method belongs to the class, so it has
+    <strong>no <code>this</code></strong> — it can't touch instance fields directly (there's no
+    specific object to read them from). That's why <code>main</code> is <code>static</code>: the JVM
+    runs it before any object exists. Use static for utility functions and shared data; use instance
+    methods for per-object behaviour.
+  </p>
+</div>
+
+<h3><code>final</code> — "this cannot change"</h3>
+<div class="tbl">
+  <table>
+    <tr>
+      <th><code>final</code> on a…</th>
+      <th>Meaning</th>
+    </tr>
+    <tr>
+      <td><strong>variable</strong></td>
+      <td>
+        Value can be assigned once, then never reassigned → a constant. E.g.
+        <code>final double PI = 3.14159;</code>
+      </td>
+    </tr>
+    <tr>
+      <td><strong>method</strong></td>
+      <td>Subclasses cannot override it. Locks the behaviour.</td>
+    </tr>
+    <tr>
+      <td><strong>class</strong></td>
+      <td>
+        Nobody can extend it. E.g. Java's <code>String</code> is <code>final</code> — that's part of
+        why it's safe and unchangeable.
+      </td>
+    </tr>
+  </table>
+</div>
+
+<h2 id="super-this">
+  <span class="num">08.</span> <code>super</code>, <code>this</code> &amp; constructor chaining
+</h2>
+<p class="lead">
+  How objects get built up through an inheritance chain — and how constructors call each other.
+</p>
+
+<p>
+  <code>this(...)</code> calls <strong>another constructor in the same class</strong>.
+  <code>super(...)</code> calls the <strong>parent's constructor</strong>. Both must be the very
+  first statement in a constructor (so you can only use one of them, at the top).
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Chaining, top to bottom</b><span class="f">Chaining.java</span>
+  </figcaption>
+  <pre><code class="language-java">class Vehicle {
+String type;
+Vehicle(String type) {
+    this.type = type;
+    System.out.println("Vehicle built: " + type);
+}
+}
+
+class Car extends Vehicle {
+int wheels;
+
+Car() {
+    this("Sedan");                 // calls the OTHER Car constructor below
+}
+Car(String model) {
+    super("Car");                  // calls Vehicle's constructor FIRST
+    this.wheels = 4;
+    System.out.println("Car built: " + model);
+}
+}
+
+new Car();
+// Output order shows the chain runs parent-first:
+//   Vehicle built: Car
+//   Car built: Sedan</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Order of construction</strong>
+  <p>
+    When you build a child, the parent is always fully constructed
+    <em>first</em> (top of the family tree downward). That's why a <code>super(...)</code> call —
+    implicit or explicit — always happens before the child's own constructor body runs.
+  </p>
+</div>
+
+<h2 id="access"><span class="num">09.</span> Access modifiers — who can see what</h2>
+<p class="lead">
+  These four keywords control the visibility of every field, method, and class. They're the
+  enforcement mechanism behind encapsulation.
+</p>
+
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Modifier</th>
+      <th>Same class</th>
+      <th>Same package</th>
+      <th>Subclass (other pkg)</th>
+      <th>Anywhere</th>
+    </tr>
+    <tr>
+      <td><code>private</code></td>
+      <td class="yes">✓</td>
+      <td class="no">✗</td>
+      <td class="no">✗</td>
+      <td class="no">✗</td>
+    </tr>
+    <tr>
+      <td><em>(default / package-private)</em></td>
+      <td class="yes">✓</td>
+      <td class="yes">✓</td>
+      <td class="no">✗</td>
+      <td class="no">✗</td>
+    </tr>
+    <tr>
+      <td><code>protected</code></td>
+      <td class="yes">✓</td>
+      <td class="yes">✓</td>
+      <td class="yes">✓</td>
+      <td class="no">✗</td>
+    </tr>
+    <tr>
+      <td><code>public</code></td>
+      <td class="yes">✓</td>
+      <td class="yes">✓</td>
+      <td class="yes">✓</td>
+      <td class="yes">✓</td>
+    </tr>
+  </table>
+</div>
+
+<p>Plain-English version, from most locked to most open:</p>
+<ul class="clean">
+  <li><code>private</code> — only inside this class. Your default for fields.</li>
+  <li><strong>default</strong> (write nothing) — visible within the same package only.</li>
+  <li>
+    <code>protected</code> — same package, plus subclasses anywhere. Good for members meant for
+    child classes.
+  </li>
+  <li>
+    <code>public</code> — visible to the entire world. Your default for the methods that form the
+    class's public API.
+  </li>
+</ul>
+<div class="key">
+  <strong>Rule of thumb</strong>
+  <p>
+    Make fields <code>private</code> and methods as private as they can be while still doing their
+    job. Expose the minimum. It's far easier to open access up later than to take it away once other
+    code depends on it.
+  </p>
+</div>
+
+<h2 id="object-class">
+  <span class="num">10.</span> The <code>Object</code> class — the ancestor of everything
+</h2>
+<p class="lead">
+  Every class in Java secretly extends <code>Object</code>. So every object you ever make inherits a
+  handful of methods worth knowing — and two you'll frequently override.
+</p>
+
+<p>
+  Even if you write <code>class Car {}</code> with no <code>extends</code>, Java treats it as
+  <code>class Car extends Object</code>. That's why every object already has methods like
+  <code>toString()</code>, <code>equals()</code>, and <code>hashCode()</code>. Three that matter in
+  daily code:
+</p>
+
+<h4><code>toString()</code> — a readable text version of your object</h4>
+<p>
+  By default it prints something ugly like <code>Car@1b6d3586</code> (class name + memory hash).
+  Override it to print something useful.
+</p>
+
+<h4><code>equals()</code> and <code>hashCode()</code> — "are two objects meaningfully equal?"</h4>
+<p>
+  By default <code>equals()</code> behaves like <code>==</code> (same object in memory). Usually you
+  want "same <em>contents</em> count as equal" — two <code>Point(2,3)</code> objects should be equal
+  even though they're separate objects. You override <code>equals()</code> to define that.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Value equality, done properly</b><span class="f">Point.java</span>
+  </figcaption>
+  <pre><code class="language-java">import java.util.Objects;
+
+class Point {
+private final int x, y;
+Point(int x, int y) { this.x = x; this.y = y; }
+
+@Override
+public String toString() {           // readable output
+    return "Point(" + x + ", " + y + ")";
+}
+
+@Override
+public boolean equals(Object o) {    // same contents =&gt; equal
+    if (this == o) return true;
+    if (!(o instanceof Point)) return false;
+    Point p = (Point) o;
+    return x == p.x &amp;&amp; y == p.y;
+}
+
+@Override
+public int hashCode() {              // MUST match equals (see rule below)
+    return Objects.hash(x, y);
+}
+}
+
+Point a = new Point(2, 3);
+Point b = new Point(2, 3);
+System.out.println(a == b);        // false  -&gt; different objects in memory
+System.out.println(a.equals(b));   // true   -&gt; same contents
+System.out.println(a);             // Point(2, 3)  -&gt; toString() kicks in</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>The equals/hashCode contract (a favourite trick question)</strong>
+  <p>
+    If you override <code>equals()</code>, you <strong>must</strong> override
+    <code>hashCode()</code> too, and the rule is:
+    <em>equal objects must have equal hash codes.</em> Break this and hash-based collections
+    (<code>HashMap</code>, <code>HashSet</code>) misbehave — your object can "vanish" inside a
+    <code>HashSet</code> because it's looked up by hash first. Always override both together.
+  </p>
+</div>
+
+<h2 id="relationships"><span class="num">11.</span> IS-A vs HAS-A — inheritance vs composition</h2>
+<p class="lead">
+  Objects relate to each other in two fundamental ways. Knowing which to reach for is a real design
+  skill, not just trivia.
+</p>
+
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Relationship</th>
+      <th>Question</th>
+      <th>Java tool</th>
+      <th>Example</th>
+    </tr>
+    <tr>
+      <td><strong>IS-A</strong></td>
+      <td>Is X a kind of Y?</td>
+      <td>Inheritance (<code>extends</code>/<code>implements</code>)</td>
+      <td>A Dog IS-A Animal</td>
+    </tr>
+    <tr>
+      <td><strong>HAS-A</strong></td>
+      <td>Does X contain/use a Y?</td>
+      <td>Composition (a field)</td>
+      <td>A Car HAS-A Engine</td>
+    </tr>
+  </table>
+</div>
+
+<p>
+  <strong>HAS-A</strong> (composition) means one object holds another as a field. It splits into two
+  shades:
+</p>
+<ul class="clean">
+  <li>
+    <strong>Aggregation</strong> — a "has-a" where the part can live on its own. A
+    <code>Team</code> has <code>Player</code>s, but players still exist if the team disbands.
+    Loosely bound.
+  </li>
+  <li>
+    <strong>Composition</strong> — a strong "owns-a" where the part can't meaningfully exist without
+    the whole. A <code>House</code> is composed of <code>Room</code>s; destroy the house and the
+    rooms go with it. Tightly bound.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption>
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span
+    ><b>Composition: a Car HAS-A Engine</b><span class="f">Composition.java</span>
+  </figcaption>
+  <pre><code class="language-java">class Engine {
+void start() { System.out.println("Engine roars to life"); }
+}
+
+class Car {
+private final Engine engine = new Engine();   // Car HAS-A Engine
+
+void drive() {
+    engine.start();                           // delegate to the part it owns
+    System.out.println("Car moves");
+}
+}
+// Car reuses Engine's behaviour WITHOUT inheriting from it. Swap in a different
+// Engine later and nothing else breaks. This flexibility is why designers say:</code></pre>
+</figure>
+
+<div class="key">
+  <strong>"Favour composition over inheritance"</strong>
+  <p>
+    Inheritance is rigid — the child is permanently welded to the parent's design, and deep
+    hierarchies get brittle. Composition is flexible — you assemble behaviour from swappable parts.
+    Reach for inheritance only when there's a true IS-A relationship; otherwise prefer HAS-A. This
+    is one of the most repeated pieces of design wisdom in OOP.
+  </p>
+</div>
+
+<h2 id="solid"><span class="num">12.</span> SOLID — the five design principles</h2>
+<p class="lead">
+  Once you're comfortable with the pillars, SOLID is the next level: five guidelines for writing OOP
+  code that stays clean as it grows. Interviewers for anything beyond junior level expect at least a
+  one-line grasp of each.
+</p>
+
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Letter</th>
+      <th>Principle</th>
+      <th>Plain meaning</th>
+    </tr>
+    <tr>
+      <td><strong>S</strong></td>
+      <td>Single Responsibility</td>
+      <td>
+        A class should do one job and have one reason to change. Don't make a class that parses
+        files <em>and</em> emails users <em>and</em> talks to the database.
+      </td>
+    </tr>
+    <tr>
+      <td><strong>O</strong></td>
+      <td>Open/Closed</td>
+      <td>
+        Open for extension, closed for modification. Add new behaviour by adding new code (new
+        subclass/implementation), not by editing working code.
+      </td>
+    </tr>
+    <tr>
+      <td><strong>L</strong></td>
+      <td>Liskov Substitution</td>
+      <td>
+        A subclass must be usable anywhere its parent is, without surprises. If
+        <code>Square extends Rectangle</code> breaks code that expected a Rectangle, you've violated
+        it.
+      </td>
+    </tr>
+    <tr>
+      <td><strong>I</strong></td>
+      <td>Interface Segregation</td>
+      <td>
+        Prefer many small, focused interfaces over one giant one. Don't force a class to implement
+        methods it doesn't need.
+      </td>
+    </tr>
+    <tr>
+      <td><strong>D</strong></td>
+      <td>Dependency Inversion</td>
+      <td>
+        Depend on abstractions (interfaces), not concrete classes. Your
+        <code>checkout()</code> should take a <code>PaymentMethod</code>, not a specific
+        <code>UpiPayment</code>.
+      </td>
+    </tr>
+  </table>
+</div>
+<p>
+  You don't need to master these on day one — but recognising the names and giving a one-sentence
+  explanation each will noticeably lift how senior you sound.
+</p>
+
+<div class="divider">Where Java surprises you</div>
+
+<h2 id="gotchas"><span class="num">13.</span> Gotchas — OOP behaving unintuitively in Java</h2>
+<p class="lead">
+  Everything above is OOP as a concept. This section is OOP as Java
+  <em>actually implements it</em> — the eight places where the rules bend and where "what does this
+  print?" questions come from. This is the gap between having read a tutorial and having written
+  Java.
+</p>
+
+<h3 id="g-pass-by-value">1 · Java is always pass-by-value — even for objects</h3>
+<p>
+  People say "Java passes objects by reference." That is wrong, and the confusion causes real bugs.
+  Java <strong>always</strong> passes by value. The subtlety: for an object, the
+  <em>value being copied is the reference</em> (the remote control), not the object itself.
+</p>
+<p>
+  So the method gets its own copy of the remote. It can use that remote to change the TV (visible to
+  the caller). But if it swaps its remote for a different TV, the caller's remote still points at
+  the original.
+</p>
+
+<figure class="code">
+  <figcaption><b>Mutate: yes. Reassign: no.</b></figcaption>
+  <pre><code>class Box { int value; }
+
+static void mutate(Box b)   { b.value = 99; }      // changes the SAME object
+static void reassign(Box b) { b = new Box(); b.value = 42; }  // points local copy elsewhere
+static void bump(int n)     { n = 100; }           // primitive: pure copy
+
+Box box = new Box();
+box.value = 1;
+int num = 1;
+
+mutate(box);    System.out.println(box.value);  // 99  -&gt; caller SEES the change
+reassign(box);  System.out.println(box.value);  // 99  -&gt; NOT 42. reassignment was local.
+bump(num);      System.out.println(num);        // 1   -&gt; primitives never change</code></pre>
+</figure>
+
+<div class="key">
+  <strong>How to say it in an interview</strong>
+  <p>
+    "Java is strictly pass-by-value. For reference types, the reference itself is copied — so a
+    method can mutate the object it points to, but reassigning the parameter has no effect on the
+    caller."
+  </p>
+</div>
+
+<h3 id="g-field-hiding">2 · Fields are NOT polymorphic (field hiding)</h3>
+<p>
+  Methods are dispatched at runtime based on the object's
+  <em>real</em> type. Fields are not — they are resolved at compile time based on the
+  <em>reference</em> type. Redeclaring a field in a subclass doesn't override it; it
+  <strong>hides</strong> it, and both copies exist.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <b>Same object, two answers, depending on the reference type</b>
+  </figcaption>
+  <pre><code>class Parent {
+String name = "Parent";
+String getName() { return name; }
+}
+class Child extends Parent {
+String name = "Child";                      // HIDES, does not override
+@Override String getName() { return name; } // this DOES override
+}
+
+Parent p = new Child();     // parent reference, child object
+System.out.println(p.name);        // "Parent"  &lt;- field: reference type wins
+System.out.println(p.getName());   // "Child"   &lt;- method: object type wins
+System.out.println(((Child) p).name); // "Child" &lt;- cast changes which field you see</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Practical takeaway</strong>
+  <p>
+    Never redeclare a parent's field in a child. It's legal, it's confusing, and it is almost always
+    a bug. Keep fields <code>private</code> and this problem disappears entirely.
+  </p>
+</div>
+
+<h3 id="g-static-hiding">
+  3 · <code>static</code>, <code>private</code> and <code>final</code> methods cannot be overridden
+</h3>
+<p>Only instance methods participate in runtime polymorphism. Three exceptions:</p>
+<ul class="clean">
+  <li>
+    <strong><code>static</code> methods</strong> — redeclaring one in a child is
+    <em>method hiding</em>, not overriding. Which one runs is decided by the reference type at
+    compile time.
+  </li>
+  <li>
+    <strong><code>private</code> methods</strong> — invisible to the subclass, so a same-named
+    method there is just a brand-new unrelated method.
+  </li>
+  <li>
+    <strong><code>final</code> methods</strong> — explicitly locked; the compiler rejects any
+    attempt to override.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption>
+    <b>Method hiding vs method overriding, side by side</b>
+  </figcaption>
+  <pre><code>class Parent {
+static void hello()    { System.out.println("static Parent"); }
+void greet()           { System.out.println("instance Parent"); }
+}
+class Child extends Parent {
+static void hello()    { System.out.println("static Child"); }   // HIDES
+@Override void greet() { System.out.println("instance Child"); } // OVERRIDES
+}
+
+Parent p = new Child();
+p.hello();   // "static Parent"    &lt;- hiding: chosen by the REFERENCE type
+p.greet();   // "instance Child"   &lt;- overriding: chosen by the OBJECT type</code></pre>
+</figure>
+
+<h3 id="g-override-rules">4 · The full overriding rules (not just "same signature")</h3>
+<p>An override must satisfy more than a matching name and parameters:</p>
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Rule</th>
+      <th>Detail</th>
+    </tr>
+    <tr>
+      <td>Same signature</td>
+      <td>
+        Name and parameter list must match exactly. Different params = overloading, not overriding.
+      </td>
+    </tr>
+    <tr>
+      <td>Return type</td>
+      <td>
+        Same, <strong>or a subtype</strong> — this is called a <em>covariant return type</em> and is
+        allowed. <code>Animal reproduce()</code> in the parent can become
+        <code>Dog reproduce()</code> in the child.
+      </td>
+    </tr>
+    <tr>
+      <td>Access modifier</td>
+      <td>
+        Cannot be <strong>more restrictive</strong>. A <code>public</code> method cannot become
+        <code>protected</code>. It <em>can</em> get wider.
+      </td>
+    </tr>
+    <tr>
+      <td>Checked exceptions</td>
+      <td>
+        Cannot throw <strong>new or broader</strong> checked exceptions. Narrower or fewer is fine.
+        Unchecked exceptions are unrestricted.
+      </td>
+    </tr>
+    <tr>
+      <td>Static / final / private</td>
+      <td>Cannot be overridden at all (see above).</td>
+    </tr>
+  </table>
+</div>
+<p>
+  The logic behind all of these is one idea:
+  <strong>a subclass must never break code written against the parent.</strong>
+  If the parent promised <code>public</code>, the child can't take that away. That's the Liskov
+  Substitution Principle enforced by the compiler.
+</p>
+
+<h3 id="g-casting">5 · Upcasting, downcasting and <code>ClassCastException</code></h3>
+<p>
+  <strong>Upcasting</strong> (child → parent) is always safe and automatic — a Dog <em>is</em> an
+  Animal. <strong>Downcasting</strong> (parent → child) is you telling the compiler "trust me, this
+  really is a Dog." If you're wrong, it blows up at runtime.
+</p>
+
+<figure class="code">
+  <figcaption><b>Cast defensively with instanceof</b></figcaption>
+  <pre><code>Animal a = new Dog();      // UPCAST — implicit, always safe
+
+// a.bark();               // won't compile: Animal has no bark()
+Dog d = (Dog) a;           // DOWNCAST — explicit, works because it really is a Dog
+d.bark();                  // now fine
+
+Animal cat = new Cat();
+Dog wrong = (Dog) cat;     // compiles, but throws ClassCastException at RUNTIME
+
+// The safe way — check first:
+if (cat instanceof Dog) {
+((Dog) cat).bark();
+}
+
+// Java 16+ pattern matching does the check and cast in one step:
+if (cat instanceof Dog dog) {
+dog.bark();            // "dog" is already typed and ready
+}</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Why upcasting is the useful one</strong>
+  <p>
+    Upcasting is what makes polymorphism work —
+    <code>Animal a = new Dog()</code> lets you write code against the general type. Needing to
+    downcast frequently is often a design smell: it means you're fighting your own abstraction.
+  </p>
+</div>
+
+<h3 id="g-init-order">6 · Initialization order (the classic "what does this print?")</h3>
+<p>
+  When an object is created, things run in a strict, non-obvious order. Statics run
+  <strong>once</strong>, ever, when the class first loads. Everything else runs per object,
+  parent-first.
+</p>
+
+<figure class="code">
+  <figcaption>
+    <b>Trace the output — this is the whole puzzle</b>
+  </figcaption>
+  <pre><code>class Parent {
+static { System.out.println("1. Parent static block"); }
+{ System.out.println("3. Parent instance block"); }
+Parent() { System.out.println("4. Parent constructor"); }
+}
+class Child extends Parent {
+static { System.out.println("2. Child static block"); }
+{ System.out.println("5. Child instance block"); }
+Child() { System.out.println("6. Child constructor"); }
+}
+
+new Child();
+new Child();   // second time: statics do NOT run again</code></pre>
+</figure>
+
+<p>Output:</p>
+<figure class="code">
+  <figcaption><b>Output</b></figcaption>
+  <pre><code>1. Parent static block      &lt;-- statics first, parent before child, ONCE only
+2. Child static block
+3. Parent instance block    &lt;-- then per-object: parent fully built first
+4. Parent constructor
+5. Child instance block
+6. Child constructor
+3. Parent instance block    &lt;-- second object: no static blocks this time
+4. Parent constructor
+5. Child instance block
+6. Child constructor</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The rule in one line</strong>
+  <p>
+    Static blocks (parent → child, once) → then for each object: instance blocks + constructor,
+    parent fully completed before the child's body runs.
+  </p>
+</div>
+
+<h3 id="g-immutable">7 · Building a genuinely immutable class</h3>
+<p>
+  An <em class="term">immutable</em> object can never change after construction. This makes it
+  automatically thread-safe, safe to share, and safe as a <code>HashMap</code> key.
+  <code>String</code> is the famous example — that's why <code>s.toUpperCase()</code> returns a
+  <em>new</em> string rather than modifying <code>s</code>.
+</p>
+<p>Making one is a recipe with a hidden step people miss:</p>
+<ul class="clean">
+  <li>Mark the class <code>final</code> so nobody can subclass it and add mutable behaviour.</li>
+  <li>Make every field <code>private final</code>.</li>
+  <li>Provide no setters — only getters.</li>
+  <li>
+    <strong>The step people forget:</strong> if a field is itself mutable (a <code>List</code>, a
+    <code>Date</code>, an array), take a <strong>defensive copy</strong> both when storing it
+    <em>and</em> when returning it. Otherwise the caller still holds a reference to your internals
+    and can mutate them behind your back.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption>
+    <b>Defensive copies are what make it truly immutable</b>
+  </figcaption>
+  <pre><code>import java.util.*;
+
+final class Person {                          // 1. final class
+private final String name;                // 2. private final fields
+private final List&lt;String&gt; hobbies;
+
+Person(String name, List&lt;String&gt; hobbies) {
+    this.name = name;
+    this.hobbies = new ArrayList&lt;&gt;(hobbies);   // 4a. copy IN
+}
+
+public String getName() { return name; }       // 3. getters only, no setters
+
+public List&lt;String&gt; getHobbies() {
+    return new ArrayList&lt;&gt;(hobbies);           // 4b. copy OUT
+    // Or: return Collections.unmodifiableList(hobbies);
+}
+}
+
+List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("chess"));
+Person p = new Person("Asha", list);
+
+list.add("hacking");             // caller mutates their original list
+p.getHobbies().add("hacking");   // caller mutates the copy they were handed
+System.out.println(p.getHobbies());   // [chess]  -&gt; the Person is untouched. </code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Without the defensive copies</strong>
+  <p>
+    If the constructor did <code>this.hobbies = hobbies;</code> and the getter did
+    <code>return hobbies;</code>, both lines above would have corrupted the "immutable" object. The
+    <code>final</code> keyword only stops the <em>reference</em> from being reassigned — it does
+    nothing to stop the <em>contents</em> of the list from being changed.
+  </p>
+</div>
+
+<h3 id="g-copy">8 · Shallow vs deep copy</h3>
+<p>
+  Directly related to the above. When you copy an object that holds references to other objects, the
+  question is whether you copied the references or the things they point to.
+</p>
+<div class="tbl">
+  <table>
+    <tr>
+      <th></th>
+      <th>Shallow copy</th>
+      <th>Deep copy</th>
+    </tr>
+    <tr>
+      <td>What's duplicated</td>
+      <td>The outer object only; nested objects are <strong>shared</strong></td>
+      <td>The outer object <strong>and</strong> everything it references, recursively</td>
+    </tr>
+    <tr>
+      <td>Effect</td>
+      <td>Mutating a nested object through one copy is visible in the other</td>
+      <td>The two copies are fully independent</td>
+    </tr>
+    <tr>
+      <td>In Java</td>
+      <td>
+        Default <code>clone()</code> behaviour; a copy-constructor that just assigns references
+      </td>
+      <td>You must copy each nested object yourself</td>
+    </tr>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>The bug shallow copies cause</b></figcaption>
+  <pre><code>class Address { String city; Address(String c) { city = c; } }
+
+class User {
+String name;
+Address address;
+
+User shallowCopy() {
+    User u = new User();
+    u.name = this.name;
+    u.address = this.address;              // SHARED reference — danger
+    return u;
+}
+
+User deepCopy() {
+    User u = new User();
+    u.name = this.name;
+    u.address = new Address(this.address.city);   // brand-new Address
+    return u;
+}
+}
+
+User original = new User();
+original.name = "Asha";
+original.address = new Address("Ranchi");
+
+User shallow = original.shallowCopy();
+shallow.address.city = "Delhi";
+System.out.println(original.address.city);   // "Delhi"  &lt;- the original CHANGED!
+
+User deep = original.deepCopy();
+deep.address.city = "Mumbai";
+System.out.println(original.address.city);   // "Delhi"  &lt;- original safe</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Note on <code>clone()</code></strong>
+  <p>
+    Java's built-in <code>Object.clone()</code> is shallow by default and widely considered a poorly
+    designed API (you must implement <code>Cloneable</code>, handle a checked exception, and cast
+    the result). Most modern Java code avoids it in favour of a
+    <strong>copy constructor</strong> (<code>new User(existingUser)</code>) or a static factory. If
+    asked, know what <code>clone()</code> does — but say you'd prefer a copy constructor.
+  </p>
+</div>
+
+<h3 id="g-summary">Gotcha summary</h3>
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Trap</th>
+      <th>The truth</th>
+    </tr>
+    <tr>
+      <td>"Objects are passed by reference"</td>
+      <td>No — always pass-by-value; the <em>reference</em> is what gets copied.</td>
+    </tr>
+    <tr>
+      <td>"Redeclaring a field overrides it"</td>
+      <td>No — it <em>hides</em> it. Fields resolve by reference type, methods by object type.</td>
+    </tr>
+    <tr>
+      <td>"Any method can be overridden"</td>
+      <td>
+        No — <code>static</code> (hidden), <code>private</code> (invisible),
+        <code>final</code> (locked).
+      </td>
+    </tr>
+    <tr>
+      <td>"Override just needs a matching signature"</td>
+      <td>Also: covariant return allowed, access can't shrink, no broader checked exceptions.</td>
+    </tr>
+    <tr>
+      <td>"A cast that compiles will work"</td>
+      <td>
+        No — downcasting fails at runtime with
+        <code>ClassCastException</code>. Guard with <code>instanceof</code>.
+      </td>
+    </tr>
+    <tr>
+      <td>"Constructors run first"</td>
+      <td>
+        No — static blocks, then instance blocks, then constructor; parent fully before child.
+      </td>
+    </tr>
+    <tr>
+      <td>"<code>final</code> makes it immutable"</td>
+      <td>
+        No — <code>final</code> locks the reference, not the contents. Defensive copies are
+        required.
+      </td>
+    </tr>
+    <tr>
+      <td>"A copy is a copy"</td>
+      <td>No — a shallow copy shares nested objects. Deep-copy when independence matters.</td>
+    </tr>
+  </table>
+</div>
+
+<div class="divider">Lock it in</div>
+
+<h2 id="interview"><span class="num">14.</span> Interview Q&amp;A &amp; common gotchas</h2>
+<p class="lead">Rapid-fire answers to the questions that come up again and again.</p>
+
+<div class="qa">
+  <p class="q">What are the four pillars of OOP?</p>
+  <p class="a">
+    Abstraction, Polymorphism, Inheritance, Encapsulation (A PIE). Be ready to define each in one
+    sentence and give a code example.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Difference between encapsulation and abstraction?</p>
+  <p class="a">
+    Encapsulation hides <em>data</em> (private fields + getters/setters, about protection).
+    Abstraction hides <em>implementation complexity</em> (abstract classes/interfaces, about a
+    simple interface).
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Abstract class vs interface — when do you use which?</p>
+  <p class="a">
+    Abstract class for closely related types that share code and state (single inheritance).
+    Interface for a capability that unrelated classes can share (multiple inheritance). Since Java 8
+    interfaces can have
+    <code>default</code> methods.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Can Java do multiple inheritance?</p>
+  <p class="a">
+    Not with classes (diamond problem). Yes with interfaces — a class can implement many. That's the
+    safe way to get the benefit.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Overloading vs overriding?</p>
+  <p class="a">
+    Overloading: same class, same name, different parameters, resolved at compile time. Overriding:
+    child replaces parent's method with the same signature, resolved at runtime (dynamic dispatch).
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Why must main be static?</p>
+  <p class="a">
+    So the JVM can call it without first creating an object of the class — static members belong to
+    the class itself.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">== vs .equals()?</p>
+  <p class="a">
+    <code>==</code> compares references (same object in memory). <code>.equals()</code> compares
+    contents (once overridden). For objects, use <code>.equals()</code>.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">If you override equals(), what else must you do?</p>
+  <p class="a">
+    Override <code>hashCode()</code> too, keeping them consistent — equal objects must return equal
+    hash codes, or hash-based collections break.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Can a constructor be inherited?</p>
+  <p class="a">
+    No. Constructors are not inherited, but a subclass constructor calls a parent constructor via
+    <code>super(...)</code>.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">What is dynamic method dispatch?</p>
+  <p class="a">
+    The runtime mechanism where a call on a parent-typed reference runs the actual object's
+    overridden method — the engine behind runtime polymorphism.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Inheritance or composition — which to prefer?</p>
+  <p class="a">
+    Favour composition (HAS-A) unless there's a true IS-A relationship. Composition is more flexible
+    and less tightly coupled.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Is Java pass-by-value or pass-by-reference?</p>
+  <p class="a">
+    Always pass-by-value. For objects, the <em>reference</em> is copied — so a method can mutate the
+    object, but reassigning the parameter doesn't affect the caller.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Can you override a static method?</p>
+  <p class="a">
+    No. Redeclaring it in a subclass is <em>method hiding</em> — resolved by the reference type at
+    compile time, not the object type. Same goes for <code>private</code> (invisible) and
+    <code>final</code> (locked).
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Are fields polymorphic?</p>
+  <p class="a">
+    No. Methods dispatch on the object's real type; fields resolve on the reference type.
+    Redeclaring a field <em>hides</em> it rather than overriding it.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">What's a covariant return type?</p>
+  <p class="a">
+    An override may return a <em>subtype</em> of what the parent returned. That's legal. Access
+    can't be narrowed, and you can't throw broader checked exceptions.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Does <code>final</code> make an object immutable?</p>
+  <p class="a">
+    No — it only stops the reference from being reassigned. The object's contents can still change.
+    True immutability needs private final fields, no setters, a final class, and defensive copies of
+    any mutable fields.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Shallow vs deep copy?</p>
+  <p class="a">
+    A shallow copy duplicates the outer object but shares its nested objects; a deep copy duplicates
+    everything recursively. Default
+    <code>clone()</code> is shallow — prefer a copy constructor.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">What runs first when you create an object?</p>
+  <p class="a">
+    Static blocks (parent then child, once ever), then per object: instance blocks and constructor,
+    with the parent fully built before the child's constructor body runs.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">15.</span> One-screen cheat sheet</h2>
+<p class="lead">The whole guide, compressed. Skim this the morning of an interview.</p>
+
+<div class="tbl">
+  <table>
+    <tr>
+      <th>Concept</th>
+      <th>One-liner</th>
+    </tr>
+    <tr>
+      <td><strong>Class</strong></td>
+      <td>Blueprint. Defines fields + methods.</td>
+    </tr>
+    <tr>
+      <td><strong>Object</strong></td>
+      <td>A real instance built from a class with <code>new</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>Constructor</strong></td>
+      <td>Runs at birth; same name as class; no return type.</td>
+    </tr>
+    <tr>
+      <td><strong>Encapsulation</strong></td>
+      <td>Hide data: <code>private</code> fields + getters/setters.</td>
+    </tr>
+    <tr>
+      <td><strong>Inheritance</strong></td>
+      <td>Reuse via <code>extends</code>; IS-A; use <code>super</code> for parent.</td>
+    </tr>
+    <tr>
+      <td><strong>Polymorphism</strong></td>
+      <td>One call, many forms. Overload (compile) + override (runtime).</td>
+    </tr>
+    <tr>
+      <td><strong>Abstraction</strong></td>
+      <td>Hide complexity via <code>abstract</code> classes / interfaces.</td>
+    </tr>
+    <tr>
+      <td><strong>abstract class</strong></td>
+      <td>Half-built; can't instantiate; mixes abstract + real methods; one parent.</td>
+    </tr>
+    <tr>
+      <td><strong>interface</strong></td>
+      <td>Pure contract of capabilities; <code>implements</code>; many at once.</td>
+    </tr>
+    <tr>
+      <td><strong>this / super</strong></td>
+      <td>Current object / parent object.</td>
+    </tr>
+    <tr>
+      <td><strong>static</strong></td>
+      <td>Belongs to the class, one shared copy, no <code>this</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>final</strong></td>
+      <td>Var = constant, method = no override, class = no extend.</td>
+    </tr>
+    <tr>
+      <td><strong>Access</strong></td>
+      <td>private &lt; default &lt; protected &lt; public.</td>
+    </tr>
+    <tr>
+      <td><strong>== vs equals()</strong></td>
+      <td>Same object vs same contents.</td>
+    </tr>
+    <tr>
+      <td><strong>Composition</strong></td>
+      <td>HAS-A; prefer over inheritance when there's no true IS-A.</td>
+    </tr>
+    <tr>
+      <td><strong>SOLID</strong></td>
+      <td>
+        Single-responsibility, Open/closed, Liskov, Interface-segregation, Dependency-inversion.
+      </td>
+    </tr>
+    <tr>
+      <td><strong>Pass-by-value</strong></td>
+      <td>Always. The reference gets copied — mutate yes, reassign no.</td>
+    </tr>
+    <tr>
+      <td><strong>Field hiding</strong></td>
+      <td>Fields resolve by reference type; methods by object type.</td>
+    </tr>
+    <tr>
+      <td><strong>Not overridable</strong></td>
+      <td>
+        <code>static</code> (hidden), <code>private</code> (invisible), <code>final</code> (locked).
+      </td>
+    </tr>
+    <tr>
+      <td><strong>Init order</strong></td>
+      <td>Static blocks (once) → instance blocks → constructor; parent before child.</td>
+    </tr>
+    <tr>
+      <td><strong>Downcasting</strong></td>
+      <td>
+        Compiles but can throw <code>ClassCastException</code>. Guard with <code>instanceof</code>.
+      </td>
+    </tr>
+    <tr>
+      <td><strong>Immutability</strong></td>
+      <td>final class + private final fields + no setters + defensive copies.</td>
+    </tr>
+  </table>
+</div>
+
+<div class="key">
+  <strong>If you remember only three things</strong>
+  <p>
+    1) Class is the blueprint, object is the built thing. 2) The four pillars are A PIE —
+    Abstraction, Polymorphism, Inheritance, Encapsulation. 3) Overload = same class/different
+    params/compile-time; Override = child replaces parent/same signature/runtime.
+  </p>
+</div>
+
+<footer class="doc-footer">
+  OOP in Java — The Complete Blueprint · a self-contained study &amp; interview reference. Best read
+  top to bottom once, then kept around as a cheat sheet.
+</footer>

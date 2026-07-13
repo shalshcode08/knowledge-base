@@ -1,0 +1,16 @@
+{
+  "name": "knowledge-base",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Personal knowledge base — static HTML notes, built and deployed via CI/CD.",
+  "scripts": {
+    "build": "node build.js",
+    "preview": "node build.js && npx --yes serve dist",
+    "format": "prettier --write \"src/**/*.{html,css}\" \"*.js\" \"test/**/*.js\" \"manifest.json\"",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "html-validate": "^9.0.0",
+    "prettier": "^3.3.0"
+  }
+}

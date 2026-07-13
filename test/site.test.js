@@ -1,0 +1,293 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+
+const ROOT = path.join(__dirname, "..");
+const SRC = path.join(ROOT, "src");
+const CONTENT = path.join(SRC, "content");
+const DIST = path.join(ROOT, "dist");
+
+function log(msg) {
+  process.stdout.write("    · " + msg + "\n");
+}
+
+function run(cmd, args) {
+  return execFileSync(cmd, args, { cwd: ROOT, encoding: "utf8", stdio: "pipe" });
+}
+
+function readManifest() {
+  return JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
+}
+
+function walk(dir, base = dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+    const full = path.join(dir, d.name);
+    return d.isDirectory()
+      ? walk(full, base)
+      : [path.relative(base, full).split(path.sep).join("/")];
+  });
+}
+
+function allPagePaths(manifest) {
+  return manifest.topics.flatMap((t) => t.pages.map((p) => p.path));
+}
+
+function distHtmlFiles() {
+  return walk(DIST).filter((f) => f.endsWith(".html"));
+}
+
+function idsIn(html) {
+  const ids = new Set();
+  const re = /\sid="([^"]+)"/g;
+  let m;
+  while ((m = re.exec(html)) !== null) ids.add(m[1]);
+  return ids;
+}
+
+function hrefsIn(html) {
+  const out = [];
+  const re = /href="([^"]+)"/g;
+  let m;
+  while ((m = re.exec(html)) !== null) out.push(m[1]);
+  return out;
+}
+
+// A failing check reports EVERY problem it found, not just the first.
+function assertNoProblems(label, problems) {
+  if (problems.length) {
+    const body = problems.map((p, i) => `  ${i + 1}. ${p}`).join("\n");
+    assert.fail(`${label} — ${problems.length} problem(s):\n${body}`);
+  }
+  log(`${label}: OK`);
+}
+
+const MANIFEST = readManifest();
+
+test("site builds cleanly (node build.js)", () => {
+  try {
+    const out = run("node", ["build.js"]);
+    out
+      .split("\n")
+      .filter(Boolean)
+      .forEach((l) => log(l));
+  } catch (e) {
+    assert.fail("build.js failed:\n" + (e.stdout || "") + (e.stderr || ""));
+  }
+});
+
+test("manifest.json is well-formed", () => {
+  const problems = [];
+  if (!Array.isArray(MANIFEST.topics)) problems.push('missing "topics" array');
+  const slug = /^[a-z0-9]+(?:\/[a-z0-9][a-z0-9-]*)+$/;
+  const seenPaths = new Set();
+  const seenTopics = new Set();
+
+  for (const topic of MANIFEST.topics || []) {
+    if (!topic.name) problems.push("a topic has no name");
+    if (seenTopics.has(topic.name)) problems.push(`duplicate topic "${topic.name}"`);
+    seenTopics.add(topic.name);
+    if (!Array.isArray(topic.pages)) problems.push(`topic "${topic.name}" has no pages array`);
+    for (const p of topic.pages || []) {
+      if (!p.title) problems.push(`page ${JSON.stringify(p)} has no title`);
+      if (!p.path) problems.push(`page "${p.title}" has no path`);
+      if (p.path && !slug.test(p.path))
+        problems.push(`path "${p.path}" must be lowercase kebab-case like "topic/note"`);
+      if (seenPaths.has(p.path)) problems.push(`duplicate path "${p.path}"`);
+      seenPaths.add(p.path);
+    }
+  }
+  assertNoProblems("manifest", problems);
+});
+
+test("every manifest page has a matching content file", () => {
+  const problems = [];
+  for (const p of allPagePaths(MANIFEST)) {
+    const file = path.join(CONTENT, p + ".html");
+    if (!fs.existsSync(file))
+      problems.push(`no content file for "${p}" (expected src/content/${p}.html)`);
+  }
+  assertNoProblems("manifest→content", problems);
+});
+
+test("no orphan content files missing from the manifest", () => {
+  const known = new Set(allPagePaths(MANIFEST).map((p) => p + ".html"));
+  const problems = walk(CONTENT)
+    .filter((rel) => rel.endsWith(".html") && !known.has(rel))
+    .map((rel) => `src/content/${rel} exists but is not listed in manifest.json`);
+  assertNoProblems("orphans", problems);
+});
+
+test("build produced index + one file per page + styles.css", () => {
+  const problems = [];
+  if (!fs.existsSync(path.join(DIST, "index.html"))) problems.push("dist/index.html missing");
+  if (!fs.existsSync(path.join(DIST, "styles.css"))) problems.push("dist/styles.css missing");
+  for (const p of allPagePaths(MANIFEST)) {
+    if (!fs.existsSync(path.join(DIST, p + ".html"))) problems.push(`dist/${p}.html missing`);
+  }
+  const expected = allPagePaths(MANIFEST).length + 1;
+  const got = distHtmlFiles().length;
+  if (got !== expected) problems.push(`expected ${expected} html files, built ${got}`);
+  assertNoProblems("build output", problems);
+});
+
+test("no unfilled template placeholders leaked into output", () => {
+  const problems = [];
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    const leaks = html.match(/\{\{[A-Z]+\}\}/g);
+    if (leaks) problems.push(`${f} still contains ${[...new Set(leaks)].join(", ")}`);
+  }
+  assertNoProblems("placeholders", problems);
+});
+
+test("every page has the required shell chrome", () => {
+  const problems = [];
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    if (!/<html lang="[^"]+"/.test(html)) problems.push(`${f}: <html> has no lang`);
+    if (!/<title>[^<]+<\/title>/.test(html)) problems.push(`${f}: empty or missing <title>`);
+    if (!html.includes('class="site-header"')) problems.push(`${f}: missing header`);
+    if (!html.includes('class="sidebar"')) problems.push(`${f}: missing sidebar`);
+    if ((html.match(/<h1[\s>]/g) || []).length !== 1)
+      problems.push(`${f}: must have exactly one <h1>`);
+  }
+  assertNoProblems("shell chrome", problems);
+});
+
+test("each note marks exactly one active sidebar item (its own)", () => {
+  const problems = [];
+  for (const p of allPagePaths(MANIFEST)) {
+    const file = path.join(DIST, p + ".html");
+    if (!fs.existsSync(file)) {
+      problems.push(`${p}.html: not built`);
+      continue;
+    }
+    const html = fs.readFileSync(file, "utf8");
+    const actives = (html.match(/class="active"/g) || []).length;
+    if (actives !== 1) problems.push(`${p}.html: expected 1 active nav item, found ${actives}`);
+    if (!html.includes(`href="../${p}.html" class="active"`))
+      problems.push(`${p}.html: its own sidebar link is not the active one`);
+  }
+  assertNoProblems("active nav", problems);
+});
+
+test("Contents box matches the page's h2 sections", () => {
+  const problems = [];
+  for (const p of allPagePaths(MANIFEST)) {
+    const file = path.join(DIST, p + ".html");
+    if (!fs.existsSync(file)) {
+      problems.push(`${p}.html: not built`);
+      continue;
+    }
+    const html = fs.readFileSync(file, "utf8");
+    const h2ids = [...html.matchAll(/<h2\s+[^>]*id="([^"]+)"/g)].map((m) => m[1]);
+    const tocBlock = (html.match(/<aside class="toc"[\s\S]*?<\/aside>/) || [""])[0];
+    if (h2ids.length && !tocBlock) {
+      problems.push(`${p}.html: has ${h2ids.length} h2 sections but no Contents box`);
+      continue;
+    }
+    const tocTargets = hrefsIn(tocBlock)
+      .filter((h) => h.startsWith("#"))
+      .map((h) => h.slice(1));
+    for (const id of h2ids)
+      if (!tocTargets.includes(id))
+        problems.push(`${p}.html: section #${id} missing from Contents box`);
+    for (const t of tocTargets)
+      if (!h2ids.includes(t))
+        problems.push(`${p}.html: Contents links #${t} which is not an h2 section`);
+  }
+  assertNoProblems("contents box", problems);
+});
+
+test("all internal links resolve to real files", () => {
+  const problems = [];
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    const dir = path.dirname(path.join(DIST, f));
+    for (const href of hrefsIn(html)) {
+      if (/^(https?:|mailto:|tel:)/.test(href)) continue; // external
+      if (href.startsWith("#")) continue; // anchor, checked separately
+      const target = href.split("#")[0];
+      if (!target) {
+        problems.push(`${f}: empty/hash-only href "${href}"`);
+        continue;
+      }
+      const resolved = path.resolve(dir, target);
+      if (!fs.existsSync(resolved))
+        problems.push(`${f}: link "${href}" → ${path.relative(DIST, resolved)} does not exist`);
+    }
+  }
+  assertNoProblems("internal links", problems);
+});
+
+test("all anchor links point at ids that exist on the page", () => {
+  const problems = [];
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    const ids = idsIn(html);
+    for (const href of hrefsIn(html)) {
+      if (!href.startsWith("#")) continue;
+      const id = href.slice(1);
+      if (id && !ids.has(id)) problems.push(`${f}: anchor "${href}" has no matching id`);
+    }
+  }
+  assertNoProblems("anchors", problems);
+});
+
+test("landmarks are uniquely labelled (accessibility)", () => {
+  const problems = [];
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    const asides = html.match(/<aside[^>]*>/g) || [];
+    const labels = asides.map((a) => (a.match(/aria-label="([^"]+)"/) || [])[1]);
+    labels.forEach((l, i) => {
+      if (!l) problems.push(`${f}: an <aside> has no aria-label (${asides[i]})`);
+    });
+    if (new Set(labels).size !== labels.length)
+      problems.push(`${f}: two <aside> landmarks share the same aria-label`);
+  }
+  assertNoProblems("landmarks", problems);
+});
+
+test("design system tokens are present in styles.css", () => {
+  const css = fs.readFileSync(path.join(SRC, "styles.css"), "utf8");
+  const problems = [];
+  for (const tok of ["--text", "--accent", "--border", "--sidebar-w", "--toc-w"]) {
+    if (!css.includes(tok + ":")) problems.push(`styles.css is missing the ${tok} token`);
+  }
+  assertNoProblems("design tokens", problems);
+});
+
+test("HTML validates (html-validate)", () => {
+  try {
+    run("npx", ["html-validate", "dist/**/*.html"]);
+    log("html-validate: OK");
+  } catch (e) {
+    assert.fail("html-validate reported errors:\n" + (e.stdout || "") + (e.stderr || ""));
+  }
+});
+
+test("formatting is consistent (prettier)", () => {
+  try {
+    run("npx", [
+      "prettier",
+      "--check",
+      "src/**/*.{html,css}",
+      "*.js",
+      "test/**/*.js",
+      "manifest.json",
+    ]);
+    log("prettier: OK");
+  } catch (e) {
+    assert.fail(
+      "prettier found unformatted files (run `npm run format`):\n" +
+        (e.stdout || "") +
+        (e.stderr || ""),
+    );
+  }
+});

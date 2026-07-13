@@ -1,0 +1,16 @@
+{
+  "topics": [
+    {
+      "name": "Java",
+      "pages": [{ "title": "OOP", "path": "java/oops" }]
+    },
+    {
+      "name": "C++",
+      "pages": []
+    },
+    {
+      "name": "DSA",
+      "pages": []
+    }
+  ]
+}
