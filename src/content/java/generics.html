@@ -1,0 +1,574 @@
+<h1>Java Generics — Complete Notes</h1>
+<p class="subtitle">
+  Type parameters, bounds, wildcards, PECS and type erasure — everything you need to
+  <em>read</em> and <em>write</em> modern Java confidently, explained from the problem they solve up
+  to the tricks the compiler plays behind your back.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> The problem generics solve</h2>
+<p class="lead">
+  <em class="term">Generics</em> let you write a class or method that works with
+  <strong>any type</strong>, while still letting the compiler check types for you. In one line: they
+  move type errors from <em>runtime crashes</em> to <em>compile-time red squiggles</em>.
+</p>
+
+<p>
+  Before generics (Java 4 and earlier), collections held plain <code>Object</code>. You could put
+  anything in, but taking things out meant casting — and nothing stopped you casting wrongly:
+</p>
+
+<figure class="code">
+  <figcaption><b>Life before generics — casts and runtime blow-ups</b></figcaption>
+  <pre><code>List list = new ArrayList();      // holds Object
+list.add("hello");
+list.add(42);                     // compiles fine — no one's checking!
+
+String s = (String) list.get(0);  // ok
+String bad = (String) list.get(1);  // compiles, then CRASHES: ClassCastException at runtime</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Same thing with generics — the bug is caught while typing</b></figcaption>
+  <pre><code>List&lt;String&gt; list = new ArrayList&lt;&gt;();
+list.add("hello");
+list.add(42);                     // COMPILE ERROR — 42 is not a String
+
+String s = list.get(0);           // no cast needed, guaranteed to be a String</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The two wins</strong>
+  <p>
+    <strong>Type safety</strong> — the compiler rejects the wrong type before your program ever
+    runs. <strong>No casts</strong> — you read values out already typed, so the code is cleaner and
+    self-documenting. A <code>List&lt;String&gt;</code> tells the reader (and the compiler) exactly
+    what's inside.
+  </p>
+</div>
+
+<div class="analogy">
+  <p>
+    A non-generic collection is a <strong>cardboard box labelled "STUFF."</strong> You can put
+    anything in, but you never know what you'll pull out, so you check every time. A
+    <code>List&lt;String&gt;</code> is a box labelled <strong>"BOOKS ONLY."</strong> The label lets
+    everyone put in and take out books with total confidence — and refuses a football at the door.
+  </p>
+</div>
+
+<h2 id="basics"><span class="num">01.</span> Generic classes &amp; interfaces</h2>
+<p class="lead">
+  You make a type generic by giving it a <em class="term">type parameter</em> — a placeholder,
+  written in angle brackets, that stands in for a real type chosen later.
+</p>
+
+<figure class="code">
+  <figcaption><b>A generic Box that holds any one type</b></figcaption>
+  <pre><code>class Box&lt;T&gt; {                    // T is a type parameter — a placeholder
+    private T value;
+    public void set(T value) { this.value = value; }
+    public T get() { return value; }
+}
+
+Box&lt;String&gt; sb = new Box&lt;&gt;();     // T becomes String here
+sb.set("hi");
+String x = sb.get();              // no cast
+
+Box&lt;Integer&gt; ib = new Box&lt;&gt;();    // T becomes Integer here
+ib.set(42);
+// ib.set("nope");                // COMPILE ERROR</code></pre>
+</figure>
+
+<p>
+  You can have several type parameters, and there's a naming convention worth knowing so you
+  recognise it in library code:
+</p>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Letter</th>
+        <th>Conventionally means</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>T</code></td>
+        <td>Type (the general one)</td>
+      </tr>
+      <tr>
+        <td><code>E</code></td>
+        <td>Element (used all over the collections)</td>
+      </tr>
+      <tr>
+        <td><code>K</code>, <code>V</code></td>
+        <td>Key, Value (maps)</td>
+      </tr>
+      <tr>
+        <td><code>N</code></td>
+        <td>Number</td>
+      </tr>
+      <tr>
+        <td><code>R</code></td>
+        <td>Return type</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Two parameters — a key/value Pair</b></figcaption>
+  <pre><code>class Pair&lt;K, V&gt; {
+    private final K key;
+    private final V value;
+    public Pair(K key, V value) { this.key = key; this.value = value; }
+    public K getKey() { return key; }
+    public V getValue() { return value; }
+}
+
+Pair&lt;String, Integer&gt; age = new Pair&lt;&gt;("Asha", 30);
+String name = age.getKey();       // String
+int a = age.getValue();           // Integer, auto-unboxed to int</code></pre>
+</figure>
+
+<div class="note">
+  <strong>A generic interface</strong>
+  <p>
+    Interfaces take type parameters the same way — you've already used them:
+    <code>Comparable&lt;T&gt;</code>, <code>Iterator&lt;E&gt;</code>, <code>List&lt;E&gt;</code>.
+    When a class implements one, it fills in the type:
+    <code>class Person implements Comparable&lt;Person&gt;</code>.
+  </p>
+</div>
+
+<h2 id="methods"><span class="num">02.</span> Generic methods</h2>
+<p class="lead">
+  A single <em>method</em> can be generic even if its class isn't. You declare the type parameter
+  <strong>before the return type</strong>, and the compiler usually infers it from the arguments so
+  you rarely spell it out.
+</p>
+
+<figure class="code">
+  <figcaption><b>The &lt;T&gt; goes before the return type</b></figcaption>
+  <pre><code>class Util {
+    // &lt;T&gt; declares the parameter; T is then used in params and return type
+    public static &lt;T&gt; T firstOrNull(List&lt;T&gt; items) {
+        return items.isEmpty() ? null : items.get(0);
+    }
+
+    public static &lt;T&gt; void swap(T[] arr, int i, int j) {
+        T tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+}
+
+String s = Util.firstOrNull(List.of("a", "b"));   // T inferred as String
+Integer n = Util.firstOrNull(List.of(1, 2, 3));   // T inferred as Integer</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Where the <code>&lt;T&gt;</code> lives tells you which kind it is</strong>
+  <p>
+    On the <em>class</em> header (<code>class Box&lt;T&gt;</code>) → every instance is bound to one
+    <code>T</code>. Just before a <em>method's</em> return type (<code
+      >static &lt;T&gt; T first(...)</code
+    >) → the method picks a fresh <code>T</code> on each call, independent of the class.
+  </p>
+</div>
+
+<h2 id="bounded"><span class="num">03.</span> Bounded type parameters</h2>
+<p class="lead">
+  Sometimes "any type" is too loose — you need "any type that can do X." A
+  <em class="term">bound</em> constrains <code>T</code> to a type or its subtypes, which also
+  unlocks that type's methods inside your generic code.
+</p>
+
+<figure class="code">
+  <figcaption><b>&lt;T extends Number&gt; — now T is guaranteed to be a number</b></figcaption>
+  <pre><code>// Without a bound, we couldn't call doubleValue() — Object has no such method.
+static &lt;T extends Number&gt; double sum(List&lt;T&gt; nums) {
+    double total = 0;
+    for (T n : nums) total += n.doubleValue();   // allowed BECAUSE of the bound
+    return total;
+}
+
+sum(List.of(1, 2, 3));         // ok — Integer extends Number
+sum(List.of(1.5, 2.5));        // ok — Double extends Number
+// sum(List.of("a", "b"));     // COMPILE ERROR — String is not a Number</code></pre>
+</figure>
+
+<div class="key">
+  <strong><code>extends</code> here means "is a subtype of"</strong>
+  <p>
+    In a bound, <code>extends</code> covers <em>both</em> class inheritance and interface
+    implementation — so <code>&lt;T extends Comparable&lt;T&gt;&gt;</code> is valid even though
+    <code>Comparable</code> is an interface. You can even require several at once with
+    <code>&amp;</code>: <code>&lt;T extends Number &amp; Comparable&lt;T&gt;&gt;</code> means "a
+    number that is also comparable."
+  </p>
+</div>
+
+<h2 id="wildcards"><span class="num">04.</span> Wildcards — the <code>?</code></h2>
+<p class="lead">
+  A wildcard <code>?</code> means "some specific type I'm not naming." It exists because of a
+  surprising fact: <code>List&lt;String&gt;</code> is <strong>not</strong> a subtype of
+  <code>List&lt;Object&gt;</code>, even though <code>String</code> is a subtype of
+  <code>Object</code>. Generics are <em>invariant</em>.
+</p>
+
+<div class="warn">
+  <strong>Why generics are invariant (and must be)</strong>
+  <p>
+    If <code>List&lt;String&gt;</code> <em>were</em> a <code>List&lt;Object&gt;</code>, you could do
+    this: assign it to a <code>List&lt;Object&gt;</code> variable, then <code>add(42)</code> —
+    sneaking an Integer into a list of Strings. To prevent exactly that, the language forbids the
+    assignment. Wildcards are how you regain flexibility <em>safely</em>.
+  </p>
+</div>
+
+<h4><code>? extends T</code> — an upper bound (a "producer" you read from)</h4>
+<figure class="code">
+  <figcaption><b>Accept a list of T or any subtype</b></figcaption>
+  <pre><code>// Reads numbers out; works for List&lt;Integer&gt;, List&lt;Double&gt;, List&lt;Number&gt;...
+static double total(List&lt;? extends Number&gt; nums) {
+    double t = 0;
+    for (Number n : nums) t += n.doubleValue();   // reading as Number is safe
+    return t;
+}
+
+total(List.of(1, 2, 3));       // List&lt;Integer&gt; ✓
+total(List.of(1.5, 2.5));      // List&lt;Double&gt; ✓
+// nums.add(1);                // NOT allowed — see below</code></pre>
+</figure>
+<p>
+  With <code>? extends Number</code> you can <strong>read</strong> elements as <code>Number</code>,
+  but you <strong>cannot add</strong> anything (except <code>null</code>). Why: the list might
+  really be a <code>List&lt;Integer&gt;</code>, and the compiler can't let you put a
+  <code>Double</code> into it. So <code>extends</code> = read-only-ish, a
+  <strong>producer</strong> of values.
+</p>
+
+<h4><code>? super T</code> — a lower bound (a "consumer" you write into)</h4>
+<figure class="code">
+  <figcaption><b>Accept a list of T or any supertype</b></figcaption>
+  <pre><code>// Writes Integers in; works for List&lt;Integer&gt;, List&lt;Number&gt;, List&lt;Object&gt;
+static void addNumbers(List&lt;? super Integer&gt; dst) {
+    for (int i = 1; i &lt;= 3; i++) dst.add(i);      // adding Integer is safe
+}
+
+List&lt;Number&gt; nums = new ArrayList&lt;&gt;();
+addNumbers(nums);              // ✓ — a List&lt;Number&gt; can certainly hold Integers
+List&lt;Object&gt; objs = new ArrayList&lt;&gt;();
+addNumbers(objs);              // ✓</code></pre>
+</figure>
+<p>
+  With <code>? super Integer</code> you can <strong>add</strong> <code>Integer</code>s safely (any
+  supertype list can hold them), but when you <strong>read</strong>, the best you get back is
+  <code>Object</code> — because the list could be a <code>List&lt;Object&gt;</code>. So
+  <code>super</code> = write-friendly, a <strong>consumer</strong> of values.
+</p>
+
+<h4>Unbounded <code>?</code></h4>
+<p>
+  A bare <code>List&lt;?&gt;</code> means "a list of some unknown type." You can read elements as
+  <code>Object</code> and check <code>size()</code>, but you can't add anything (except
+  <code>null</code>). It's handy for methods that don't care about the element type, like
+  <code>printAll(List&lt;?&gt; list)</code>.
+</p>
+
+<h2 id="pecs"><span class="num">05.</span> PECS — the rule that makes wildcards click</h2>
+<p class="lead">
+  <strong>P</strong>roducer <strong>E</strong>xtends, <strong>C</strong>onsumer
+  <strong>S</strong>uper. This one mnemonic tells you which wildcard to use every time.
+</p>
+<ul class="clean">
+  <li>
+    If the parameter <strong>produces</strong> values for you (you read <em>out</em> of it), use
+    <code>? extends T</code>.
+  </li>
+  <li>
+    If the parameter <strong>consumes</strong> values from you (you write <em>into</em> it), use
+    <code>? super T</code>.
+  </li>
+  <li>If it does both, use an exact type <code>T</code> (no wildcard).</li>
+</ul>
+
+<figure class="code">
+  <figcaption>
+    <b>PECS in the wild — a copy method (mirrors the JDK's Collections.copy)</b>
+  </figcaption>
+  <pre><code>static &lt;T&gt; void copy(List&lt;? super T&gt; dst,      // dst CONSUMES T  → super
+                     List&lt;? extends T&gt; src) {  // src PRODUCES T  → extends
+    for (T item : src) dst.add(item);
+}
+
+List&lt;Number&gt; dst = new ArrayList&lt;&gt;();
+List&lt;Integer&gt; src = List.of(1, 2, 3);
+copy(dst, src);                // ✓ read Integers out of src, write them into a Number list</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Read it as a sentence</strong>
+  <p>
+    "I'm reading numbers <em>out</em> of <code>src</code>, so <code>src</code> is a producer →
+    <code>extends</code>. I'm writing numbers <em>into</em> <code>dst</code>, so <code>dst</code> is
+    a consumer → <code>super</code>." If you can say which direction the data flows, PECS picks the
+    wildcard for you.
+  </p>
+</div>
+
+<h2 id="erasure"><span class="num">06.</span> Type erasure — how generics actually work</h2>
+<p class="lead">
+  Here's the twist that explains most of generics' quirks: they exist
+  <strong>only at compile time</strong>. Once your code compiles, the type information is
+  <em class="term">erased</em>, and the bytecode looks much like the old pre-generics code.
+</p>
+
+<p>
+  The compiler uses your <code>&lt;T&gt;</code> to <em>check</em> your code, then throws the
+  parameter away: unbounded <code>T</code> becomes <code>Object</code> (a bounded
+  <code>&lt;T extends Number&gt;</code> becomes <code>Number</code>), and it silently inserts the
+  casts you didn't have to write. This is why generics are said to be
+  <strong>"syntactic sugar"</strong> over casting.
+</p>
+
+<figure class="code">
+  <figcaption><b>What the compiler sees vs. what the JVM runs</b></figcaption>
+  <pre><code>// You write:
+Box&lt;String&gt; b = new Box&lt;&gt;();
+String s = b.get();
+
+// After erasure, the bytecode is effectively:
+Box b = new Box();
+String s = (String) b.get();      // the cast the compiler added for you
+
+// And at runtime these are the SAME class:
+List&lt;String&gt; a = new ArrayList&lt;&gt;();
+List&lt;Integer&gt; c = new ArrayList&lt;&gt;();
+System.out.println(a.getClass() == c.getClass());   // true — both are just ArrayList</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Why Java did it this way</strong>
+  <p>
+    Erasure was chosen for <strong>backward compatibility</strong>: pre-generics code and generic
+    code had to interoperate and run on the same JVM. The cost is that types aren't available at
+    runtime — a limitation called being <em>non-reified</em>. Languages like C# reify generics; Java
+    does not.
+  </p>
+</div>
+
+<h2 id="restrictions"><span class="num">07.</span> What erasure forbids</h2>
+<p class="lead">
+  Almost every "you can't do that with generics" rule traces back to erasure: at runtime,
+  <code>T</code> simply doesn't exist.
+</p>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>You can't…</th>
+        <th>Because…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>new T()</code></td>
+        <td>the JVM doesn't know what <code>T</code> is at runtime</td>
+      </tr>
+      <tr>
+        <td><code>new T[10]</code></td>
+        <td>same — can't create an array of an erased type</td>
+      </tr>
+      <tr>
+        <td><code>if (obj instanceof List&lt;String&gt;)</code></td>
+        <td>
+          the <code>&lt;String&gt;</code> is gone; only <code>instanceof List&lt;?&gt;</code> is
+          allowed
+        </td>
+      </tr>
+      <tr>
+        <td>use a primitive: <code>List&lt;int&gt;</code></td>
+        <td>type parameters must be reference types — use <code>List&lt;Integer&gt;</code></td>
+      </tr>
+      <tr>
+        <td>a <code>static</code> field of type <code>T</code></td>
+        <td><code>T</code> belongs to an instance, not the class</td>
+      </tr>
+      <tr>
+        <td><code>catch (MyException&lt;T&gt; e)</code></td>
+        <td>exceptions can't be generic — the runtime can't tell them apart</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>The workaround for "new T()" — pass a factory or a Class</b></figcaption>
+  <pre><code>// Can't do: T t = new T();
+// Instead, take a Supplier and let the caller decide how to build one:
+static &lt;T&gt; List&lt;T&gt; filled(int n, Supplier&lt;T&gt; factory) {
+    List&lt;T&gt; list = new ArrayList&lt;&gt;();
+    for (int i = 0; i &lt; n; i++) list.add(factory.get());
+    return list;
+}
+List&lt;StringBuilder&gt; sbs = filled(3, StringBuilder::new);</code></pre>
+</figure>
+
+<h2 id="arrays"><span class="num">08.</span> Generics vs arrays — a real clash</h2>
+<p class="lead">
+  Arrays and generics behave in opposite ways, and mixing them is a known sharp edge.
+</p>
+<ul class="clean">
+  <li>
+    <strong>Arrays are covariant:</strong> <code>String[]</code> <em>is</em> an
+    <code>Object[]</code>. This compiles — but can blow up at runtime.
+  </li>
+  <li>
+    <strong>Generics are invariant:</strong> <code>List&lt;String&gt;</code> is <em>not</em> a
+    <code>List&lt;Object&gt;</code>. This is caught at compile time.
+  </li>
+</ul>
+<figure class="code">
+  <figcaption><b>Arrays let a bug through that generics would have stopped</b></figcaption>
+  <pre><code>Object[] arr = new String[3];     // legal — arrays are covariant
+arr[0] = 42;                       // compiles… then throws ArrayStoreException at runtime
+
+List&lt;Object&gt; list = new ArrayList&lt;String&gt;();   // COMPILE ERROR — caught immediately (good!)</code></pre>
+</figure>
+<div class="warn">
+  <strong>Don't create arrays of generic types</strong>
+  <p>
+    <code>new List&lt;String&gt;[10]</code> is illegal, and <code>new T[10]</code> can't be done.
+    When you need a "generic array," use a <code>List&lt;T&gt;</code> instead — it's the idiomatic
+    Java answer and avoids the whole minefield.
+  </p>
+</div>
+
+<h2 id="inference"><span class="num">09.</span> Type inference &amp; the diamond</h2>
+<p class="lead">
+  The compiler is good at figuring out type parameters so you don't repeat yourself.
+</p>
+<figure class="code">
+  <figcaption><b>Let the compiler fill it in</b></figcaption>
+  <pre><code>// The diamond &lt;&gt; (Java 7+): don't repeat the type on the right
+Map&lt;String, List&lt;Integer&gt;&gt; m = new HashMap&lt;&gt;();   // not new HashMap&lt;String, List&lt;Integer&gt;&gt;()
+
+// Method type inference — no need to write Util.&lt;String&gt;firstOrNull(...)
+String s = Util.firstOrNull(List.of("a", "b"));
+
+// var (Java 10+) — infers the whole variable type
+var names = new ArrayList&lt;String&gt;();              // names is ArrayList&lt;String&gt;</code></pre>
+</figure>
+<div class="note">
+  <strong>The raw type trap</strong>
+  <p>
+    Writing <code>List list = new ArrayList();</code> with <em>no</em> type parameter uses a
+    <strong>raw type</strong>. It compiles (for backward compatibility) but disables all generic
+    checking and earns "unchecked" warnings. Never use raw types in new code — always specify the
+    type or use <code>&lt;&gt;</code>.
+  </p>
+</div>
+
+<h2 id="gotchas"><span class="num">10.</span> Gotchas — where Java surprises you</h2>
+<div class="qa">
+  <p class="q">1. You can't overload on generic type alone.</p>
+  <p class="a">
+    <code>void f(List&lt;String&gt;)</code> and <code>void f(List&lt;Integer&gt;)</code> won't
+    compile side by side — after erasure both are <code>f(List)</code>, an identical signature.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">2. A wildcard list is almost read-only.</p>
+  <p class="a">
+    You cannot <code>add</code> to a <code>List&lt;? extends T&gt;</code> (except <code>null</code>)
+    — the compiler can't know the exact element type is compatible.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">3. "Unchecked cast" warnings mean the compiler can't verify you.</p>
+  <p class="a">
+    Casting <code>(List&lt;String&gt;) someRawList</code> compiles with a warning because erasure
+    means the cast can't actually be checked at runtime. Fix the types rather than suppressing the
+    warning blindly.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">4. Bounded <code>T</code> erases to its bound, not to <code>Object</code>.</p>
+  <p class="a">
+    <code>&lt;T extends Number&gt;</code> erases <code>T</code> to <code>Number</code>, so inside
+    the method you can call <code>Number</code>'s methods on a <code>T</code>.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">11.</span> Interview Q&amp;A</h2>
+<div class="qa">
+  <p class="q">Q: What is type erasure?</p>
+  <p class="a">
+    The compiler checks generic types, then removes the parameters from the bytecode —
+    <code>T</code> becomes <code>Object</code> (or its bound) and casts are inserted automatically.
+    Consequence: generic type info isn't available at runtime, and
+    <code>List&lt;String&gt;</code> and <code>List&lt;Integer&gt;</code> are the same class. It was
+    chosen for backward compatibility.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Q: Explain PECS.</p>
+  <p class="a">
+    Producer Extends, Consumer Super. Use <code>? extends T</code> for a source you read from,
+    <code>? super T</code> for a destination you write to. It maximises how many types your API
+    accepts while staying type-safe.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Q: Why can't you write <code>new T()</code> or <code>new T[n]</code>?</p>
+  <p class="a">
+    Because <code>T</code> is erased — at runtime there's no such type to instantiate. Work around
+    it by passing a <code>Supplier&lt;T&gt;</code> or a <code>Class&lt;T&gt;</code>, and use a
+    <code>List&lt;T&gt;</code> instead of a generic array.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">
+    Q: Difference between <code>List&lt;Object&gt;</code>, <code>List&lt;?&gt;</code> and a raw
+    <code>List</code>?
+  </p>
+  <p class="a">
+    <code>List&lt;Object&gt;</code> — a list you can add any object to. <code>List&lt;?&gt;</code> —
+    a list of some unknown type; read as <code>Object</code>, can't add (except null). Raw
+    <code>List</code> — no generics at all; compiles for legacy reasons but unsafe, avoid it.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">12.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li><strong>Why:</strong> compile-time type safety + no casts.</li>
+  <li>
+    <strong>Class:</strong> <code>class Box&lt;T&gt;</code> · <strong>method:</strong>
+    <code>static &lt;T&gt; T f(...)</code> (declare <code>&lt;T&gt;</code> before the return type).
+  </li>
+  <li>
+    <strong>Bound:</strong> <code>&lt;T extends Number&gt;</code> — restricts <code>T</code> and
+    unlocks that type's methods.
+  </li>
+  <li>
+    <strong>Wildcards:</strong> <code>? extends T</code> = read (producer); <code>? super T</code> =
+    write (consumer); <code>?</code> = unknown.
+  </li>
+  <li><strong>PECS:</strong> Producer Extends, Consumer Super.</li>
+  <li>
+    <strong>Invariance:</strong> <code>List&lt;String&gt;</code> is <em>not</em> a
+    <code>List&lt;Object&gt;</code>.
+  </li>
+  <li>
+    <strong>Erasure:</strong> generics vanish at runtime → no <code>new T()</code>, no
+    <code>new T[]</code>, no <code>T.class</code>, no primitives, no generic exceptions.
+  </li>
+  <li>
+    <strong>Arrays vs generics:</strong> arrays covariant (runtime-checked), generics invariant
+    (compile-checked) — prefer <code>List&lt;T&gt;</code> over arrays.
+  </li>
+  <li><strong>Never</strong> use raw types in new code.</li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

@@ -1,0 +1,853 @@
+<h1>Java Collections Framework — Complete Notes</h1>
+<p class="subtitle">
+  Every list, set, map and queue in Java, explained from the ground up in plain language — then
+  taken all the way down to the internals interviewers actually dig into (especially how
+  <code>HashMap</code> really works).
+</p>
+
+<h2 id="intro"><span class="num">00.</span> What the Collections Framework actually is</h2>
+<p class="lead">
+  A <em class="term">collection</em> is just "a bunch of objects grouped together." The Collections
+  Framework is Java's built-in, standardised toolbox of these groupings, so you never have to
+  hand-roll a resizable array or a hash table again.
+</p>
+
+<p>
+  Before the framework existed (Java 1.1), everyone used raw arrays, <code>Vector</code> and
+  <code>Hashtable</code>, and none of them shared a common interface — so code that worked with one
+  couldn't work with another. Java 1.2 introduced a unified design: a small set of
+  <strong>interfaces</strong> (what a collection can do), many <strong>implementations</strong> (how
+  it does it), and a couple of <strong>utility classes</strong> (algorithms like sort and search).
+  Learn the interfaces once and every implementation feels familiar.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of the interfaces as <strong>job descriptions</strong> ("a List must keep order and allow
+    duplicates") and the implementations as <strong>different employees</strong> who can do that job
+    in their own way (<code>ArrayList</code> is fast at random access, <code>LinkedList</code> is
+    fast at inserting in the middle). You write your code against the job description, then hire
+    whichever employee fits your workload — and you can swap them later without rewriting anything.
+  </p>
+</div>
+
+<div class="key">
+  <strong>The mental model to hold</strong>
+  <p>
+    Two separate family trees. <strong><code>Collection</code></strong> covers things that hold
+    <em>single elements</em> — <code>List</code>, <code>Set</code>, <code>Queue</code>.
+    <strong><code>Map</code></strong> is a <em>separate</em> tree for <em>key → value pairs</em> and
+    does <strong>not</strong> extend <code>Collection</code>. People say "collections" loosely to
+    mean both, but in the type system they're two trees.
+  </p>
+</div>
+
+<h2 id="hierarchy"><span class="num">01.</span> The hierarchy — how the pieces fit</h2>
+<p class="lead">
+  Get this map in your head and everything else slots into place. Everything below
+  <code>Collection</code> shares the same core methods; only the <em>rules</em> differ.
+</p>
+
+<figure class="code">
+  <figcaption><b>The two family trees</b></figcaption>
+  <pre><code>Iterable
+  └── Collection ............. add, remove, size, contains, iterator
+        ├── List ............. ordered, index-based, allows duplicates
+        │     ├── ArrayList
+        │     ├── LinkedList
+        │     └── Vector (legacy) → Stack (legacy)
+        ├── Set .............. no duplicates
+        │     ├── HashSet
+        │     │     └── LinkedHashSet
+        │     └── TreeSet (implements SortedSet/NavigableSet)
+        └── Queue ............ ordered for processing (FIFO-ish)
+              ├── ArrayDeque (also a Deque)
+              ├── PriorityQueue
+              └── LinkedList (also a Queue/Deque)
+
+Map (SEPARATE tree) ......... key → value, no duplicate keys
+  ├── HashMap
+  │     └── LinkedHashMap
+  ├── TreeMap (implements SortedMap/NavigableMap)
+  └── Hashtable (legacy)</code></pre>
+</figure>
+
+<p>
+  <code>Iterable</code> sits at the very top — it's the interface that lets a type be used in a
+  for-each loop. <code>Collection</code> adds the bulk operations (<code>add</code>,
+  <code>remove</code>, <code>contains</code>, <code>size</code>). Below that, each interface
+  <em>narrows the contract</em>:
+</p>
+<ul class="clean">
+  <li>
+    <strong><code>List</code></strong> — keeps insertion order, indexes elements from 0, allows
+    duplicates.
+  </li>
+  <li>
+    <strong><code>Set</code></strong> — refuses duplicates (defined by <code>equals</code>).
+  </li>
+  <li>
+    <strong><code>Queue</code></strong> — models "a line to be processed," usually
+    first-in-first-out.
+  </li>
+  <li>
+    <strong><code>Deque</code></strong> — a double-ended queue: add/remove at <em>both</em> ends.
+  </li>
+  <li>
+    <strong><code>Map</code></strong> — stores pairs; look up a value by its key.
+  </li>
+</ul>
+
+<div class="note">
+  <strong>"Legacy" collections</strong>
+  <p>
+    <code>Vector</code>, <code>Stack</code> and <code>Hashtable</code> are from Java 1.0. They still
+    work but are <strong>synchronized on every method</strong> (slow) and generally replaced by
+    <code>ArrayList</code>, <code>ArrayDeque</code> and <code>HashMap</code>. Know they exist for
+    interviews; avoid them in new code.
+  </p>
+</div>
+
+<div class="divider">Lists</div>
+
+<h2 id="list"><span class="num">02.</span> List — ArrayList vs LinkedList</h2>
+<p class="lead">
+  A <em class="term">List</em> is an ordered, index-based sequence that allows duplicates. Two
+  implementations matter, and the whole interview is "which one, and why."
+</p>
+
+<h3><code>ArrayList</code> — a growable array</h3>
+<p>
+  Internally it's a plain array (<code>Object[]</code>). Because it's contiguous memory, reading
+  <code>list.get(i)</code> is a single jump — <strong>O(1)</strong>. When it fills up, it
+  <strong>grows by ~50%</strong>: it allocates a bigger array and copies everything over. That copy
+  is occasional, so appending is <strong>amortised O(1)</strong>.
+</p>
+
+<div class="analogy">
+  <p>
+    An <code>ArrayList</code> is a <strong>numbered row of lockers</strong>. Jumping to locker #457
+    is instant. But inserting a new locker in the <em>middle</em> means shifting every locker after
+    it down one — slow.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>ArrayList basics</b></figcaption>
+  <pre><code>List&lt;String&gt; fruits = new ArrayList&lt;&gt;();
+fruits.add("apple");            // append — O(1) amortised
+fruits.add("banana");
+fruits.add(1, "mango");         // insert at index 1 — shifts the rest, O(n)
+fruits.get(0);                  // "apple" — O(1) random access
+fruits.set(0, "avocado");       // replace — O(1)
+fruits.remove("banana");        // remove by value — O(n) to find + shift
+fruits.size();                  // 2
+System.out.println(fruits);     // [avocado, mango]</code></pre>
+</figure>
+
+<h3><code>LinkedList</code> — a doubly-linked chain of nodes</h3>
+<p>
+  Each element is a <em class="term">node</em> holding the value plus pointers to the previous and
+  next node. There's no array, so there's no shifting: inserting or deleting once you're
+  <em>at</em> a node is <strong>O(1)</strong>. But there's no index math either — to reach element
+  #457 you must walk 457 links, so <code>get(i)</code> is <strong>O(n)</strong>.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>ArrayList</th>
+        <th>LinkedList</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>get(i)</code> random access</td>
+        <td class="yes">O(1)</td>
+        <td class="no">O(n)</td>
+      </tr>
+      <tr>
+        <td>append at end</td>
+        <td class="yes">O(1)*</td>
+        <td class="yes">O(1)</td>
+      </tr>
+      <tr>
+        <td>insert / remove at front</td>
+        <td class="no">O(n)</td>
+        <td class="yes">O(1)</td>
+      </tr>
+      <tr>
+        <td>insert / remove in middle</td>
+        <td class="no">O(n)</td>
+        <td>O(n) to find, O(1) to unlink</td>
+      </tr>
+      <tr>
+        <td>memory per element</td>
+        <td class="yes">low (just the value)</td>
+        <td class="no">high (value + 2 pointers)</td>
+      </tr>
+      <tr>
+        <td>cache friendliness</td>
+        <td class="yes">excellent (contiguous)</td>
+        <td class="no">poor (scattered nodes)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The honest interview answer</strong>
+  <p>
+    Use <code>ArrayList</code> <strong>~95% of the time.</strong> Modern CPUs love contiguous
+    memory, so even "middle inserts" are often faster on an <code>ArrayList</code> than a
+    <code>LinkedList</code> because walking the linked nodes thrashes the cache.
+    <code>LinkedList</code>'s real niche is when you use it as a <code>Queue</code>/<code
+      >Deque</code
+    >
+    (constant-time add/remove at both ends). Default to <code>ArrayList</code> and only switch with
+    a measured reason.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Sizing tip</strong>
+  <p>
+    If you know roughly how many elements you'll add, pre-size it:
+    <code>new ArrayList&lt;&gt;(10_000)</code>. That skips the repeated grow-and-copy cycles and can
+    be a real speed-up in hot loops.
+  </p>
+</div>
+
+<div class="divider">Sets</div>
+
+<h2 id="set"><span class="num">03.</span> Set — HashSet, LinkedHashSet, TreeSet</h2>
+<p class="lead">
+  A <em class="term">Set</em> is a collection with <strong>no duplicates</strong>. "Duplicate" means
+  <code>a.equals(b)</code> is true — which is exactly why <code>equals</code>/<code>hashCode</code>
+  matter so much (covered in <a href="oops.html#object-class">the OOP notes</a>).
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Implementation</th>
+        <th>Ordering</th>
+        <th>Backed by</th>
+        <th>Speed (add/contains)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>HashSet</code></td>
+        <td>none (unpredictable)</td>
+        <td>a <code>HashMap</code></td>
+        <td class="yes">O(1) average</td>
+      </tr>
+      <tr>
+        <td><code>LinkedHashSet</code></td>
+        <td>insertion order</td>
+        <td><code>HashMap</code> + linked list</td>
+        <td class="yes">O(1) average</td>
+      </tr>
+      <tr>
+        <td><code>TreeSet</code></td>
+        <td>sorted order</td>
+        <td>a red-black tree</td>
+        <td>O(log n)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Same data, different order</b></figcaption>
+  <pre><code>Set&lt;Integer&gt; hash = new HashSet&lt;&gt;(List.of(3, 1, 2, 1));
+Set&lt;Integer&gt; linked = new LinkedHashSet&lt;&gt;(List.of(3, 1, 2, 1));
+Set&lt;Integer&gt; tree = new TreeSet&lt;&gt;(List.of(3, 1, 2, 1));
+
+System.out.println(hash);    // [1, 2, 3]  — no guaranteed order (looks sorted here by luck)
+System.out.println(linked);  // [3, 1, 2]  — the order you inserted
+System.out.println(tree);    // [1, 2, 3]  — always sorted ascending</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Which Set to reach for</strong>
+  <p>
+    <code>HashSet</code> when you just need uniqueness and don't care about order (the default).
+    <code>LinkedHashSet</code> when you want uniqueness <em>and</em> to remember insertion order
+    (e.g. de-duplicating a list while preserving sequence). <code>TreeSet</code> when you need the
+    elements kept sorted, or need range queries like "give me everything ≥ 10"
+    (<code>tailSet</code>, <code>ceiling</code>, <code>floor</code>).
+  </p>
+</div>
+
+<div class="warn">
+  <strong><code>TreeSet</code> needs ordering</strong>
+  <p>
+    Its elements must be <code>Comparable</code>, or you must hand it a <code>Comparator</code>. Put
+    non-comparable objects in without one and you get a <code>ClassCastException</code> at runtime.
+    Also, <code>TreeSet</code> decides "duplicate" using <code>compareTo == 0</code>, <em>not</em>
+    <code>equals</code> — a subtle trap.
+  </p>
+</div>
+
+<div class="divider">Maps — the big one</div>
+
+<h2 id="map"><span class="num">04.</span> Map — and how HashMap really works</h2>
+<p class="lead">
+  A <em class="term">Map</em> stores <strong>key → value</strong> pairs with unique keys. This is
+  the single most-asked Java topic after OOP, because <code>HashMap</code>'s internals touch
+  hashing, <code>equals</code>/<code>hashCode</code>, and data structures all at once.
+</p>
+
+<figure class="code">
+  <figcaption><b>Map basics</b></figcaption>
+  <pre><code>Map&lt;String, Integer&gt; ages = new HashMap&lt;&gt;();
+ages.put("Asha", 30);
+ages.put("Ravi", 25);
+ages.put("Asha", 31);            // same key → OVERWRITES, not duplicates. Now Asha = 31
+ages.get("Asha");                // 31
+ages.getOrDefault("Zoe", 0);     // 0 — key absent, returns the default
+ages.containsKey("Ravi");        // true
+ages.putIfAbsent("Ravi", 99);    // no-op, Ravi already present
+
+// Idiomatic counting / grouping:
+Map&lt;String, Integer&gt; count = new HashMap&lt;&gt;();
+for (String w : words) count.merge(w, 1, Integer::sum);   // +1 per word
+count.computeIfAbsent("list", k -&gt; new ArrayList&lt;&gt;());    // create-on-first-use pattern
+
+for (Map.Entry&lt;String, Integer&gt; e : ages.entrySet())
+    System.out.println(e.getKey() + " → " + e.getValue());</code></pre>
+</figure>
+
+<h3 id="hashmap-internals">Inside HashMap — the part interviewers love</h3>
+<div class="analogy">
+  <p>
+    Imagine a <strong>wall of numbered pigeonholes</strong> (an array called the
+    <em class="term">table</em>, made of "buckets"). To file a key, you compute a number from it
+    (its hash), map that number to a pigeonhole, and drop the entry in. To find it later, you
+    recompute the same number and go straight to that pigeonhole — no scanning the whole wall. That
+    direct jump is why lookups are <strong>O(1) on average</strong>.
+  </p>
+</div>
+
+<h4>Step by step: what <code>put(key, value)</code> does</h4>
+<ol class="clean">
+  <li>Call <code>key.hashCode()</code> to get a raw 32-bit number.</li>
+  <li>
+    <strong>Spread the bits</strong> (Java does <code>h ^ (h &gt;&gt;&gt; 16)</code>) so that even
+    keys with similar hashes land in different buckets. This mixing reduces collisions.
+  </li>
+  <li>
+    Map that to a bucket index with <code>hash &amp; (n - 1)</code>, where <code>n</code> is the
+    table length. (This works as a fast modulo
+    <em>because the table length is always a power of two</em> — that's why it is.)
+  </li>
+  <li>
+    Go to that bucket. If it's empty, place the entry. If something's already there — a
+    <strong>collision</strong> — walk the entries in that bucket comparing with
+    <code>hashCode</code> then <code>equals</code>. If a key <em>equals</em> an existing one,
+    overwrite its value; otherwise append the new entry.
+  </li>
+</ol>
+
+<div class="key">
+  <strong>Why keys need <code>hashCode</code> AND <code>equals</code></strong>
+  <p>
+    <code>hashCode</code> picks the <em>bucket</em> (fast, narrows a million entries to a handful).
+    <code>equals</code> confirms the <em>exact</em> key within that bucket (correct). You need both:
+    hashCode for speed, equals for correctness. Break the contract — equal objects with different
+    hashCodes — and your key gets filed in one bucket but looked up in another, so it "vanishes."
+    This is the single most important reason the
+    <a href="oops.html#object-class">equals/hashCode contract</a> exists.
+  </p>
+</div>
+
+<h4>Collisions: linked list, then tree</h4>
+<p>
+  When many keys land in the same bucket, they're chained together. Historically that chain was a
+  <strong>linked list</strong>, so a badly-collided bucket degraded lookups to
+  <strong>O(n)</strong>. Since Java 8, once a single bucket holds
+  <strong>8+ entries</strong> (<code>TREEIFY_THRESHOLD</code>) <em>and</em> the table is at least 64
+  slots, that bucket is converted into a <strong>balanced red-black tree</strong>, bringing
+  worst-case lookup back down to <strong>O(log n)</strong>. If the bucket later shrinks below 6, it
+  turns back into a list.
+</p>
+
+<h4>Resizing (rehashing)</h4>
+<p>
+  The map tracks a <em class="term">load factor</em> (default <strong>0.75</strong>). When the
+  number of entries exceeds <code>capacity × loadFactor</code> — e.g. 12 entries in a 16-slot table
+  — it <strong>doubles</strong> the table size and redistributes every entry into the new, larger
+  table. This keeps buckets short. Resizing is O(n) when it happens, but it's rare, so
+  <code>put</code>/<code>get</code> stay <strong>amortised O(1)</strong>.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Constant / default</th>
+        <th>Value</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>initial capacity</td>
+        <td>16</td>
+        <td>starting number of buckets</td>
+      </tr>
+      <tr>
+        <td>load factor</td>
+        <td>0.75</td>
+        <td>fill fraction that triggers a resize</td>
+      </tr>
+      <tr>
+        <td>resize multiplier</td>
+        <td>×2</td>
+        <td>capacity always doubles (stays a power of two)</td>
+      </tr>
+      <tr>
+        <td>treeify threshold</td>
+        <td>8</td>
+        <td>bucket becomes a tree at 8+ entries</td>
+      </tr>
+      <tr>
+        <td>untreeify threshold</td>
+        <td>6</td>
+        <td>tree reverts to a list below 6</td>
+      </tr>
+      <tr>
+        <td>min treeify capacity</td>
+        <td>64</td>
+        <td>below this it resizes instead of treeifying</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>Never use a mutable key</strong>
+  <p>
+    If you use an object as a key and then mutate a field that affects its <code>hashCode</code>,
+    the map computes a <em>new</em> bucket on lookup but the entry is still filed under the
+    <em>old</em> one — so <code>get</code> returns <code>null</code> even though the entry is right
+    there. Keys should be immutable (this is why <code>String</code> and the wrapper types make
+    ideal keys).
+  </p>
+</div>
+
+<h3>The other Maps</h3>
+<ul class="clean">
+  <li>
+    <strong><code>LinkedHashMap</code></strong> — a <code>HashMap</code> that also threads a linked
+    list through its entries to remember <strong>insertion order</strong> (or, with a flag,
+    <em>access</em> order — the basis of a simple <strong>LRU cache</strong>).
+  </li>
+  <li>
+    <strong><code>TreeMap</code></strong> — keeps keys <strong>sorted</strong> (red-black tree),
+    <code>O(log n)</code> operations, and adds navigation like <code>firstKey</code>,
+    <code>floorKey</code>, <code>headMap</code>, <code>subMap</code>.
+  </li>
+  <li>
+    <strong><code>Hashtable</code></strong> — legacy, fully synchronized, no null keys/values. For
+    thread-safety today use <code>ConcurrentHashMap</code> instead.
+  </li>
+</ul>
+
+<div class="note">
+  <strong>Nulls</strong>
+  <p>
+    <code>HashMap</code> allows <strong>one null key</strong> and many null values.
+    <code>TreeMap</code> allows null <em>values</em> but not null <em>keys</em> (it can't sort
+    null). <code>ConcurrentHashMap</code> and <code>Hashtable</code> allow
+    <strong>no nulls at all</strong>.
+  </p>
+</div>
+
+<div class="divider">Queues &amp; Deques</div>
+
+<h2 id="queue"><span class="num">05.</span> Queue, Deque &amp; PriorityQueue</h2>
+<p class="lead">
+  A <em class="term">Queue</em> models a line of items waiting to be processed. A
+  <em class="term">Deque</em> ("deck") is a double-ended queue — push and pop at both ends, so it
+  can act as either a queue (FIFO) or a stack (LIFO).
+</p>
+
+<figure class="code">
+  <figcaption><b>ArrayDeque as both a queue and a stack</b></figcaption>
+  <pre><code>Deque&lt;Integer&gt; dq = new ArrayDeque&lt;&gt;();
+
+// As a FIFO queue:
+dq.offer(1); dq.offer(2);       // add to tail
+dq.poll();                      // 1 — remove from head
+
+// As a LIFO stack (use this, NOT the legacy Stack class):
+dq.push(10); dq.push(20);       // add to head
+dq.pop();                       // 20 — remove from head
+dq.peek();                      // 10 — look without removing</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Use <code>ArrayDeque</code>, not <code>Stack</code></strong>
+  <p>
+    The old <code>Stack</code> class extends <code>Vector</code> and is synchronized and slow. For
+    stack or queue behaviour, <code>ArrayDeque</code> is the modern, faster choice.
+  </p>
+</div>
+
+<h3><code>PriorityQueue</code> — a heap</h3>
+<p>
+  A <code>PriorityQueue</code> doesn't return items in insertion order — it returns the
+  <strong>smallest</strong> (or by your <code>Comparator</code>, the "highest priority") first. It's
+  backed by a <em class="term">binary heap</em>: <code>offer</code> and <code>poll</code> are
+  <code>O(log n)</code>, peeking at the top is <code>O(1)</code>. It's the go-to for "top-K,"
+  scheduling, and Dijkstra-style algorithms.
+</p>
+
+<figure class="code">
+  <figcaption><b>PriorityQueue</b></figcaption>
+  <pre><code>PriorityQueue&lt;Integer&gt; pq = new PriorityQueue&lt;&gt;();     // min-heap by default
+pq.offer(5); pq.offer(1); pq.offer(3);
+pq.poll();   // 1  (smallest first)
+pq.poll();   // 3
+
+// Max-heap: reverse the comparator
+PriorityQueue&lt;Integer&gt; max = new PriorityQueue&lt;&gt;(Comparator.reverseOrder());</code></pre>
+</figure>
+
+<div class="divider">Working with collections</div>
+
+<h2 id="iteration"><span class="num">06.</span> Iterating — and the fail-fast trap</h2>
+<p class="lead">
+  You'll loop over collections constantly. The one thing that bites everyone is modifying a
+  collection <em>while</em> iterating it.
+</p>
+
+<figure class="code">
+  <figcaption><b>Ways to iterate</b></figcaption>
+  <pre><code>List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("a", "b", "c"));
+
+for (String n : names) { ... }                  // for-each (uses an Iterator under the hood)
+
+Iterator&lt;String&gt; it = names.iterator();         // explicit iterator
+while (it.hasNext()) {
+    String n = it.next();
+    if (n.equals("b")) it.remove();             // SAFE removal during iteration
+}
+
+names.removeIf(n -&gt; n.startsWith("a"));         // cleanest conditional removal (Java 8+)</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>ConcurrentModificationException</strong>
+  <p>
+    If you add or remove from a collection <em>through the collection itself</em> while a for-each
+    loop is running over it, most implementations throw
+    <code>ConcurrentModificationException</code>. They're <strong>fail-fast</strong>: they keep a
+    <code>modCount</code> and notice the structure changed underneath the iterator. The fix is to
+    mutate <em>through the iterator</em> (<code>it.remove()</code>) or use <code>removeIf</code>.
+    Despite the name, this happens in ordinary single-threaded code — it has nothing to do with
+    threads.
+  </p>
+</div>
+
+<h2 id="ordering"><span class="num">07.</span> Comparable vs Comparator — sorting</h2>
+<p class="lead">
+  To sort objects, Java needs to know what "less than" means. Two mechanisms: build the ordering
+  <em>into</em> the class (<code>Comparable</code>), or supply it <em>from outside</em>
+  (<code>Comparator</code>).
+</p>
+
+<ul class="clean">
+  <li>
+    <strong><code>Comparable&lt;T&gt;</code></strong> — implemented <em>by the class itself</em>;
+    defines its one <em>natural ordering</em> via <code>compareTo</code>. Example:
+    <code>String</code> sorts alphabetically, <code>Integer</code> numerically.
+  </li>
+  <li>
+    <strong><code>Comparator&lt;T&gt;</code></strong> — a <em>separate</em> object defining
+    <em>an</em> ordering. You can make many (by name, by age, reversed) without touching the class.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Both, side by side</b></figcaption>
+  <pre><code>class Person implements Comparable&lt;Person&gt; {
+    String name; int age;
+    // natural ordering: by age
+    public int compareTo(Person o) { return Integer.compare(this.age, o.age); }
+}
+
+List&lt;Person&gt; people = ...;
+Collections.sort(people);                        // uses compareTo (by age)
+
+// External comparators — compose them fluently:
+people.sort(Comparator.comparing(p -&gt; p.name));                    // by name
+people.sort(Comparator.comparingInt((Person p) -&gt; p.age).reversed());  // oldest first
+people.sort(Comparator.comparing((Person p) -&gt; p.name)
+                      .thenComparingInt(p -&gt; p.age));               // name, then age</code></pre>
+</figure>
+
+<div class="note">
+  <strong>The contract</strong>
+  <p>
+    <code>compareTo</code>/<code>compare</code> returns a <strong>negative</strong> number if
+    <code>this</code> is "less," <strong>zero</strong> if equal, <strong>positive</strong> if
+    "greater." Keep it consistent with <code>equals</code> where possible, and never implement it as
+    <code>a - b</code> on ints that could overflow — use <code>Integer.compare(a, b)</code>.
+  </p>
+</div>
+
+<h2 id="utilities"><span class="num">08.</span> Collections &amp; Arrays utility classes</h2>
+<p>
+  Two helper classes carry the algorithms. <code>Collections</code> (with an "s") operates on
+  collections; <code>Arrays</code> operates on arrays.
+</p>
+<figure class="code">
+  <figcaption><b>Handy static helpers</b></figcaption>
+  <pre><code>Collections.sort(list);
+Collections.reverse(list);
+Collections.max(list);  Collections.min(list);
+Collections.frequency(list, x);
+Collections.unmodifiableList(list);        // read-only VIEW (throws on modify)
+Collections.synchronizedList(list);        // thread-safe wrapper (coarse locking)
+
+int[] arr = {3, 1, 2};
+Arrays.sort(arr);
+Arrays.toString(arr);                      // "[1, 2, 3]"
+List&lt;Integer&gt; view = Arrays.asList(1, 2, 3);   // FIXED-SIZE list backed by an array
+
+// Immutable factory methods (Java 9+): truly unmodifiable, reject nulls:
+List&lt;String&gt; ro = List.of("a", "b");
+Map&lt;String, Integer&gt; m = Map.of("a", 1, "b", 2);</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Two "immutable-ish" traps</strong>
+  <p>
+    <code>Arrays.asList(...)</code> is <strong>fixed-size</strong>: you can <code>set</code> an
+    element but <code>add</code>/<code>remove</code> throws. And
+    <code>Collections.unmodifiableList</code> returns a <em>view</em> — if you keep a reference to
+    the original backing list and change <em>that</em>, the "unmodifiable" view reflects it. For
+    genuinely immutable copies, use <code>List.of(...)</code> / <code>List.copyOf(...)</code>.
+  </p>
+</div>
+
+<div class="divider">Reference</div>
+
+<h2 id="big-o"><span class="num">09.</span> Complexity cheat sheet</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Structure</th>
+        <th>Access</th>
+        <th>Search</th>
+        <th>Insert</th>
+        <th>Delete</th>
+        <th>Ordered?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ArrayList</code></td>
+        <td class="yes">O(1)</td>
+        <td>O(n)</td>
+        <td>O(1)* / O(n) mid</td>
+        <td>O(n)</td>
+        <td>insertion</td>
+      </tr>
+      <tr>
+        <td><code>LinkedList</code></td>
+        <td>O(n)</td>
+        <td>O(n)</td>
+        <td class="yes">O(1) at ends</td>
+        <td class="yes">O(1) at node</td>
+        <td>insertion</td>
+      </tr>
+      <tr>
+        <td><code>HashMap</code>/<code>HashSet</code></td>
+        <td>—</td>
+        <td class="yes">O(1) avg</td>
+        <td class="yes">O(1) avg</td>
+        <td class="yes">O(1) avg</td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td><code>LinkedHashMap</code>/<code>Set</code></td>
+        <td>—</td>
+        <td class="yes">O(1) avg</td>
+        <td class="yes">O(1) avg</td>
+        <td class="yes">O(1) avg</td>
+        <td>insertion</td>
+      </tr>
+      <tr>
+        <td><code>TreeMap</code>/<code>TreeSet</code></td>
+        <td>—</td>
+        <td>O(log n)</td>
+        <td>O(log n)</td>
+        <td>O(log n)</td>
+        <td>sorted</td>
+      </tr>
+      <tr>
+        <td><code>ArrayDeque</code></td>
+        <td>—</td>
+        <td>O(n)</td>
+        <td class="yes">O(1) at ends</td>
+        <td class="yes">O(1) at ends</td>
+        <td>insertion</td>
+      </tr>
+      <tr>
+        <td><code>PriorityQueue</code></td>
+        <td>O(1) peek</td>
+        <td>O(n)</td>
+        <td>O(log n)</td>
+        <td>O(log n) min</td>
+        <td>by priority</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+<p><small>* amortised — occasional resize copies are O(n) but rare.</small></p>
+
+<h2 id="choosing"><span class="num">10.</span> How to choose — a decision guide</h2>
+<div class="dd">
+  <div class="do">
+    <h5>✓ Pick by the question you're answering</h5>
+    <ul>
+      <li>"Ordered list, index access, duplicates OK" → <strong>ArrayList</strong></li>
+      <li>"Unique items, order doesn't matter" → <strong>HashSet</strong></li>
+      <li>"Unique items, keep insertion order" → <strong>LinkedHashSet</strong></li>
+      <li>"Unique items, kept sorted / range queries" → <strong>TreeSet</strong></li>
+      <li>"Look up a value by a key" → <strong>HashMap</strong></li>
+      <li>"…and keep keys sorted" → <strong>TreeMap</strong></li>
+      <li>"Queue / stack / both ends" → <strong>ArrayDeque</strong></li>
+      <li>"Always pull the smallest / highest-priority" → <strong>PriorityQueue</strong></li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h5>✗ Don't</h5>
+    <ul>
+      <li>Reach for <code>LinkedList</code> without a measured reason.</li>
+      <li>Use legacy <code>Vector</code>/<code>Stack</code>/<code>Hashtable</code> in new code.</li>
+      <li>
+        Use a <code>HashMap</code> from multiple threads — use <code>ConcurrentHashMap</code>.
+      </li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="gotchas"><span class="num">11.</span> Gotchas — where Java surprises you</h2>
+<div class="qa">
+  <p class="q">1. Autoboxing in collections is silent and costly.</p>
+  <p class="a">
+    <code>List&lt;Integer&gt;</code> stores boxed <code>Integer</code> objects, not
+    <code>int</code>s. In a tight numeric loop that's a lot of allocation. And
+    <code>list.remove(2)</code> removes <em>index</em> 2, while
+    <code>list.remove(Integer.valueOf(2))</code> removes the <em>value</em> 2 — a classic bug.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">
+    2. <code>HashMap</code> iteration order is not guaranteed — and can change between runs.
+  </p>
+  <p class="a">Never rely on it. Use <code>LinkedHashMap</code> if you need a predictable order.</p>
+</div>
+<div class="qa">
+  <p class="q">
+    3. Storing objects with broken <code>equals</code>/<code>hashCode</code> in a Set/Map.
+  </p>
+  <p class="a">
+    Duplicates sneak in, or lookups fail. Always override both together for anything used as a key
+    or set element. Records (Java 16+) generate correct versions for you.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">
+    4. <code>TreeSet</code>/<code>TreeMap</code> use <code>compareTo</code>, not
+    <code>equals</code>, to detect duplicates.
+  </p>
+  <p class="a">
+    If your comparator says two different objects are "equal" (returns 0), the second is dropped —
+    even if <code>equals</code> says they differ.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">12.</span> Interview Q&amp;A</h2>
+<div class="qa">
+  <p class="q">Q: How does HashMap work internally?</p>
+  <p class="a">
+    An array of buckets. <code>put</code> hashes the key, spreads the bits, maps it to a bucket with
+    <code>hash &amp; (n-1)</code>, and stores it; collisions chain in the bucket (list, or a
+    red-black tree once 8+ entries). At 75% full it doubles and rehashes. Lookups are O(1) average,
+    O(log n) worst case since Java 8.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Q: ArrayList vs LinkedList?</p>
+  <p class="a">
+    ArrayList = growable array, O(1) random access, O(n) middle inserts, cache-friendly. LinkedList
+    = node chain, O(1) end operations, O(n) access, more memory. Default to ArrayList; LinkedList
+    mainly earns its place as a deque.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Q: Why must a good HashMap key be immutable?</p>
+  <p class="a">
+    Because its bucket is chosen from its hashCode at insertion. Mutate a field that changes the
+    hashCode and the entry becomes unreachable — filed under the old bucket, searched under the new
+    one.
+  </p>
+</div>
+<div class="qa">
+  <p class="q">Q: HashMap vs Hashtable vs ConcurrentHashMap?</p>
+  <p class="a">
+    HashMap: fast, not thread-safe, allows one null key. Hashtable: legacy, fully synchronized, no
+    nulls. ConcurrentHashMap: thread-safe with fine-grained locking/CAS (locks per bucket, not the
+    whole map), no nulls — the modern choice for concurrency.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">13.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Two trees:</strong> <code>Collection</code> (List/Set/Queue) and
+    <code>Map</code> (separate).
+  </li>
+  <li>
+    <strong>Default picks:</strong> <code>ArrayList</code>, <code>HashSet</code>,
+    <code>HashMap</code>, <code>ArrayDeque</code>.
+  </li>
+  <li>
+    <strong>Need order?</strong> <code>LinkedHashSet</code>/<code>LinkedHashMap</code> (insertion)
+    or <code>TreeSet</code>/<code>TreeMap</code> (sorted).
+  </li>
+  <li>
+    <strong>HashMap:</strong> 16 buckets, load factor 0.75, doubles on resize, treeifies buckets at
+    8.
+  </li>
+  <li>
+    <strong>Keys &amp; set elements</strong> must have correct, immutable
+    <code>equals</code>/<code>hashCode</code>.
+  </li>
+  <li>
+    <strong>Mutating while iterating?</strong> Use <code>Iterator.remove</code> or
+    <code>removeIf</code>, never the collection directly.
+  </li>
+  <li>
+    <strong>Sorting:</strong> <code>Comparable</code> = one natural order in the class;
+    <code>Comparator</code> = many orders from outside.
+  </li>
+  <li>
+    <strong>Thread-safe map:</strong> <code>ConcurrentHashMap</code>, not <code>Hashtable</code>.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

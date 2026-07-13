@@ -2,7 +2,11 @@
   "topics": [
     {
       "name": "Java",
-      "pages": [{ "title": "OOP", "path": "java/oops" }]
+      "pages": [
+        { "title": "OOP", "path": "java/oops" },
+        { "title": "Collections Framework", "path": "java/collections" },
+        { "title": "Generics", "path": "java/generics" }
+      ]
     }
   ]
 }
