@@ -225,10 +225,26 @@ a {
   background: var(--fill-2);
   font-size: 14px;
 }
-.toc b {
+.toc-head {
   display: block;
-  margin-bottom: 8px;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+  pointer-events: none;
+}
+.toc-head b {
   font-size: 15px;
+}
+.toc-chevron {
+  display: none;
+  flex: none;
+  color: var(--faint);
 }
 .toc ol {
   margin: 0;
@@ -258,6 +274,31 @@ a {
   inset: 0;
   z-index: 30;
   background: rgba(0, 0, 0, 0.28);
+}
+
+.to-top {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+.to-top:hover {
+  color: var(--text);
+  border-color: #bbb;
+}
+.to-top[hidden] {
+  display: none;
 }
 
 h1 {
@@ -638,6 +679,41 @@ footer.doc-footer {
   .content {
     padding: 24px 22px 64px;
   }
+  .toc {
+    display: block;
+    order: -1;
+    position: static;
+    max-height: none;
+    overflow: visible;
+    margin: 18px 22px 4px;
+    padding: 8px 12px;
+  }
+  .toc-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0;
+    cursor: pointer;
+    pointer-events: auto;
+  }
+  .toc-chevron {
+    display: block;
+    transition: transform 0.2s ease;
+  }
+  .toc-head[aria-expanded="true"] .toc-chevron {
+    transform: rotate(180deg);
+  }
+  .toc-head[aria-expanded="false"] + ol {
+    display: none;
+  }
+  .toc-head[aria-expanded="true"] + ol {
+    margin-top: 12px;
+  }
+  .to-top {
+    right: 10px;
+    bottom: 24px;
+  }
 }
 @media (max-width: 480px) {
   body {
@@ -651,6 +727,9 @@ footer.doc-footer {
   }
   .content {
     padding: 20px 16px 56px;
+  }
+  .toc {
+    margin: 14px 16px 2px;
   }
   .breadcrumb .crumb-hide {
     display: none;

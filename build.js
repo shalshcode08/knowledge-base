@@ -57,8 +57,11 @@ function buildContents(html) {
   if (!items.length) return "";
   return (
     `      <aside class="toc" aria-label="On this page">\n` +
-    `        <b>Contents</b>\n` +
-    `        <ol start="0">\n${items.join("\n")}\n        </ol>\n` +
+    `        <button type="button" class="toc-head" aria-expanded="false" aria-controls="tocList">\n` +
+    `          <b>Contents</b>\n` +
+    `          <svg class="toc-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>\n` +
+    `        </button>\n` +
+    `        <ol id="tocList" start="0">\n${items.join("\n")}\n        </ol>\n` +
     `      </aside>`
   );
 }
