@@ -11,46 +11,48 @@
   </head>
   <body class="{{BODYCLASS}}" data-root="{{ROOT}}">
     <header class="site-header">
-      <button
-        type="button"
-        class="menu-toggle"
-        id="menuToggle"
-        aria-label="Open navigation"
-        aria-expanded="false"
-      >
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
+      <div class="header-inner">
+        <button
+          type="button"
+          class="menu-toggle"
+          id="menuToggle"
+          aria-label="Open navigation"
+          aria-expanded="false"
         >
-          <line x1="3" y1="6" x2="21" y2="6" />
-          <line x1="3" y1="12" x2="21" y2="12" />
-          <line x1="3" y1="18" x2="21" y2="18" />
-        </svg>
-      </button>
-      <a class="brand" href="{{ROOT}}index.html">
-        <img class="logo" src="{{ROOT}}knowledge_base_logo.png" alt="" width="26" height="26" />
-        <span class="name">knowledge<span>-base</span></span>
-      </a>
-      <div class="breadcrumb">{{BREADCRUMB}}</div>
-      <div class="header-spacer"></div>
-      <button type="button" class="search" id="searchOpen" aria-label="Search notes">
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-        >
-          <circle cx="11" cy="11" r="7" />
-          <line x1="21" y1="21" x2="16.65" y2="16.65" />
-        </svg>
-        <span>Search notes…</span>
-        <span class="kbd">⌘K</span>
-      </button>
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+          >
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        </button>
+        <a class="brand" href="{{ROOT}}index.html">
+          <img class="logo" src="{{ROOT}}knowledge_base_logo.png" alt="" width="26" height="26" />
+          <span class="name">knowledge<span>-base</span></span>
+        </a>
+        <div class="breadcrumb">{{BREADCRUMB}}</div>
+        <div class="header-spacer"></div>
+        <button type="button" class="search" id="searchOpen" aria-label="Search notes">
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <circle cx="11" cy="11" r="7" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <span>Search notes…</span>
+          <span class="kbd">⌘K</span>
+        </button>
+      </div>
     </header>
 
     {{MAIN}}
