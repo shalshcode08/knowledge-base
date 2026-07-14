@@ -10,9 +10,9 @@ You write **content-only HTML** (just the `<h1>`, callouts, code, tables — no 
 static site to `dist/`. Push to `main` → CI checks it → Cloudflare Pages serves it.
 
 ```
-src/content/java/oops.html   ──┐
-manifest.json  (nav order)     ├──►  node build.js  ──►  dist/  ──►  Cloudflare Pages
-src/shell.html + src/styles.css┘
+src/content/java/oops.html      ─┐
+manifest.json  (nav order)       ├──►  node build.js  ──►  dist/  ──►  Cloudflare Pages
+src/shell.html + src/styles.css ─┘
 ```
 
 ## Repo layout
