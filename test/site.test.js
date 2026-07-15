@@ -353,3 +353,86 @@ test("logo + icons are present and referenced on every page", () => {
   }
   assertNoProblems("logo + icons", problems);
 });
+
+const SITE_URL = (process.env.SITE_URL || "https://knowledge-base.somyashrestha.space").replace(
+  /\/+$/,
+  "",
+);
+const pageUrl = (p) => `${SITE_URL}/${p}.html`;
+
+test("sitemap.xml lists the homepage and every page", () => {
+  const problems = [];
+  const file = path.join(DIST, "sitemap.xml");
+  if (!fs.existsSync(file)) {
+    problems.push("dist/sitemap.xml missing");
+    return assertNoProblems("sitemap", problems);
+  }
+  const xml = fs.readFileSync(file, "utf8");
+  if (!xml.startsWith("<?xml")) problems.push("sitemap.xml missing XML declaration");
+  if (!xml.includes("http://www.sitemaps.org/schemas/sitemap/0.9"))
+    problems.push("sitemap.xml missing urlset namespace");
+  const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+  if (!locs.includes(`${SITE_URL}/`)) problems.push("sitemap.xml missing homepage URL");
+  for (const p of allPagePaths(MANIFEST)) {
+    if (!locs.includes(pageUrl(p))) problems.push(`sitemap.xml missing ${pageUrl(p)}`);
+  }
+  for (const loc of locs) {
+    if (!loc.startsWith(SITE_URL + "/"))
+      problems.push(`sitemap.xml has a non-canonical URL: ${loc}`);
+  }
+  const expected = allPagePaths(MANIFEST).length + 1;
+  if (locs.length !== expected)
+    problems.push(`sitemap.xml has ${locs.length} URLs, expected ${expected}`);
+  const lastmods = [...xml.matchAll(/<lastmod>([^<]+)<\/lastmod>/g)].map((m) => m[1]);
+  for (const d of lastmods) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) problems.push(`sitemap.xml has a bad <lastmod>: ${d}`);
+  }
+  assertNoProblems("sitemap", problems);
+});
+
+test("rss.xml is a valid feed covering every note", () => {
+  const problems = [];
+  const file = path.join(DIST, "rss.xml");
+  if (!fs.existsSync(file)) {
+    problems.push("dist/rss.xml missing");
+    return assertNoProblems("rss", problems);
+  }
+  const xml = fs.readFileSync(file, "utf8");
+  if (!xml.startsWith("<?xml")) problems.push("rss.xml missing XML declaration");
+  if (!/<rss version="2\.0"/.test(xml)) problems.push("rss.xml is not an RSS 2.0 document");
+  if (!xml.includes(`<link>${SITE_URL}/</link>`)) problems.push("rss.xml channel link is wrong");
+  if (!xml.includes(`href="${SITE_URL}/rss.xml"`))
+    problems.push("rss.xml missing atom:link self reference");
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].map((m) => m[1]);
+  const pages = allPagePaths(MANIFEST);
+  if (items.length !== pages.length)
+    problems.push(`rss.xml has ${items.length} items, expected ${pages.length}`);
+  const links = items.map((it) => (it.match(/<link>([^<]+)<\/link>/) || [])[1]);
+  for (const p of pages) {
+    if (!links.includes(pageUrl(p))) problems.push(`rss.xml missing an item for ${pageUrl(p)}`);
+  }
+  for (const it of items) {
+    if (!/<title>[^<]+<\/title>/.test(it)) problems.push("an rss item has no <title>");
+    if (!/<guid[^>]*>[^<]+<\/guid>/.test(it)) problems.push("an rss item has no <guid>");
+    if (!/<pubDate>[^<]+<\/pubDate>/.test(it)) problems.push("an rss item has no <pubDate>");
+  }
+  assertNoProblems("rss", problems);
+});
+
+test("robots.txt points at the sitemap and every page links the feed", () => {
+  const problems = [];
+  const robots = path.join(DIST, "robots.txt");
+  if (!fs.existsSync(robots)) {
+    problems.push("dist/robots.txt missing");
+  } else {
+    const txt = fs.readFileSync(robots, "utf8");
+    if (!txt.includes(`Sitemap: ${SITE_URL}/sitemap.xml`))
+      problems.push("robots.txt does not reference the sitemap");
+  }
+  for (const f of distHtmlFiles()) {
+    const html = fs.readFileSync(path.join(DIST, f), "utf8");
+    if (!/rel="alternate"[\s\S]*?application\/rss\+xml/.test(html))
+      problems.push(`${f}: missing RSS <link rel="alternate">`);
+  }
+  assertNoProblems("robots + feed discovery", problems);
+});
