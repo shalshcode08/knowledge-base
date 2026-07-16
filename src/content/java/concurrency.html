@@ -1,0 +1,2050 @@
+<h1>Java Concurrency &amp; Multithreading — Complete Notes</h1>
+<p class="subtitle">
+  Threads, locks, visibility, the memory model, executors, CompletableFuture and virtual threads —
+  built up from why shared memory is dangerous, through to the tools that make it safe. This is
+  where backend interviews get serious.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> Why any of this exists</h2>
+<p class="lead">
+  <em class="term">Concurrency</em> is structuring a program so several things can be
+  <strong>in progress</strong> at once. <em class="term">Parallelism</em> is actually
+  <strong>executing</strong> them at the same instant on different cores. You can have concurrency
+  on a single core; parallelism needs real hardware.
+</p>
+
+<div class="analogy">
+  <p>
+    <strong>Concurrency</strong> is one cook juggling three pans — chopping while the water boils,
+    switching between tasks so nothing sits idle. <strong>Parallelism</strong> is three cooks, one
+    pan each. Concurrency is about <em>dealing with</em> many things at once; parallelism is about
+    <em>doing</em> many things at once.
+  </p>
+</div>
+
+<p>You reach for threads for exactly two reasons:</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Goal</th>
+        <th>The problem</th>
+        <th>What helps</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Throughput</strong> (I/O-bound)</td>
+        <td>A thread waiting on the network is a wasted CPU</td>
+        <td>Many threads, so someone always has work</td>
+      </tr>
+      <tr>
+        <td><strong>Speed</strong> (CPU-bound)</td>
+        <td>One core is doing all the work; the other 7 idle</td>
+        <td>Split the work across cores</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Process vs thread</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Process</th>
+        <th>Thread</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Memory</td>
+        <td>Its own, isolated</td>
+        <td><strong>Shared</strong> with sibling threads</td>
+      </tr>
+      <tr>
+        <td>Cost to create</td>
+        <td>Heavy</td>
+        <td>Lighter (~1MB stack each, still not free)</td>
+      </tr>
+      <tr>
+        <td>Communication</td>
+        <td>IPC, sockets, pipes — explicit</td>
+        <td>Just read the same variable — implicit</td>
+      </tr>
+      <tr>
+        <td>A crash…</td>
+        <td>Kills only itself</td>
+        <td>Can take the whole process down</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The one sentence that explains every bug in this document</strong>
+  <p>
+    Threads <strong>share memory by default</strong>. That's what makes them fast, and it's what
+    makes them dangerous — two threads touching the same variable with no coordination is the root
+    of every race condition, visibility bug and deadlock you will ever write.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Coming from Go</strong>
+  <p>
+    Go's motto is "share memory by communicating" — goroutines pass data over channels. Java's
+    default is the opposite: "communicate by sharing memory", and it's your job to guard it. The
+    mapping is roughly: <strong>goroutine → thread</strong> (or virtual thread, which is much
+    closer) · <strong>channel → <code>BlockingQueue</code></strong> ·
+    <strong><code>sync.Mutex</code> → <code>synchronized</code>/<code>ReentrantLock</code></strong>
+    · <strong><code>sync/atomic</code> → <code>java.util.concurrent.atomic</code></strong> ·
+    <strong><code>WaitGroup</code> → <code>CountDownLatch</code></strong> ·
+    <strong><code>go f()</code> → <code>executor.submit(f)</code></strong
+    >. Java's race detector equivalent is… discipline. There is no <code>-race</code> flag.
+  </p>
+</div>
+
+<h2 id="threads"><span class="num">01.</span> Threads — creating and controlling</h2>
+<p class="lead">
+  A <em class="term">thread</em> is an independent path of execution with its own call stack,
+  running inside your process and sharing its heap.
+</p>
+
+<figure class="code">
+  <figcaption><b>Three ways to start one — prefer the third</b></figcaption>
+  <pre><code>// 1. Extend Thread — DON'T. Burns your single inheritance slot, couples task to mechanism.
+class MyThread extends Thread {
+    public void run() { System.out.println("running"); }
+}
+new MyThread().start();
+
+// 2. Implement Runnable — the task is a separate thing from the thread running it
+class MyTask implements Runnable {
+    public void run() { System.out.println("running"); }
+}
+new Thread(new MyTask()).start();
+
+// 3. A lambda + an executor — what you should actually write (see section 08)
+executor.submit(() -&gt; System.out.println("running"));</code></pre>
+</figure>
+
+<div class="warn">
+  <strong><code>start()</code> vs <code>run()</code> — the classic trick question</strong>
+  <p>
+    <code>start()</code> asks the JVM for a <strong>new thread</strong>, which then calls
+    <code>run()</code>. Calling <code>run()</code> directly is just an
+    <strong>ordinary method call on the current thread</strong> — no concurrency at all, and no
+    error to tell you. Also: calling <code>start()</code> twice throws
+    <code>IllegalThreadStateException</code>. A thread is not reusable.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Proof</b></figcaption>
+  <pre><code>Runnable task = () -&gt; System.out.println(Thread.currentThread().getName());
+
+new Thread(task).start();   // prints "Thread-0"  — a real new thread
+new Thread(task).run();     // prints "main"      — no thread was created!</code></pre>
+</figure>
+
+<h3>The six thread states</h3>
+<figure class="code">
+  <figcaption><b>Thread.State — and what moves you between them</b></figcaption>
+  <pre><code>     NEW                          created, start() not yet called
+      |  start()
+      v
+   RUNNABLE  &lt;-------------+     runnable or running (Java doesn't distinguish)
+      |                    |
+      |  wants a lock      | lock acquired
+      v                    |
+   BLOCKED  --------------+      waiting to enter a synchronized block
+      |
+      |  wait() / join() / park()
+      v
+   WAITING  ---------------+     waiting indefinitely for another thread
+      |  notify()/notifyAll()/interrupt()
+      |
+      |  wait(t) / sleep(t) / join(t)
+      v
+ TIMED_WAITING ----------+       same, but with a deadline
+      |
+      v
+  TERMINATED                     run() finished (or threw)</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>State</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>NEW</code></td>
+        <td>Object exists, <code>start()</code> not called</td>
+      </tr>
+      <tr>
+        <td><code>RUNNABLE</code></td>
+        <td>Eligible to run — may or may not be on a CPU right now</td>
+      </tr>
+      <tr>
+        <td><code>BLOCKED</code></td>
+        <td>
+          Waiting for a <strong>monitor lock</strong> (i.e. to enter <code>synchronized</code>)
+        </td>
+      </tr>
+      <tr>
+        <td><code>WAITING</code></td>
+        <td>
+          <code>wait()</code>, <code>join()</code>, <code>LockSupport.park()</code> — no timeout
+        </td>
+      </tr>
+      <tr>
+        <td><code>TIMED_WAITING</code></td>
+        <td>
+          <code>sleep(n)</code>, <code>wait(n)</code>, <code>join(n)</code>, <code>tryLock(n)</code>
+        </td>
+      </tr>
+      <tr>
+        <td><code>TERMINATED</code></td>
+        <td>Finished. Cannot restart.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong><code>BLOCKED</code> vs <code>WAITING</code></strong>
+  <p>
+    <code>BLOCKED</code> = "I want a lock someone else holds" — nobody has to do anything, I'll get
+    in when they leave. <code>WAITING</code> = "I've been told to wait and I need someone to
+    <strong>actively wake me</strong>" (<code>notify</code>, <code>signal</code>,
+    <code>unpark</code>). A <code>WAITING</code> thread with nobody to wake it waits forever. This
+    distinction is the first thing you look for in a thread dump.
+  </p>
+</div>
+
+<h3>Essential thread methods</h3>
+<figure class="code">
+  <figcaption><b>What you'll actually call</b></figcaption>
+  <pre><code>Thread.sleep(1000);            // pause THIS thread ~1s. Holds any locks it owns! (see gotchas)
+t.join();                      // block until t finishes
+t.join(500);                   // ...or 500ms, whichever comes first
+t.interrupt();                 // politely ASK t to stop — see below
+Thread.currentThread();        // who am I
+t.setDaemon(true);             // JVM won't wait for this thread to exit (MUST be before start())
+t.setName("worker-1");         // do this — it makes thread dumps readable
+Thread.yield();                // "I'd share the CPU" — a hint, usually useless</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Interruption is a request, not a command</strong>
+  <p>
+    Java has <strong>no way to kill a thread</strong>. <code>t.interrupt()</code> just sets a flag.
+    If the thread is blocked in <code>sleep</code>/<code>wait</code>/<code>join</code>, it throws
+    <code>InterruptedException</code> and <strong>clears the flag</strong>. Otherwise the thread
+    must check <code>Thread.interrupted()</code> itself. Cooperative cancellation is the only
+    cancellation there is. (<code>Thread.stop()</code> exists, is deeply broken, and was removed.)
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Handling interruption correctly — the two valid options</b></figcaption>
+  <pre><code>// Option A — let it propagate (best, if your signature allows it)
+void work() throws InterruptedException {
+    Thread.sleep(1000);
+}
+
+// Option B — you can't rethrow (e.g. inside Runnable.run) -&gt; RESTORE THE FLAG
+public void run() {
+    try {
+        Thread.sleep(1000);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();   // put the flag back!
+        return;                               // and actually stop
+    }
+}
+
+// WRONG — swallows the request. Your app now won't shut down.
+try { Thread.sleep(1000); } catch (InterruptedException e) { }   // never do this</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>A cancellable loop</b></figcaption>
+  <pre><code>public void run() {
+    while (!Thread.currentThread().isInterrupted()) {
+        doChunkOfWork();
+    }
+    cleanup();
+}</code></pre>
+</figure>
+
+<h2 id="problems"><span class="num">02.</span> The problem — shared mutable state</h2>
+<p class="lead">
+  Every concurrency bug traces back to one of three things:
+  <strong>atomicity</strong> (an operation isn't as indivisible as it looks),
+  <strong>visibility</strong> (a thread never sees another's write), and
+  <strong>ordering</strong> (things didn't happen in the order you wrote them).
+</p>
+
+<h3>Problem 1: atomicity — <code>i++</code> is a lie</h3>
+<figure class="code">
+  <figcaption><b>One character of source, three operations in bytecode</b></figcaption>
+  <pre><code>count++;
+
+// is really:
+//   1. READ  count from memory        (getfield)
+//   2. ADD   1 to the value           (iadd)
+//   3. WRITE the result back          (putfield)
+//
+// Another thread can interleave at ANY point between them.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>The lost update — watch two increments produce one</b></figcaption>
+  <pre><code>// count = 0
+
+// Thread A            | Thread B
+// read count  -&gt; 0    |
+//                     | read count  -&gt; 0      &lt;- B reads before A wrote
+// add 1       -&gt; 1    |
+//                     | add 1       -&gt; 1
+// write 1             |
+//                     | write 1               &lt;- overwrites A's work
+//
+// count == 1. Two increments happened. One vanished.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Run it yourself — it fails every time</b></figcaption>
+  <pre><code>class Counter {
+    private int count = 0;
+    public void increment() { count++; }
+    public int get() { return count; }
+}
+
+Counter c = new Counter();
+Thread t1 = new Thread(() -&gt; { for (int i = 0; i &lt; 100_000; i++) c.increment(); });
+Thread t2 = new Thread(() -&gt; { for (int i = 0; i &lt; 100_000; i++) c.increment(); });
+t1.start(); t2.start();
+t1.join();  t2.join();
+
+System.out.println(c.get());   // Expected 200000. Actual: 137482. Or 189301. Never the same twice.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Race condition</strong>
+  <p>
+    A <em class="term">race condition</em> is when the result depends on the
+    <strong>timing</strong> of threads. The section of code that touches shared state is the
+    <em class="term">critical section</em>. Fixing a race means making the critical section
+    <strong>atomic</strong> — indivisible from any other thread's point of view.
+  </p>
+</div>
+
+<div class="note">
+  <strong>The other classic: check-then-act</strong>
+  <p>
+    <code>if (map.get(k) == null) map.put(k, v);</code> is a race even with a thread-safe map. Both
+    operations are individually atomic, but another thread can slip in
+    <strong>between</strong> them. Lazy initialisation (<code
+      >if (instance == null) instance = new …</code
+    >) is the same bug. You need one atomic operation: <code>map.putIfAbsent(k, v)</code> or
+    <code>map.computeIfAbsent(k, …)</code>.
+  </p>
+</div>
+
+<h3>Problem 2: visibility — the write that never arrives</h3>
+<p>
+  This one is genuinely counter-intuitive. Even with no interleaving at all, a thread may
+  <strong>never see</strong> another thread's write. Not "later" — <em>never</em>.
+</p>
+
+<figure class="code">
+  <figcaption><b>An infinite loop that shouldn't be possible</b></figcaption>
+  <pre><code>class Task {
+    private boolean running = true;      // no volatile!
+
+    public void stop() { running = false; }
+
+    public void run() {
+        while (running) { }              // may spin FOREVER, even after stop() is called
+        System.out.println("stopped");
+    }
+}
+// Main thread calls stop(). The worker thread may never notice — and often doesn't
+// once the JIT warms up. Adding `volatile` to `running` fixes it completely.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why the write is invisible</strong>
+  <p>
+    Each CPU core has its own <strong>cache</strong>. A write may sit in Core A's cache and never
+    reach Core B. On top of that, the <strong>JIT compiler</strong> sees a loop that never modifies
+    <code>running</code> and legally hoists the read out:
+    <code>if (running) while (true) { }</code>. Both are allowed, because
+    <strong>without synchronisation the JVM makes no promise at all</strong> that one thread's write
+    is visible to another.
+  </p>
+</div>
+
+<div class="analogy">
+  <p>
+    You and a colleague each have a <strong>private notepad copy</strong> of the shared whiteboard.
+    You cross out "running" on your pad. Unless someone walks to the whiteboard and syncs, your
+    colleague keeps reading "running" off their own pad forever. <code>volatile</code> and locks are
+    the rule that says "always read and write the actual whiteboard."
+  </p>
+</div>
+
+<h3>Problem 3: reordering</h3>
+<figure class="code">
+  <figcaption><b>The compiler and CPU may legally reorder your code</b></figcaption>
+  <pre><code>// You wrote:              // Another thread might observe:
+a = 1;                     //   flag = true;     &lt;- reordered ahead!
+flag = true;               //   a = 1;
+
+// So a reader that sees flag == true can still read a == 0.
+// Single-threaded semantics are preserved; cross-thread ones are not.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The rule that permits all this</strong>
+  <p>
+    The JVM only guarantees <strong>as-if-serial</strong> semantics — the result must look correct
+    <em>to the thread doing it</em>. Any reordering invisible to that single thread is fair game,
+    and the hardware does it aggressively. Other threads get no guarantees whatsoever unless you
+    establish a <strong>happens-before</strong> relationship (section 05).
+  </p>
+</div>
+
+<h2 id="synchronized"><span class="num">03.</span> synchronized — the built-in lock</h2>
+<p class="lead">
+  <code>synchronized</code> guarantees that only <strong>one thread at a time</strong> runs the
+  block, <em>and</em> that everything the previous holder did is <strong>visible</strong> to the
+  next. It fixes atomicity and visibility together.
+</p>
+
+<figure class="code">
+  <figcaption><b>The counter, fixed</b></figcaption>
+  <pre><code>class Counter {
+    private int count = 0;
+    public synchronized void increment() { count++; }   // one thread at a time
+    public synchronized int get() { return count; }     // MUST also be synchronized — see below
+}
+// Now always prints exactly 200000.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>The reader must synchronize too</strong>
+  <p>
+    Synchronising only the writer is a classic half-fix. Locking gives visibility only
+    <strong>between threads that use the same lock</strong>. An unsynchronised
+    <code>get()</code> has no happens-before edge with <code>increment()</code>, so it may read a
+    stale value forever.
+    <strong>Every access to shared mutable state — reads included — must be synchronised.</strong>
+  </p>
+</div>
+
+<h3>Every object has a lock</h3>
+<p>
+  Every Java object carries a hidden <em class="term">monitor</em> (or intrinsic lock).
+  <code>synchronized</code> acquires it on entry and releases it on exit —
+  <strong>including when an exception is thrown</strong>, so you can never leak an intrinsic lock.
+</p>
+
+<figure class="code">
+  <figcaption><b>What each form actually locks</b></figcaption>
+  <pre><code>class Example {
+
+    public synchronized void a() { }        // locks `this`
+
+    public static synchronized void b() { } // locks Example.class — a DIFFERENT lock from `this`!
+
+    public void c() {
+        synchronized (this) { }             // identical to a()
+    }
+
+    private final Object lock = new Object();
+    public void d() {
+        synchronized (lock) { }             // locks a private object — usually the best choice
+    }
+}</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Instance and static locks are unrelated</strong>
+  <p>
+    A <code>synchronized</code> instance method locks <code>this</code>; a
+    <code>static synchronized</code> method locks the <code>Class</code> object. They are two
+    completely separate locks — so an instance method and a static method
+    <strong>can run at the same time</strong> and happily corrupt the same static field. This trips
+    people up constantly.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Prefer a private lock object</b></figcaption>
+  <pre><code>// Risky: `this` is public, so ANY outside code can lock your object and stall you
+class Bad {
+    public synchronized void work() { }
+}
+Bad b = new Bad();
+synchronized (b) { Thread.sleep(60_000); }   // outsider just froze every call to work()
+
+// Safe: nobody outside can reach the lock
+class Good {
+    private final Object lock = new Object();   // final! reassigning a lock breaks everything
+    public void work() { synchronized (lock) { } }
+}</code></pre>
+</figure>
+
+<h3>Synchronized is reentrant</h3>
+<figure class="code">
+  <figcaption><b>A thread can re-enter a lock it already holds</b></figcaption>
+  <pre><code>class Reentrant {
+    public synchronized void outer() {
+        inner();          // already hold the lock — walk straight in. No deadlock.
+    }
+    public synchronized void inner() { }
+}
+// The JVM keeps a hold COUNT: +1 on entry, -1 on exit. Released at zero.
+// Without reentrancy, any object calling its own synchronized method would deadlock with itself.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Keep critical sections small</strong>
+  <p>
+    A lock serialises threads — everything inside it is single-threaded, so it's a direct cap on
+    throughput.
+    <strong>Never do I/O, call unknown code, or sleep while holding a lock.</strong> Calling a
+    callback or an overridable method inside a lock is an "alien method" and a classic deadlock
+    source: you have no idea what locks <em>it</em> will grab.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Lock the update, not the work</b></figcaption>
+  <pre><code>// BAD — the network call holds the lock for 200ms
+public synchronized void update(String id) {
+    Data d = httpClient.fetch(id);       // slow! Everyone else is blocked.
+    cache.put(id, d);
+}
+
+// GOOD — do the slow part outside, lock only the shared bit
+public void update(String id) {
+    Data d = httpClient.fetch(id);       // no lock held
+    synchronized (lock) {
+        cache.put(id, d);                // microseconds
+    }
+}</code></pre>
+</figure>
+
+<h2 id="volatile"><span class="num">04.</span> volatile — visibility only</h2>
+<p class="lead">
+  <code>volatile</code> makes a field's writes immediately visible to every thread, and forbids
+  reordering around it. It does <strong>not</strong> make anything atomic.
+</p>
+
+<figure class="code">
+  <figcaption><b>The correct use — a stop flag</b></figcaption>
+  <pre><code>class Worker implements Runnable {
+    private volatile boolean running = true;   // now the write is guaranteed to be seen
+
+    public void stop() { running = false; }
+
+    public void run() {
+        while (running) { doWork(); }          // terminates promptly. Guaranteed.
+    }
+}</code></pre>
+</figure>
+
+<div class="key">
+  <strong>What volatile guarantees — and what it doesn't</strong>
+  <p>
+    <span class="yes">Yes:</span> reads/writes go to main memory, never a stale cache · reads/writes
+    are atomic <em>even for <code>long</code>/<code>double</code></em> · no reordering across it
+    (it's a memory barrier). <span class="no">No:</span> it does <strong>not</strong> make
+    <code>count++</code> atomic — that's still read-modify-write, three operations, each
+    individually visible but collectively racy.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The trap — volatile does not fix a counter</b></figcaption>
+  <pre><code>private volatile int count = 0;
+public void increment() { count++; }   // STILL BROKEN. Still loses updates.
+
+// Because it's read, add, write — and volatile only makes each STEP visible,
+// not the three of them indivisible.
+
+// Fixes: synchronized, or AtomicInteger:
+private final AtomicInteger count = new AtomicInteger();
+public void increment() { count.incrementAndGet(); }   // correct</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th><code>volatile</code></th>
+        <th><code>synchronized</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Visibility</td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span></td>
+      </tr>
+      <tr>
+        <td>Atomicity of compound ops</td>
+        <td><span class="no">No</span></td>
+        <td><span class="yes">Yes</span></td>
+      </tr>
+      <tr>
+        <td>Blocks threads</td>
+        <td><span class="no">No</span> — never blocks</td>
+        <td><span class="yes">Yes</span></td>
+      </tr>
+      <tr>
+        <td>Applies to</td>
+        <td>A single field</td>
+        <td>A block or method</td>
+      </tr>
+      <tr>
+        <td>Cost</td>
+        <td>Cheap (a memory barrier)</td>
+        <td>More expensive (may park threads)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>When volatile is enough</strong>
+  <p>
+    Use it when <strong>exactly one</strong> of these holds: the write doesn't depend on the current
+    value (a flag, a reference swap), or only one thread ever writes. If the new value is computed
+    from the old one, you need atomics or a lock. The <code>long</code>/<code>double</code> point
+    matters too: on 32-bit JVMs, non-volatile 64-bit reads/writes may be <strong>torn</strong> into
+    two halves — volatile forbids that.
+  </p>
+</div>
+
+<h2 id="jmm"><span class="num">05.</span> The Java Memory Model — happens-before</h2>
+<p class="lead">
+  The <em class="term">Java Memory Model</em> (JMM) is the contract that says exactly when one
+  thread's writes must be visible to another. Its entire vocabulary is one relation:
+  <strong>happens-before</strong>.
+</p>
+
+<div class="key">
+  <strong>What happens-before means</strong>
+  <p>
+    If action <strong>A happens-before B</strong>, then everything A did is
+    <strong>guaranteed visible</strong> to B, and cannot be reordered after it. If there is
+    <strong>no</strong> happens-before edge between two actions on shared data, and at least one is
+    a write, you have a <em class="term">data race</em> — and the JMM promises you
+    <strong>nothing at all</strong>. Not "usually works". Nothing.
+  </p>
+</div>
+
+<h3>The rules that create an edge</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Rule</th>
+        <th>A happens-before B</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Program order</strong></td>
+        <td>Earlier statement → later statement, <em>within one thread</em></td>
+      </tr>
+      <tr>
+        <td><strong>Monitor lock</strong></td>
+        <td><code>unlock</code> on M → a later <code>lock</code> on the <strong>same</strong> M</td>
+      </tr>
+      <tr>
+        <td><strong>Volatile</strong></td>
+        <td>A write to <code>v</code> → every later read of <code>v</code></td>
+      </tr>
+      <tr>
+        <td><strong>Thread start</strong></td>
+        <td>Everything before <code>t.start()</code> → everything inside <code>t</code></td>
+      </tr>
+      <tr>
+        <td><strong>Thread join</strong></td>
+        <td>Everything in <code>t</code> → whatever follows <code>t.join()</code></td>
+      </tr>
+      <tr>
+        <td><strong>Final fields</strong></td>
+        <td>Constructor finishing → any thread seeing a correctly published reference</td>
+      </tr>
+      <tr>
+        <td><strong>Transitivity</strong></td>
+        <td>A → B and B → C implies A → C</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>How volatile publishes more than just itself</b></figcaption>
+  <pre><code>class Publisher {
+    private int data;                 // plain field — NOT volatile
+    private volatile boolean ready;   // volatile flag
+
+    void writer() {
+        data = 42;              // (1)
+        ready = true;           // (2) volatile WRITE
+    }
+
+    void reader() {
+        if (ready) {            // (3) volatile READ
+            System.out.println(data);   // (4) GUARANTEED to print 42 — never 0
+        }
+    }
+}
+// Why: (1) happens-before (2) by program order.
+//      (2) happens-before (3) by the volatile rule.
+//      (3) happens-before (4) by program order.
+//      Transitivity =&gt; (1) happens-before (4). `data` is visible even though it's not volatile.
+// This is the "volatile piggyback": the barrier flushes EVERYTHING written before it.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Safe publication via start() and join()</b></figcaption>
+  <pre><code>int x = 10;                              // written before start()
+Thread t = new Thread(() -&gt; System.out.println(x));   // sees 10, guaranteed
+t.start();
+
+// --- and the other direction ---
+Thread t2 = new Thread(() -&gt; result = compute());
+t2.start();
+t2.join();                 // everything t2 did happens-before here
+System.out.println(result);   // guaranteed to see it</code></pre>
+</figure>
+
+<h3>Final fields and safe publication</h3>
+<figure class="code">
+  <figcaption>
+    <b>Why <code>final</code> is a concurrency tool, not just a style choice</b>
+  </figcaption>
+  <pre><code>class Safe {
+    private final int x;
+    Safe(int x) { this.x = x; }
+}
+// The JMM guarantees: any thread that sees a Safe reference sees a fully-constructed
+// object with x already set. No synchronisation needed. This is why immutable objects
+// are automatically thread-safe.
+
+class Unsafe {
+    private int x;             // NOT final
+    Unsafe(int x) { this.x = x; }
+}
+// Another thread can see a non-null Unsafe reference but still read x == 0,
+// because the constructor's write can be reordered with the reference publication.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Never let <code>this</code> escape a constructor</strong>
+  <p>
+    Registering a listener, starting a thread, or storing <code>this</code> anywhere inside a
+    constructor publishes a <strong>half-built object</strong>. Other threads can observe fields
+    that aren't assigned yet — including <code>final</code> ones. Use a static factory that
+    constructs first and registers after.
+  </p>
+</div>
+
+<div class="key">
+  <strong>The three ways to be thread-safe</strong>
+  <p>
+    <strong>1. Don't share</strong> — thread confinement, locals, <code>ThreadLocal</code>.
+    <strong>2. Don't mutate</strong> — immutable objects with final fields need no synchronisation
+    at all. <strong>3. Synchronise</strong> — if you must share mutable state, guard every access
+    with the same lock. In that order of preference.
+  </p>
+</div>
+
+<h2 id="atomics"><span class="num">06.</span> Atomics and CAS</h2>
+<p class="lead">
+  The <code>java.util.concurrent.atomic</code> classes give you lock-free, atomic read-modify-write
+  on a single variable — built on one CPU instruction: <strong>compare-and-swap</strong>.
+</p>
+
+<figure class="code">
+  <figcaption><b>AtomicInteger — the counter, done right and fast</b></figcaption>
+  <pre><code>AtomicInteger count = new AtomicInteger(0);
+
+count.incrementAndGet();         // ++count  -&gt; returns the NEW value
+count.getAndIncrement();         // count++  -&gt; returns the OLD value
+count.addAndGet(5);
+count.get();
+count.set(10);
+count.compareAndSet(10, 20);     // if it's 10, make it 20. Returns whether it worked.
+count.updateAndGet(x -&gt; x * 2);  // arbitrary function, applied atomically
+count.accumulateAndGet(5, Integer::sum);</code></pre>
+</figure>
+
+<h3>How CAS works</h3>
+<figure class="code">
+  <figcaption><b>Compare-and-swap — optimistic, not pessimistic</b></figcaption>
+  <pre><code>// CAS(memoryLocation, expectedValue, newValue):
+//   atomically, in ONE uninterruptible CPU instruction:
+//   "if the value here is still `expected`, replace it with `new` and report success;
+//    otherwise change nothing and report failure."
+
+// incrementAndGet() is essentially:
+int current;
+do {
+    current = get();                              // read
+} while (!compareAndSet(current, current + 1));   // try to swap; if someone beat us, LOOP and retry
+return current + 1;</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Optimistic vs pessimistic</strong>
+  <p>
+    A <strong>lock</strong> is pessimistic: "assume conflict, so block everyone else first."
+    <strong>CAS</strong> is optimistic: "assume no conflict, do the work, and check at the last
+    instant — if I was beaten, just try again." Nobody blocks, no thread ever parks, and there's no
+    context switch. Under low contention this is dramatically faster.
+  </p>
+</div>
+
+<div class="analogy">
+  <p>
+    Editing a shared doc. <strong>Locking</strong> = check the doc out so nobody else can touch it.
+    <strong>CAS</strong> = edit your copy, then try to save: "was it still version 7 when I saved?
+    Yes → saved. No → someone else committed; discard my attempt and redo it on version 8."
+  </p>
+</div>
+
+<div class="warn">
+  <strong>CAS is not free under contention</strong>
+  <p>
+    Every failed CAS means a wasted loop iteration. With many threads hammering one variable,
+    threads spin burning CPU and a lock can actually win. That's what <code>LongAdder</code> is for:
+    it keeps <strong>multiple internal cells</strong>, so threads update different memory and only
+    <code>sum()</code> combines them. For a hot counter, prefer it over <code>AtomicLong</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The atomic family</b></figcaption>
+  <pre><code>AtomicInteger / AtomicLong / AtomicBoolean
+AtomicReference&lt;T&gt;                     // CAS on an object reference
+AtomicIntegerArray / AtomicLongArray    // per-element atomicity
+LongAdder / LongAccumulator             // high-contention counters — much faster
+AtomicStampedReference&lt;T&gt;              // reference + version stamp -&gt; defeats the ABA problem
+
+// AtomicReference: swap an immutable object atomically
+AtomicReference&lt;Config&gt; cfg = new AtomicReference&lt;&gt;(initial);
+cfg.updateAndGet(c -&gt; c.withTimeout(30));</code></pre>
+</figure>
+
+<div class="note">
+  <strong>The ABA problem</strong>
+  <p>
+    CAS only asks "is the value the same?", not "was it never changed?". If a value goes A → B → A,
+    your CAS succeeds even though the world moved underneath you — which matters for lock-free
+    stacks and linked structures. <code>AtomicStampedReference</code> attaches a version counter so
+    A-with-stamp-1 and A-with-stamp-3 are distinguishable.
+  </p>
+</div>
+
+<h2 id="locks"><span class="num">07.</span> Explicit locks</h2>
+<p class="lead">
+  <code>ReentrantLock</code> does everything <code>synchronized</code> does, plus the things it
+  can't: timeouts, interruptible waits, fairness, and multiple wait-sets.
+</p>
+
+<figure class="code">
+  <figcaption><b>The mandatory shape — unlock in finally, always</b></figcaption>
+  <pre><code>private final ReentrantLock lock = new ReentrantLock();
+
+public void work() {
+    lock.lock();
+    try {
+        // critical section
+    } finally {
+        lock.unlock();     // MUST be in finally — an exception would leak the lock forever
+    }
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>This is the one real downside of explicit locks</strong>
+  <p>
+    <code>synchronized</code> releases automatically on any exit, including a thrown exception. With
+    <code>ReentrantLock</code>, forgetting <code>finally</code> means the lock is
+    <strong>never released</strong> and every other thread blocks forever. Never put
+    <code>lock()</code> inside the <code>try</code> — if it throws, you'd unlock a lock you never
+    acquired (<code>IllegalMonitorStateException</code>).
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption>
+    <b>What you get that <code>synchronized</code> cannot do</b>
+  </figcaption>
+  <pre><code>// 1. Try, and give up immediately rather than blocking
+if (lock.tryLock()) {
+    try { work(); } finally { lock.unlock(); }
+} else {
+    doSomethingElse();          // no waiting around
+}
+
+// 2. Try with a timeout — the single best deadlock defence there is
+if (lock.tryLock(500, TimeUnit.MILLISECONDS)) {
+    try { work(); } finally { lock.unlock(); }
+} else {
+    log.warn("could not acquire lock in 500ms — backing off");
+}
+
+// 3. Interruptible acquisition (synchronized blocks are NOT interruptible)
+lock.lockInterruptibly();
+
+// 4. Fairness — longest waiter goes first (slower, but no starvation)
+ReentrantLock fair = new ReentrantLock(true);</code></pre>
+</figure>
+
+<h3>ReadWriteLock — many readers, one writer</h3>
+<figure class="code">
+  <figcaption><b>When reads massively outnumber writes</b></figcaption>
+  <pre><code>private final ReadWriteLock rw = new ReentrantReadWriteLock();
+private final Map&lt;String,String&gt; cache = new HashMap&lt;&gt;();
+
+public String get(String k) {
+    rw.readLock().lock();          // MANY threads can hold this at once
+    try { return cache.get(k); }
+    finally { rw.readLock().unlock(); }
+}
+
+public void put(String k, String v) {
+    rw.writeLock().lock();         // EXCLUSIVE — blocks all readers and writers
+    try { cache.put(k, v); }
+    finally { rw.writeLock().unlock(); }
+}</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Measure before reaching for it</strong>
+  <p>
+    A <code>ReadWriteLock</code> only pays off when reads are <strong>frequent and long</strong>.
+    Its bookkeeping is heavier than a plain lock, so for short reads a
+    <code>ReentrantLock</code> often wins — and <code>ConcurrentHashMap</code> beats both for the
+    cache case above. Note you cannot upgrade a read lock to a write lock (that deadlocks); you must
+    release and re-acquire.
+  </p>
+</div>
+
+<h3>Condition — wait/notify, done properly</h3>
+<figure class="code">
+  <figcaption><b>A bounded buffer with two separate wait-sets</b></figcaption>
+  <pre><code>private final ReentrantLock lock = new ReentrantLock();
+private final Condition notFull  = lock.newCondition();   // separate queues — this is the win
+private final Condition notEmpty = lock.newCondition();
+private final Queue&lt;T&gt; q = new ArrayDeque&lt;&gt;();
+private final int cap = 10;
+
+public void put(T item) throws InterruptedException {
+    lock.lock();
+    try {
+        while (q.size() == cap) notFull.await();   // ALWAYS in a while, never an if
+        q.add(item);
+        notEmpty.signal();                          // wake only a consumer
+    } finally { lock.unlock(); }
+}
+
+public T take() throws InterruptedException {
+    lock.lock();
+    try {
+        while (q.isEmpty()) notEmpty.await();
+        T item = q.poll();
+        notFull.signal();                           // wake only a producer
+        return item;
+    } finally { lock.unlock(); }
+}</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Always wait in a <code>while</code> loop, never an <code>if</code></strong>
+  <p>
+    Two reasons. <strong>Spurious wakeups</strong>: the JVM is permitted to wake a waiting thread
+    for no reason at all. <strong>Stolen conditions</strong>: by the time you reacquire the lock,
+    another thread may have already consumed what you were woken for. The condition must be
+    <strong>re-checked</strong> after waking — which is exactly what <code>while</code> does.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The old intrinsic equivalent — same rules</b></figcaption>
+  <pre><code>synchronized (lock) {
+    while (!condition) {
+        lock.wait();          // releases the monitor and waits. MUST hold it to call this.
+    }
+    // ... use the resource
+    lock.notifyAll();         // prefer notifyAll: notify() wakes ONE arbitrary thread,
+}                             // which may be the wrong one -&gt; lost signal -&gt; hang.</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th><code>synchronized</code></th>
+        <th><code>ReentrantLock</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Release</td>
+        <td>Automatic</td>
+        <td>Manual — <code>finally</code> or bust</td>
+      </tr>
+      <tr>
+        <td>Timeout / try</td>
+        <td><span class="no">No</span></td>
+        <td><span class="yes">Yes</span></td>
+      </tr>
+      <tr>
+        <td>Interruptible</td>
+        <td><span class="no">No</span></td>
+        <td><span class="yes">Yes</span></td>
+      </tr>
+      <tr>
+        <td>Fairness option</td>
+        <td><span class="no">No</span></td>
+        <td><span class="yes">Yes</span></td>
+      </tr>
+      <tr>
+        <td>Multiple wait-sets</td>
+        <td><span class="no">No</span> — one per object</td>
+        <td><span class="yes">Yes</span> — many <code>Condition</code>s</td>
+      </tr>
+      <tr>
+        <td>Verdict</td>
+        <td><strong>Default choice</strong> — simpler, safer</td>
+        <td>When you need a feature above</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>The coordination toolkit</h3>
+<figure class="code">
+  <figcaption><b>Four you should recognise instantly</b></figcaption>
+  <pre><code>// CountDownLatch — wait for N things to finish. ONE SHOT, cannot be reset. (Go: WaitGroup)
+CountDownLatch latch = new CountDownLatch(3);
+for (int i = 0; i &lt; 3; i++) {
+    executor.submit(() -&gt; { try { work(); } finally { latch.countDown(); } });
+}
+latch.await();                     // blocks until the count hits 0
+
+// CyclicBarrier — N threads wait for EACH OTHER, then all proceed. Reusable.
+CyclicBarrier barrier = new CyclicBarrier(3, () -&gt; System.out.println("all arrived"));
+barrier.await();                   // each thread blocks here until the 3rd arrives
+
+// Semaphore — limit concurrent access to N permits
+Semaphore sem = new Semaphore(5);  // at most 5 at a time
+sem.acquire();
+try { useResource(); } finally { sem.release(); }   // release in finally!
+
+// Phaser — like a reusable barrier with a dynamic party count (rarely needed)</code></pre>
+</figure>
+
+<h2 id="executors"><span class="num">08.</span> ExecutorService &amp; thread pools</h2>
+<p class="lead">
+  Creating a thread per task is a mistake: each costs ~1MB of stack and a syscall, and unbounded
+  thread creation will kill your JVM. An <em class="term">executor</em> separates
+  <strong>what to run</strong> from <strong>which thread runs it</strong>, and reuses a fixed pool.
+</p>
+
+<figure class="code">
+  <figcaption><b>The basic loop</b></figcaption>
+  <pre><code>ExecutorService pool = Executors.newFixedThreadPool(4);
+
+pool.execute(() -&gt; System.out.println("fire and forget"));   // Runnable, returns nothing
+Future&lt;String&gt; f = pool.submit(() -&gt; "I return a value");    // Callable, returns a Future
+
+pool.shutdown();                                    // no new tasks; finish what's queued
+if (!pool.awaitTermination(30, TimeUnit.SECONDS)) { // wait for them
+    pool.shutdownNow();                             // interrupt the stragglers
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Always shut down, ideally in a finally</strong>
+  <p>
+    Pool threads are <strong>non-daemon by default</strong>, so a forgotten
+    <code>shutdown()</code> keeps your JVM alive forever. Since Java 19,
+    <code>ExecutorService</code> implements <code>AutoCloseable</code>, so
+    <code>try (var pool = Executors.newFixedThreadPool(4)) { … }</code> closes and awaits
+    termination for you.
+  </p>
+</div>
+
+<h3>The factory methods — and why you probably shouldn't use them</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Factory</th>
+        <th>Behaviour</th>
+        <th>The catch</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>newFixedThreadPool(n)</code></td>
+        <td>n threads, unbounded queue</td>
+        <td>Queue grows forever → <strong>OOM</strong> under overload</td>
+      </tr>
+      <tr>
+        <td><code>newCachedThreadPool()</code></td>
+        <td>Unbounded threads, reused for 60s</td>
+        <td><strong>Unbounded threads</strong> → OOM under a burst</td>
+      </tr>
+      <tr>
+        <td><code>newSingleThreadExecutor()</code></td>
+        <td>One thread, unbounded queue</td>
+        <td>Sequential; queue can still explode</td>
+      </tr>
+      <tr>
+        <td><code>newScheduledThreadPool(n)</code></td>
+        <td>Delayed / periodic tasks</td>
+        <td>One task throwing silently kills the schedule</td>
+      </tr>
+      <tr>
+        <td><code>newWorkStealingPool()</code></td>
+        <td>ForkJoinPool, one deque per thread</td>
+        <td>Doesn't preserve submission order</td>
+      </tr>
+      <tr>
+        <td><code>newVirtualThreadPerTaskExecutor()</code></td>
+        <td>Java 21: a new virtual thread per task</td>
+        <td>Not a pool — don't try to size it</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>In production, build the pool yourself</strong>
+  <p>
+    Every <code>Executors</code> factory is unbounded <em>somewhere</em> — in the queue or in the
+    thread count. Under load that turns backpressure into an <code>OutOfMemoryError</code>.
+    Construct a <code>ThreadPoolExecutor</code> with a <strong>bounded queue</strong> and an
+    explicit rejection policy so overload <em>degrades</em> instead of exploding.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>ThreadPoolExecutor — every knob explained</b></figcaption>
+  <pre><code>ThreadPoolExecutor pool = new ThreadPoolExecutor(
+    4,                                    // corePoolSize — kept alive even when idle
+    8,                                    // maximumPoolSize — only grown when the QUEUE IS FULL
+    60, TimeUnit.SECONDS,                 // keepAliveTime — how long extra (non-core) threads linger
+    new ArrayBlockingQueue&lt;&gt;(100),        // BOUNDED work queue — this is the important bit
+    new ThreadFactoryBuilder().setNameFormat("worker-%d").build(),   // named threads = readable dumps
+    new ThreadPoolExecutor.CallerRunsPolicy()   // what to do when full (see below)
+);</code></pre>
+</figure>
+
+<div class="note">
+  <strong>The sizing rule that surprises everyone</strong>
+  <p>
+    A <code>ThreadPoolExecutor</code> grows past <code>corePoolSize</code>
+    <strong>only when the queue is full</strong> — not when tasks are waiting. So with an
+    <em>unbounded</em> queue, <code>maximumPoolSize</code> is <strong>never reached</strong> and is
+    completely ignored. That's precisely why <code>newFixedThreadPool</code> passes the same number
+    for both.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The four rejection policies</b></figcaption>
+  <pre><code>new ThreadPoolExecutor.AbortPolicy()          // default: throw RejectedExecutionException
+new ThreadPoolExecutor.CallerRunsPolicy()     // the SUBMITTING thread runs it -&gt; natural backpressure
+new ThreadPoolExecutor.DiscardPolicy()        // silently drop it (dangerous)
+new ThreadPoolExecutor.DiscardOldestPolicy()  // drop the oldest queued task, then retry</code></pre>
+</figure>
+
+<div class="key">
+  <strong><code>CallerRunsPolicy</code> is usually the right answer</strong>
+  <p>
+    When the pool is saturated, the submitter is forced to execute the task itself. That
+    <strong>slows the producer down</strong> — it can't submit again until it finishes — which is
+    exactly the backpressure you want. The queue stops growing, nothing is dropped, and the system
+    degrades gracefully instead of falling over.
+  </p>
+</div>
+
+<h3>How big should the pool be?</h3>
+<figure class="code">
+  <figcaption><b>The two rules of thumb</b></figcaption>
+  <pre><code>int cores = Runtime.getRuntime().availableProcessors();
+
+// CPU-bound work: more threads than cores just adds context switching
+int cpuBound = cores;         // (or cores + 1 to cover the odd page fault)
+
+// I/O-bound work: threads are mostly parked waiting, so you want many more
+int ioBound = cores * (1 + waitTime / computeTime);
+// e.g. 8 cores, 100ms waiting per 5ms computing  -&gt;  8 * (1 + 20) = 168 threads
+
+// This formula is exactly why virtual threads exist — see section 12.</code></pre>
+</figure>
+
+<h3>Callable and Future</h3>
+<figure class="code">
+  <figcaption><b>Runnable vs Callable</b></figcaption>
+  <pre><code>Runnable r = () -&gt; System.out.println("hi");         // void, cannot throw checked exceptions
+Callable&lt;String&gt; c = () -&gt; { return "result"; };     // returns a value, CAN throw checked
+
+Future&lt;String&gt; f = pool.submit(c);
+f.get();                        // BLOCKS until done. Throws ExecutionException wrapping any failure.
+f.get(1, TimeUnit.SECONDS);     // ...or gives up. TimeoutException.
+f.isDone();
+f.cancel(true);                 // true = interrupt it if it's already running</code></pre>
+</figure>
+
+<div class="warn">
+  <strong><code>Future.get()</code> blocks — that's its whole problem</strong>
+  <p>
+    Submitting ten tasks then calling <code>get()</code> on each in turn is barely better than doing
+    them in sequence: you're blocked at the first one while the rest finish invisibly. You can't
+    chain, combine, or react to a <code>Future</code> without blocking a thread. That limitation is
+    exactly what <code>CompletableFuture</code> was invented to remove.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Exceptions in submitted tasks disappear</strong>
+  <p>
+    <code>execute()</code> sends a thrown exception to the thread's
+    <code>UncaughtExceptionHandler</code>. But <code>submit()</code>
+    <strong>captures it in the Future</strong> — so if you never call <code>get()</code>, the
+    exception is silently swallowed and your task just… doesn't work. Always <code>get()</code>, or
+    handle failures explicitly.
+  </p>
+</div>
+
+<h2 id="futures"><span class="num">09.</span> CompletableFuture</h2>
+<p class="lead">
+  <code>CompletableFuture</code> is a <code>Future</code> you can <strong>chain</strong>. Instead of
+  blocking to ask "are you done?", you attach "when you're done, do this next" — and no thread
+  waits.
+</p>
+
+<figure class="code">
+  <figcaption><b>Starting one</b></figcaption>
+  <pre><code>// async + returns a value
+CompletableFuture&lt;String&gt; f = CompletableFuture.supplyAsync(() -&gt; fetchUser());
+
+// async + returns nothing
+CompletableFuture&lt;Void&gt; g = CompletableFuture.runAsync(() -&gt; log());
+
+// already-finished
+CompletableFuture&lt;String&gt; done = CompletableFuture.completedFuture("value");
+
+// with your own pool — ALWAYS do this in production (the default is the common FJ pool)
+CompletableFuture.supplyAsync(() -&gt; fetchUser(), myExecutor);</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Chaining — the three that matter</b></figcaption>
+  <pre><code>CompletableFuture.supplyAsync(() -&gt; fetchUserId())
+    .thenApply(id -&gt; loadUser(id))          // map:     T -&gt; U        (sync-ish, same thread)
+    .thenCompose(user -&gt; loadOrdersAsync(user))  // flatMap: T -&gt; CompletableFuture&lt;U&gt;
+    .thenAccept(orders -&gt; render(orders))   // consume: T -&gt; void
+    .thenRun(() -&gt; log.info("done"));       // ignore the value entirely</code></pre>
+</figure>
+
+<div class="key">
+  <strong><code>thenApply</code> vs <code>thenCompose</code> — it's map vs flatMap</strong>
+  <p>
+    If your function returns a <strong>plain value</strong>, use <code>thenApply</code>. If it
+    returns <strong>another <code>CompletableFuture</code></strong
+    >, use <code>thenCompose</code> — otherwise you end up holding a
+    <code>CompletableFuture&lt;CompletableFuture&lt;T&gt;&gt;</code>, which is exactly as awkward as
+    it looks.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The nesting mistake</b></figcaption>
+  <pre><code>// WRONG — a future inside a future
+CompletableFuture&lt;CompletableFuture&lt;User&gt;&gt; bad =
+    CompletableFuture.supplyAsync(() -&gt; id).thenApply(id -&gt; loadUserAsync(id));
+
+// RIGHT — flattened
+CompletableFuture&lt;User&gt; good =
+    CompletableFuture.supplyAsync(() -&gt; id).thenCompose(id -&gt; loadUserAsync(id));</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Combining — run things in parallel and join the results</b></figcaption>
+  <pre><code>CompletableFuture&lt;String&gt; user  = CompletableFuture.supplyAsync(() -&gt; fetchUser());
+CompletableFuture&lt;String&gt; prefs = CompletableFuture.supplyAsync(() -&gt; fetchPrefs());
+
+// both run CONCURRENTLY; combine when both finish
+CompletableFuture&lt;String&gt; page = user.thenCombine(prefs, (u, p) -&gt; render(u, p));
+
+// wait for many
+CompletableFuture.allOf(f1, f2, f3).join();     // Void — collect results from each yourself
+CompletableFuture.anyOf(f1, f2, f3).join();     // the FIRST one to finish wins
+
+// A useful idiom: allOf + collect
+List&lt;CompletableFuture&lt;String&gt;&gt; futures = ids.stream()
+    .map(id -&gt; CompletableFuture.supplyAsync(() -&gt; load(id), pool))
+    .toList();
+List&lt;String&gt; results = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
+    .thenApply(v -&gt; futures.stream().map(CompletableFuture::join).toList())
+    .join();</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Error handling — three flavours</b></figcaption>
+  <pre><code>cf.exceptionally(ex -&gt; "fallback")            // only on failure -&gt; supply a default
+  .handle((result, ex) -&gt; ex != null ? "fallback" : result)   // ALWAYS runs; sees both
+  .whenComplete((result, ex) -&gt; log(result, ex));             // ALWAYS runs; changes nothing
+
+// Timeouts (Java 9+)
+cf.orTimeout(2, TimeUnit.SECONDS);                       // fail with TimeoutException
+cf.completeOnTimeout("default", 2, TimeUnit.SECONDS);    // ...or quietly substitute a value</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>An exception mid-chain skips everything downstream</strong>
+  <p>
+    If <code>supplyAsync</code> throws, every <code>thenApply</code> after it is
+    <strong>skipped</strong> and the exception travels to the first
+    <code>exceptionally</code>/<code>handle</code>. If you never attach one and never call
+    <code>join()</code>, <strong>the failure vanishes silently</strong> — no log, no crash. Always
+    terminate a chain with error handling.
+  </p>
+</div>
+
+<div class="note">
+  <strong><code>join()</code> vs <code>get()</code></strong>
+  <p>
+    Same blocking behaviour, different exceptions. <code>get()</code> throws
+    <strong>checked</strong> <code>InterruptedException</code>/<code>ExecutionException</code>;
+    <code>join()</code> throws <strong>unchecked</strong> <code>CompletionException</code> — which
+    is why <code>join()</code> works inside lambdas and <code>get()</code> doesn't.
+  </p>
+</div>
+
+<div class="note">
+  <strong>The <code>*Async</code> suffix</strong>
+  <p>
+    <code>thenApply</code> may run on whichever thread completed the previous stage (or even the
+    calling thread). <code>thenApplyAsync</code> always hands the work to a pool. Use the
+    <code>Async</code> variants — with <strong>your own executor</strong> — whenever a stage does
+    anything slow, or you'll accidentally tie up a completing thread.
+  </p>
+</div>
+
+<h2 id="concurrent-collections"><span class="num">10.</span> Concurrent collections</h2>
+<p class="lead">
+  Never wrap a <code>HashMap</code> in a lock and call it a day. <code>java.util.concurrent</code>
+  ships collections designed for concurrency from the ground up.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Instead of</th>
+        <th>Use</th>
+        <th>How it works</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>HashMap</code></td>
+        <td><code>ConcurrentHashMap</code></td>
+        <td>Per-bucket locking + CAS — reads are lock-free</td>
+      </tr>
+      <tr>
+        <td><code>ArrayList</code> (read-heavy)</td>
+        <td><code>CopyOnWriteArrayList</code></td>
+        <td>Every write copies the whole array</td>
+      </tr>
+      <tr>
+        <td><code>TreeMap</code></td>
+        <td><code>ConcurrentSkipListMap</code></td>
+        <td>Lock-free sorted skip list</td>
+      </tr>
+      <tr>
+        <td>A hand-rolled queue</td>
+        <td><code>ArrayBlockingQueue</code> / <code>LinkedBlockingQueue</code></td>
+        <td>Blocking producer/consumer handoff</td>
+      </tr>
+      <tr>
+        <td>A non-blocking queue</td>
+        <td><code>ConcurrentLinkedQueue</code></td>
+        <td>Lock-free (CAS) — never blocks</td>
+      </tr>
+      <tr>
+        <td><code>Collections.synchronizedMap</code></td>
+        <td>Basically nothing</td>
+        <td>One global lock — a bottleneck, and still not safe for compound ops</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>ConcurrentHashMap — the atomic methods are the point</b></figcaption>
+  <pre><code>ConcurrentHashMap&lt;String,Integer&gt; map = new ConcurrentHashMap&lt;&gt;();
+
+// BROKEN — two atomic calls are not one atomic operation
+if (!map.containsKey(k)) map.put(k, 1);       // another thread can slip in between
+
+// CORRECT — single atomic operations
+map.putIfAbsent(k, 1);
+map.computeIfAbsent(k, key -&gt; expensiveLoad(key));   // computed at most once per key
+map.compute(k, (key, v) -&gt; v == null ? 1 : v + 1);
+map.merge(k, 1, Integer::sum);                        // the cleanest counter you'll write
+map.getOrDefault(k, 0);</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why <code>ConcurrentHashMap</code> is fast</strong>
+  <p>
+    <strong>Reads never lock</strong> — nodes hold <code>volatile</code> fields, so a get is a plain
+    read. <strong>Writes lock only one bucket</strong> (Java 8+ synchronises on the first node of
+    that bin, after trying CAS for an empty bin). Two threads writing different keys almost never
+    contend. Compare that to <code>Collections.synchronizedMap</code>, where one giant lock
+    serialises every single operation.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>ConcurrentHashMap forbids null keys and values</strong>
+  <p>
+    <code>HashMap</code> allows them; <code>ConcurrentHashMap</code> throws NPE. The reason is
+    genuinely subtle: with a plain map you'd disambiguate with <code>containsKey()</code>, but
+    concurrently that answer can change between the two calls — so <code>get()</code> returning null
+    would be irreducibly ambiguous ("absent" vs "mapped to null"). Banning null removes the
+    ambiguity entirely.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Weakly consistent iterators</strong>
+  <p>
+    Concurrent collections never throw <code>ConcurrentModificationException</code>. Their iterators
+    are <strong>weakly consistent</strong>: they reflect the state at some point since creation and
+    may or may not show later changes. Similarly, <code>size()</code> is an estimate that may be
+    stale the instant it returns — never use it in a
+    <code>for (int i = 0; i &lt; map.size(); i++)</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>BlockingQueue — the producer/consumer backbone (Java's channel)</b></figcaption>
+  <pre><code>BlockingQueue&lt;Task&gt; queue = new ArrayBlockingQueue&lt;&gt;(100);   // BOUNDED = backpressure
+
+// Producer — blocks when full, which throttles it naturally
+queue.put(task);
+
+// Consumer — blocks when empty, no busy-waiting
+Task t = queue.take();
+
+// The full method set — four behaviours for each operation:
+//            Throws           Returns special   Blocks     Times out
+// insert     add(e)           offer(e)          put(e)     offer(e, t, unit)
+// remove     remove()         poll()            take()     poll(t, unit)
+// examine    element()        peek()            —          —
+
+// SynchronousQueue — capacity ZERO: a direct handoff, each put waits for a take.
+// This is the closest thing Java has to an unbuffered Go channel.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong><code>CopyOnWriteArrayList</code> copies the entire array on every write</strong>
+  <p>
+    That's O(n) per mutation. It's excellent for listener lists — write once at startup, read
+    constantly, iterate without locking or CME. It is catastrophic for anything write-heavy.
+  </p>
+</div>
+
+<h2 id="deadlock"><span class="num">11.</span> Deadlock, livelock, starvation</h2>
+<p class="lead">
+  A <em class="term">deadlock</em> is two threads each holding the lock the other needs, both
+  waiting forever. Nothing throws, nothing logs — the program simply stops.
+</p>
+
+<figure class="code">
+  <figcaption><b>The classic — lock ordering inversion</b></figcaption>
+  <pre><code>final Object lockA = new Object();
+final Object lockB = new Object();
+
+Thread t1 = new Thread(() -&gt; {
+    synchronized (lockA) {              // gets A
+        Thread.sleep(50);
+        synchronized (lockB) { }        // wants B — held by t2. Waits forever.
+    }
+});
+
+Thread t2 = new Thread(() -&gt; {
+    synchronized (lockB) {              // gets B
+        Thread.sleep(50);
+        synchronized (lockA) { }        // wants A — held by t1. Waits forever.
+    }
+});
+// Both threads BLOCKED. No exception, no log, no CPU usage. The app just hangs.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The four Coffman conditions — all must hold</strong>
+  <p>
+    <strong>1. Mutual exclusion</strong> — a resource can't be shared.
+    <strong>2. Hold and wait</strong> — you hold one while requesting another.
+    <strong>3. No preemption</strong> — locks can't be forcibly taken.
+    <strong>4. Circular wait</strong> — a cycle in the "waits for" graph. Break
+    <strong>any one</strong> and deadlock is impossible. In practice you break #4.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Fix 1 — global lock ordering (the standard answer)</b></figcaption>
+  <pre><code>// Rule: EVERY thread acquires locks in the same defined order. No cycle can form.
+void transfer(Account from, Account to, int amount) {
+    Account first  = from.id &lt; to.id ? from : to;    // order by a stable, unique key
+    Account second = from.id &lt; to.id ? to : from;
+
+    synchronized (first) {
+        synchronized (second) {
+            from.debit(amount);
+            to.credit(amount);
+        }
+    }
+}
+// Now transfer(A,B) and transfer(B,A) both lock A then B. Circular wait is impossible.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Fix 2 — tryLock with a timeout (break "hold and wait")</b></figcaption>
+  <pre><code>boolean transfer(Account from, Account to, int amount) throws InterruptedException {
+    if (from.lock.tryLock(1, TimeUnit.SECONDS)) {
+        try {
+            if (to.lock.tryLock(1, TimeUnit.SECONDS)) {
+                try {
+                    from.debit(amount);
+                    to.credit(amount);
+                    return true;
+                } finally { to.lock.unlock(); }
+            }
+        } finally { from.lock.unlock(); }   // couldn't get the second -&gt; RELEASE the first and retry
+    }
+    return false;
+}</code></pre>
+</figure>
+
+<h3>The neighbours</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Problem</th>
+        <th>What's happening</th>
+        <th>CPU</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Deadlock</strong></td>
+        <td>Everyone blocked in a cycle, forever</td>
+        <td>Idle</td>
+      </tr>
+      <tr>
+        <td><strong>Livelock</strong></td>
+        <td>Threads keep responding to each other and never progress</td>
+        <td>Busy — looks healthy!</td>
+      </tr>
+      <tr>
+        <td><strong>Starvation</strong></td>
+        <td>One thread never gets the lock; others hog it</td>
+        <td>Busy</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="analogy">
+  <p>
+    <strong>Deadlock</strong>: two people in a corridor, each waiting for the other to move first —
+    frozen. <strong>Livelock</strong>: both politely step aside, at the same time, again and again —
+    lots of motion, zero progress. <strong>Starvation</strong>: one person keeps getting shoved to
+    the back of the queue while everyone else walks through.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Diagnosing a hang in production</b></figcaption>
+  <pre><code>jps                    # find the pid
+jstack &lt;pid&gt;           # dump every thread's stack
+
+# jstack DETECTS deadlocks for you and prints:
+#
+# Found one Java-level deadlock:
+# =============================
+# "Thread-1":
+#   waiting to lock monitor 0x00007f... (object 0x000000076ab, a java.lang.Object),
+#   which is held by "Thread-0"
+# "Thread-0":
+#   waiting to lock monitor 0x00007f... (object 0x000000076ac, a java.lang.Object),
+#   which is held by "Thread-1"
+
+# This is why naming your threads matters — "pool-1-thread-7" tells you nothing.</code></pre>
+</figure>
+
+<h2 id="virtual-threads"><span class="num">12.</span> Virtual threads (Java 21)</h2>
+<p class="lead">
+  A <em class="term">virtual thread</em> is a thread the JVM manages itself instead of the OS. They
+  cost a few hundred bytes instead of a megabyte, so you can have <strong>millions</strong> — and
+  the "thread per request" model becomes viable again.
+</p>
+
+<div class="key">
+  <strong>The problem they solve</strong>
+  <p>
+    A platform thread maps 1:1 to an OS thread: ~1MB of stack, a syscall to create, and a costly
+    context switch. So you can afford maybe a few thousand — which is why we invented thread pools,
+    then async callbacks, then reactive streams, all to avoid blocking a precious thread. Virtual
+    threads make blocking <strong>cheap again</strong>, which deletes that entire tower of
+    complexity.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Using them</b></figcaption>
+  <pre><code>// One-off
+Thread.startVirtualThread(() -&gt; System.out.println("hi"));
+
+Thread t = Thread.ofVirtual().name("worker").start(runnable);
+t.join();
+
+// The real way — an executor that makes a NEW virtual thread per task
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    for (int i = 0; i &lt; 1_000_000; i++) {
+        executor.submit(() -&gt; {
+            Thread.sleep(1000);      // blocks the VIRTUAL thread — the carrier is freed!
+            return fetchSomething();
+        });
+    }
+}   // close() waits for all of them
+
+// A million concurrent tasks. With platform threads this would OOM instantly.</code></pre>
+</figure>
+
+<h3>How they work</h3>
+<figure class="code">
+  <figcaption><b>Mounting and unmounting</b></figcaption>
+  <pre><code>// Virtual threads run on a small pool of PLATFORM threads called "carriers"
+// (a ForkJoinPool sized to your core count).
+//
+//   1. Virtual thread MOUNTS onto a carrier and runs.
+//   2. It hits a blocking call (I/O, sleep, lock).
+//   3. The JVM UNMOUNTS it: its stack is copied to the heap, the carrier is released.
+//   4. The carrier immediately runs another virtual thread.
+//   5. When the I/O completes, the virtual thread is remounted (on any carrier) and continues.
+//
+// Blocking a virtual thread costs a heap copy, not an OS context switch.</code></pre>
+</figure>
+
+<div class="analogy">
+  <p>
+    Platform threads are <strong>hired staff</strong> — expensive, so you keep a small pool and
+    never let one sit idle. Virtual threads are <strong>sticky notes</strong>: write one per task
+    and stick it on the board. A handful of real workers (carriers) pick up whatever note is
+    actionable. A note waiting on someone else just sits there costing nothing.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Do NOT pool virtual threads</strong>
+  <p>
+    Pooling exists to amortise expensive creation. Virtual threads are cheap to create, so a pool
+    only reintroduces the limit you were escaping. Never write
+    <code>newFixedThreadPool</code> of virtual threads — use
+    <code>newVirtualThreadPerTaskExecutor()</code>. Similarly, don't cache anything in
+    <code>ThreadLocal</code> on them: with a million threads that's a million copies.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Pinning — the one real gotcha</strong>
+  <p>
+    If a virtual thread blocks <strong>inside a <code>synchronized</code> block</strong> (or in a
+    native/JNI call), it cannot unmount — it's <em class="term">pinned</em> to its carrier, and that
+    carrier is stuck too. Enough pinned threads and you starve the carrier pool. The fix in Java 21
+    is to use <code>ReentrantLock</code> instead of <code>synchronized</code> around blocking calls.
+    (JDK 24 largely removes this limitation, but on 21 it's real.) Diagnose with
+    <code>-Djdk.tracePinnedThreads=full</code>.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Platform thread</th>
+        <th>Virtual thread</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Backed by</td>
+        <td>An OS thread</td>
+        <td>The JVM (runs on a carrier)</td>
+      </tr>
+      <tr>
+        <td>Cost</td>
+        <td>~1MB stack</td>
+        <td>~a few hundred bytes, grows on demand</td>
+      </tr>
+      <tr>
+        <td>Practical count</td>
+        <td>Thousands</td>
+        <td>Millions</td>
+      </tr>
+      <tr>
+        <td>Pool them?</td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="no">No — never</span></td>
+      </tr>
+      <tr>
+        <td>Good for</td>
+        <td>CPU-bound work</td>
+        <td>I/O-bound work</td>
+      </tr>
+      <tr>
+        <td>Daemon?</td>
+        <td>Configurable</td>
+        <td>Always daemon; priority is ignored</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>They don't make CPU-bound code faster</strong>
+  <p>
+    You still only have N cores. Virtual threads solve <strong>waiting</strong>, not
+    <strong>computing</strong>. For CPU-bound work, a platform-thread pool sized to your cores is
+    still exactly right.
+  </p>
+</div>
+
+<h2 id="gotchas"><span class="num">13.</span> Gotchas — where Java surprises you</h2>
+
+<div class="qa">
+  <p class="q">1. <code>Thread.sleep()</code> does not release locks.</p>
+  <p class="a">
+    <code>wait()</code> releases the monitor; <code>sleep()</code> keeps everything it holds. So
+    sleeping inside <code>synchronized</code> blocks every other thread for the full duration.
+    <code>wait()</code> also <em>requires</em> you to hold the monitor — calling it without one
+    throws <code>IllegalMonitorStateException</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. Double-checked locking is broken without <code>volatile</code>.</p>
+  <p class="a">
+    <code>instance = new Singleton()</code> is three steps (allocate, construct, assign), and the
+    JIT may <strong>reorder</strong> the assignment before the constructor finishes. Another thread
+    then sees a non-null reference to a <strong>half-built object</strong>. Marking the field
+    <code>volatile</code> forbids that reordering and makes the idiom correct. Better still: use the
+    static holder idiom or an enum.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. <code>Collections.synchronizedList</code> doesn't make compound actions safe.</p>
+  <p class="a">
+    Each call is atomic, but <code>if (!list.contains(x)) list.add(x);</code> is two calls with a
+    gap. Iteration isn't safe either — you must manually <code>synchronized (list)</code> around the
+    whole loop, or you'll get a <code>ConcurrentModificationException</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. <code>SimpleDateFormat</code> is not thread-safe.</p>
+  <p class="a">
+    It holds mutable state in a field, so a shared static instance silently produces wrong dates
+    under load — no exception, just garbage. Use <code>java.time</code> (<code
+      >DateTimeFormatter</code
+    >
+    is immutable and thread-safe). Same trap: <code>Random</code> (use
+    <code>ThreadLocalRandom</code>) and <code>StringBuilder</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Exceptions in <code>submit()</code> vanish.</p>
+  <p class="a">
+    <code>submit()</code> stores the throwable in the <code>Future</code> instead of surfacing it.
+    If you never call <code>get()</code>, nothing is ever logged. <code>execute()</code> at least
+    routes it to the uncaught-exception handler. The same applies to a
+    <code>CompletableFuture</code> chain with no <code>exceptionally</code>/<code>handle</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. A <code>ScheduledExecutorService</code> task that throws stops rescheduling.</p>
+  <p class="a">
+    <code>scheduleAtFixedRate</code> cancels the whole schedule if the task ever throws — silently.
+    Your periodic job just stops running and nobody finds out for a week. Always wrap the body in
+    <code>try/catch(Throwable)</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">7. <code>ThreadLocal</code> leaks memory in a thread pool.</p>
+  <p class="a">
+    Pool threads live forever, so anything you put in a <code>ThreadLocal</code> is never collected
+    — and the next task on that thread <strong>sees the previous task's value</strong>. Always
+    <code>remove()</code> in a <code>finally</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">8. <code>notify()</code> can lose a signal; prefer <code>notifyAll()</code>.</p>
+  <p class="a">
+    <code>notify()</code> wakes <strong>one arbitrary</strong> waiter. If multiple threads wait on
+    different conditions on the same monitor, it may wake one whose condition is still false — which
+    goes back to sleep, and the signal is gone forever. Use <code>notifyAll()</code>, or use
+    separate <code>Condition</code> objects.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">9. Non-volatile <code>long</code>/<code>double</code> can tear.</p>
+  <p class="a">
+    The JMM permits a 64-bit read/write to be split into two 32-bit halves, so another thread can
+    observe a value that was <strong>never written</strong> — half old, half new. Rare on 64-bit
+    JVMs, but specified and legal. <code>volatile</code> or <code>AtomicLong</code> forbids it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">10. Making every method <code>synchronized</code> is not thread safety.</p>
+  <p class="a">
+    It makes each <em>call</em> atomic, not each <em>use case</em>.
+    <code>if (!list.isEmpty()) list.remove(0);</code> still races. Thread safety is about
+    <strong>invariants</strong>, not methods — the whole compound action needs one lock.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">14.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: <code>start()</code> vs <code>run()</code>?</p>
+  <p class="a">
+    <code>start()</code> creates a new thread which then invokes <code>run()</code>. Calling
+    <code>run()</code> directly executes it on the current thread — a plain method call, no
+    concurrency. Calling <code>start()</code> twice throws <code>IllegalThreadStateException</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: <code>volatile</code> vs <code>synchronized</code>?</p>
+  <p class="a">
+    <code>volatile</code> gives visibility and ordering for one field; it never blocks and gives no
+    atomicity for compound operations. <code>synchronized</code> gives visibility
+    <strong>and</strong> mutual exclusion over a block. Use <code>volatile</code> for a flag or a
+    reference swap; anything read-modify-write needs a lock or an atomic.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why isn't <code>volatile int i; i++;</code> thread-safe?</p>
+  <p class="a">
+    <code>i++</code> is read-modify-write. <code>volatile</code> makes each individual read and
+    write visible, but another thread can interleave between them, so updates are still lost. Use
+    <code>AtomicInteger.incrementAndGet()</code> or a lock.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is happens-before?</p>
+  <p class="a">
+    The JMM's visibility guarantee: if A happens-before B, A's writes are visible to B and can't be
+    reordered past it. Created by program order, unlock→lock on the same monitor, volatile
+    write→read, <code>start()</code>, <code>join()</code>, and final-field publication — and it's
+    transitive. No edge + concurrent access with a write = data race = no guarantees at all.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: <code>BLOCKED</code> vs <code>WAITING</code>?</p>
+  <p class="a">
+    <code>BLOCKED</code> is waiting to acquire a monitor — it resumes automatically when the holder
+    releases. <code>WAITING</code> is waiting for an explicit signal
+    (<code>notify</code>/<code>signal</code>/<code>unpark</code>/thread termination) — someone must
+    actively wake it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: <code>synchronized</code> vs <code>ReentrantLock</code>?</p>
+  <p class="a">
+    <code>ReentrantLock</code> adds <code>tryLock</code>, timeouts, interruptible acquisition,
+    fairness, and multiple <code>Condition</code>s — at the cost of manual <code>unlock()</code> in
+    a <code>finally</code>. <code>synchronized</code> is simpler, releases automatically, and is the
+    default. Both are reentrant.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How does CAS work, and what's the ABA problem?</p>
+  <p class="a">
+    CAS atomically writes a new value only if the current value equals the expected one; failure
+    means retry in a loop. It's optimistic and lock-free, so no thread blocks. ABA: a value changes
+    A→B→A, so CAS succeeds despite intervening modification.
+    <code>AtomicStampedReference</code> adds a version to distinguish them.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What causes deadlock and how do you prevent it?</p>
+  <p class="a">
+    All four Coffman conditions holding at once: mutual exclusion, hold-and-wait, no preemption, and
+    circular wait. Break one — usually circular wait, by imposing a global lock ordering. Other
+    tools: <code>tryLock</code> with timeout, and holding fewer locks (ideally one).
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why is <code>ConcurrentHashMap</code> better than <code>Hashtable</code>?</p>
+  <p class="a">
+    <code>Hashtable</code> and <code>synchronizedMap</code> lock the entire map on every operation.
+    <code>ConcurrentHashMap</code> never locks reads and locks only a single bucket on write, so
+    unrelated keys don't contend. It also offers atomic compound ops (<code>computeIfAbsent</code>,
+    <code>merge</code>) which a lock-wrapped map can't express safely.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you size a thread pool?</p>
+  <p class="a">
+    CPU-bound: roughly the number of cores. I/O-bound:
+    <code>cores × (1 + waitTime/computeTime)</code> — often hundreds. And in production build a
+    <code>ThreadPoolExecutor</code> with a <strong>bounded queue</strong> and
+    <code>CallerRunsPolicy</code>, because every <code>Executors</code> factory is unbounded
+    somewhere and will OOM under load.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What are virtual threads and when do they help?</p>
+  <p class="a">
+    JVM-managed threads that unmount from their carrier when they block, so a blocking call costs a
+    heap copy instead of an OS context switch. Millions are practical, which makes
+    thread-per-request viable and removes the need for reactive plumbing. They help
+    <strong>I/O-bound</strong> work only; don't pool them; watch out for pinning inside
+    <code>synchronized</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you make a class thread-safe?</p>
+  <p class="a">
+    Best: <strong>don't share</strong> (confine it to one thread). Next best:
+    <strong>don't mutate</strong> (immutable + final fields is automatically safe). Last resort:
+    <strong>synchronise</strong> every access — reads included — with the same lock, keep the
+    critical section small, and never call unknown code while holding it.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">15.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Three problems:</strong> atomicity (<code>i++</code> is 3 ops) · visibility (caches +
+    JIT) · ordering (reordering is legal).
+  </li>
+  <li>
+    <strong>States:</strong> NEW → RUNNABLE → (BLOCKED = wants a lock | WAITING = needs a signal |
+    TIMED_WAITING) → TERMINATED.
+  </li>
+  <li>
+    <strong><code>start()</code></strong> = new thread · <strong><code>run()</code></strong> = plain
+    method call. Interrupt is a <strong>request</strong>; restore the flag if you swallow it.
+  </li>
+  <li>
+    <strong><code>volatile</code>:</strong> visibility + ordering, no atomicity, never blocks. Good
+    for flags.
+  </li>
+  <li>
+    <strong><code>synchronized</code>:</strong> visibility + mutual exclusion. Reentrant. Instance
+    locks <code>this</code>; static locks <code>Class</code> — <em>different locks</em>. Lock a
+    private final object.
+  </li>
+  <li>
+    <strong>happens-before:</strong> program order · unlock→lock (same monitor) · volatile
+    write→read · <code>start()</code> · <code>join()</code> · final fields · transitive.
+  </li>
+  <li>
+    <strong>Atomics:</strong> CAS = optimistic retry loop, lock-free. <code>LongAdder</code> under
+    high contention. ABA → <code>AtomicStampedReference</code>.
+  </li>
+  <li>
+    <strong><code>ReentrantLock</code>:</strong> <code>tryLock</code> · timeout ·
+    <code>lockInterruptibly</code> · fairness · <code>Condition</code>.
+    <strong>Always <code>unlock()</code> in <code>finally</code>.</strong>
+  </li>
+  <li>
+    <strong>Wait:</strong> always in a <code>while</code> loop (spurious wakeups) · prefer
+    <code>notifyAll()</code> · <code>wait()</code> releases the lock, <code>sleep()</code> does not.
+  </li>
+  <li>
+    <strong>Pools:</strong> grows past core <strong>only when the queue is full</strong> → unbounded
+    queue means max is ignored. Use a bounded queue + <code>CallerRunsPolicy</code>. Size: cores
+    (CPU) · cores×(1+wait/compute) (I/O).
+  </li>
+  <li>
+    <strong><code>CompletableFuture</code>:</strong> <code>thenApply</code> (map) ·
+    <code>thenCompose</code> (flatMap) · <code>thenCombine</code> (join two) ·
+    <code>allOf</code>/<code>anyOf</code> · <code>exceptionally</code>/<code>handle</code>. Pass
+    your own executor.
+  </li>
+  <li>
+    <strong>Collections:</strong> <code>ConcurrentHashMap</code> (no nulls, atomic
+    <code>merge</code>/<code>computeIfAbsent</code>) · <code>CopyOnWriteArrayList</code> (read-heavy
+    only) · <code>BlockingQueue</code> (bounded = backpressure).
+  </li>
+  <li>
+    <strong>Deadlock:</strong> 4 Coffman conditions · fix with
+    <strong>global lock ordering</strong> or <code>tryLock</code> timeout · diagnose with
+    <code>jstack</code>.
+  </li>
+  <li>
+    <strong>Virtual threads (21):</strong> cheap, millions, unmount on block. I/O only · never pool
+    · beware pinning in <code>synchronized</code>.
+  </li>
+  <li>
+    <strong>Safety, in order:</strong> don't share → don't mutate → synchronise everything with one
+    lock.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

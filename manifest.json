@@ -5,7 +5,12 @@
       "pages": [
         { "title": "OOP", "path": "java/oops" },
         { "title": "Collections Framework", "path": "java/collections" },
-        { "title": "Generics", "path": "java/generics" }
+        { "title": "Generics", "path": "java/generics" },
+        { "title": "Exceptions", "path": "java/exceptions" },
+        { "title": "Modern Java (8 → 21)", "path": "java/modern-java" },
+        { "title": "Concurrency", "path": "java/concurrency" },
+        { "title": "JVM Internals", "path": "java/jvm" },
+        { "title": "Design Patterns", "path": "java/design-patterns" }
       ]
     }
   ]

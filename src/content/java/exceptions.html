@@ -1,0 +1,1099 @@
+<h1>Java Exceptions — Complete Notes</h1>
+<p class="subtitle">
+  Checked vs unchecked, the hierarchy, try-with-resources, custom exceptions, and the judgment call
+  that actually matters in real code — when to wrap, when to propagate, and when to shut up and let
+  it fly.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> What an exception actually is</h2>
+<p class="lead">
+  An <em class="term">exception</em> is Java's way of saying "I cannot finish this method, and I
+  refuse to pretend I did." It is a <strong>second return channel</strong> — one that carries a
+  failure instead of a value, and that you cannot silently ignore.
+</p>
+
+<p>
+  Before exceptions, languages signalled failure with <strong>magic return values</strong>: return
+  <code>-1</code>, or <code>null</code>, or set a global error flag. The problem is that nothing
+  forces the caller to look:
+</p>
+
+<figure class="code">
+  <figcaption><b>The old way — failure as a return value, easily ignored</b></figcaption>
+  <pre><code>int result = divide(10, 0);   // returns -1 to mean "error"
+System.out.println(result);   // prints -1 and carries on happily
+                              // The bug travels silently through your whole program.</code></pre>
+</figure>
+
+<p>
+  An exception flips this around. The failing method <strong>stops</strong>, and the error travels
+  up the call stack on its own until someone handles it. If nobody does, the program dies loudly
+  with a stack trace — which is far better than quietly computing the wrong answer.
+</p>
+
+<figure class="code">
+  <figcaption><b>The exception way — impossible to ignore by accident</b></figcaption>
+  <pre><code>int divide(int a, int b) {
+    if (b == 0) throw new ArithmeticException("cannot divide by zero");
+    return a / b;
+}
+
+int result = divide(10, 0);   // this line never completes
+System.out.println(result);   // never runs — control has already left</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The one idea behind all of it</strong>
+  <p>
+    An exception <strong>separates the happy path from the error path</strong>. Your main logic
+    reads top-to-bottom as if nothing can fail, and the failure handling lives in one place off to
+    the side. Compare that to checking a return code after literally every single call.
+  </p>
+</div>
+
+<h3>What happens when you throw — stack unwinding</h3>
+<p>
+  When you <code>throw</code>, the JVM abandons the current method and looks for a matching
+  <code>catch</code> in the caller. If there isn't one, it abandons that method too, and keeps going
+  <strong>up the call stack</strong>. This walk is called <em class="term">stack unwinding</em>. If
+  it reaches the top of the thread with no handler, the thread dies and the trace is printed.
+</p>
+
+<figure class="code">
+  <figcaption><b>Unwinding — the exception climbs until something catches it</b></figcaption>
+  <pre><code>void main()  { a(); }              // 3. no catch here either -&gt; thread dies, trace printed
+void a()     { b(); }              // 2. no catch here -&gt; keep climbing
+void b()     { throw new IllegalStateException("boom"); }  // 1. thrown here
+
+// Output:
+// Exception in thread "main" java.lang.IllegalStateException: boom
+//     at Demo.b(Demo.java:8)
+//     at Demo.a(Demo.java:6)
+//     at Demo.main(Demo.java:4)</code></pre>
+</figure>
+
+<div class="analogy">
+  <p>
+    Throwing is <strong>pulling the emergency cord on a train</strong>. The current carriage stops
+    immediately and the alarm passes down the train, carriage by carriage, until someone with a key
+    (a <code>catch</code>) responds. If nobody on the whole train has a key, the train stops dead
+    and a report is printed of exactly which carriage pulled the cord and who was standing behind
+    it.
+  </p>
+</div>
+
+<h2 id="hierarchy"><span class="num">01.</span> The hierarchy — everything is a Throwable</h2>
+<p class="lead">
+  Every single thing you can <code>throw</code> or <code>catch</code> in Java descends from one
+  class: <code>Throwable</code>. Learn this tree and 80% of exception questions answer themselves.
+</p>
+
+<figure class="code">
+  <figcaption><b>The tree that explains everything</b></figcaption>
+  <pre><code>              Object
+                |
+            Throwable                 &lt;- the root of everything throwable
+             /      \
+          Error    Exception
+            |        /      \
+            |       |    RuntimeException
+            |       |          |
+            |       |    - NullPointerException
+            |       |    - IllegalArgumentException
+            |       |    - IllegalStateException
+            |       |    - IndexOutOfBoundsException
+            |       |    - ArithmeticException
+            |       |    - ClassCastException
+            |       |
+            |    (checked exceptions)
+            |     - IOException
+            |     - FileNotFoundException
+            |     - SQLException
+            |     - InterruptedException
+            |
+        (unrecoverable JVM problems)
+         - OutOfMemoryError
+         - StackOverflowError
+         - NoClassDefFoundError</code></pre>
+</figure>
+
+<p>The tree splits into <strong>three practical groups</strong>:</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Group</th>
+        <th>Who caused it</th>
+        <th>Checked?</th>
+        <th>Should you catch it?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Error</code></td>
+        <td>The JVM itself is in trouble</td>
+        <td><span class="no">No</span></td>
+        <td><span class="no">No</span> — you cannot meaningfully fix it</td>
+      </tr>
+      <tr>
+        <td><code>RuntimeException</code></td>
+        <td>A bug in your code</td>
+        <td><span class="no">No</span></td>
+        <td>Usually no — <strong>fix the bug</strong> instead</td>
+      </tr>
+      <tr>
+        <td>Other <code>Exception</code></td>
+        <td>The outside world misbehaved</td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span> — this is expected and recoverable</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The rule that defines "checked"</strong>
+  <p>
+    An exception is <strong>checked</strong> if it extends <code>Exception</code> but
+    <strong>not</strong> <code>RuntimeException</code>. That's the whole rule.
+    <code>Error</code> and <code>RuntimeException</code> and all their subclasses are
+    <strong>unchecked</strong>. Nothing else about the class matters — not its name, not its
+    package.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Never catch Error</strong>
+  <p>
+    <code>OutOfMemoryError</code> means the heap is exhausted; <code>StackOverflowError</code> means
+    the stack is. Catching them and "carrying on" leaves the JVM in a state where nothing is
+    trustworthy — your catch block itself may need memory it can't get. Let the process die and
+    restart it.
+  </p>
+</div>
+
+<h2 id="checked"><span class="num">02.</span> Checked vs unchecked — the real distinction</h2>
+<p class="lead">
+  <em class="term">Checked</em> exceptions are enforced by the compiler: you must either
+  <code>catch</code> them or declare them with <code>throws</code>. <em class="term">Unchecked</em>
+  exceptions are not — you can ignore them entirely and the code still compiles.
+</p>
+
+<figure class="code">
+  <figcaption><b>Checked — the compiler will not let you look away</b></figcaption>
+  <pre><code>// IOException is checked, so ONE of these two is mandatory:
+
+// Option A — handle it here
+void readA() {
+    try {
+        Files.readString(Path.of("a.txt"));
+    } catch (IOException e) {
+        System.out.println("could not read: " + e.getMessage());
+    }
+}
+
+// Option B — declare it and make it the caller's problem
+void readB() throws IOException {
+    Files.readString(Path.of("a.txt"));
+}
+
+// Option C — do neither
+void readC() {
+    Files.readString(Path.of("a.txt"));   // COMPILE ERROR:
+}                                          // unreported exception IOException; must be caught or declared</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Unchecked — the compiler says nothing at all</b></figcaption>
+  <pre><code>void parse(String s) {
+    int n = Integer.parseInt(s);   // throws NumberFormatException (unchecked)
+}                                  // Compiles fine. No try, no throws. Blows up at runtime if s is "abc".</code></pre>
+</figure>
+
+<h3>Why the distinction exists</h3>
+<p>
+  The intended meaning is a statement about <strong>whose fault it is</strong> and
+  <strong>whether the caller can do anything</strong>:
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Checked</th>
+        <th>Unchecked</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Means</td>
+        <td>"Something outside your control failed"</td>
+        <td>"You have a bug"</td>
+      </tr>
+      <tr>
+        <td>Example</td>
+        <td>The network dropped, the file is gone</td>
+        <td>You passed <code>null</code>, index was -1</td>
+      </tr>
+      <tr>
+        <td>Caller can react?</td>
+        <td><span class="yes">Yes</span> — retry, use a default, tell the user</td>
+        <td><span class="no">No</span> — there's nothing sensible to do</td>
+      </tr>
+      <tr>
+        <td>Right fix</td>
+        <td>Handle it</td>
+        <td>Change the code</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="analogy">
+  <p>
+    <strong>Checked</strong> is the restaurant telling you "we're out of salmon" — annoying, but
+    expected, and you can just order something else. <strong>Unchecked</strong> is the waiter
+    tripping and dropping the plate — that isn't a menu decision you respond to, it's a mistake that
+    should be fixed in the kitchen.
+  </p>
+</div>
+
+<h3>The honest modern take</h3>
+<p>
+  Checked exceptions are the most argued-about feature in Java, and it is worth knowing why so you
+  can answer with nuance rather than dogma. In practice they have two well-known failure modes:
+</p>
+
+<figure class="code">
+  <figcaption><b>Failure mode 1 — the swallow, the single worst thing you can do</b></figcaption>
+  <pre><code>try {
+    riskyThing();
+} catch (IOException e) {
+    // nothing here. "I'll deal with it later."
+}
+// The failure is now invisible. No log, no trace, no clue.
+// Debugging this at 3am is genuinely miserable.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Failure mode 2 — throws pollution creeping up every layer</b></figcaption>
+  <pre><code>String load()   throws IOException, SQLException, ParseException { ... }
+String service() throws IOException, SQLException, ParseException { return load(); }
+String handler() throws IOException, SQLException, ParseException { return service(); }
+// Every layer is forced to name low-level failures it has no interest in.</code></pre>
+</figure>
+
+<div class="note">
+  <strong>What modern codebases actually do</strong>
+  <p>
+    Most modern Java (and every language designed after Java — C#, Kotlin, Go, Scala) leans
+    <strong>unchecked</strong>. The common convention: use <strong>unchecked</strong> for
+    programming errors and for failures the caller genuinely can't fix, and reserve
+    <strong>checked</strong> for the rare case where a caller has a realistic, specific recovery.
+    When crossing a layer boundary, <strong>wrap</strong> the checked exception in a meaningful
+    unchecked one (see <a href="#wrap">section 07</a>).
+  </p>
+</div>
+
+<h2 id="syntax"><span class="num">03.</span> try / catch / finally — the mechanics</h2>
+<p class="lead">
+  <code>try</code> marks code that might fail, <code>catch</code> handles a specific failure, and
+  <code>finally</code> runs cleanup <strong>no matter what happens</strong>.
+</p>
+
+<figure class="code">
+  <figcaption><b>The full shape</b></figcaption>
+  <pre><code>try {
+    // code that might throw
+} catch (FileNotFoundException e) {
+    // runs ONLY for this type (or a subclass of it)
+} catch (IOException e) {
+    // runs for other IOExceptions
+} finally {
+    // ALWAYS runs — exception or not, return or not
+}</code></pre>
+</figure>
+
+<h3>Catch order matters — most specific first</h3>
+<p>
+  Java picks the <strong>first</strong> catch whose type matches. So a broad catch placed above a
+  narrow one makes the narrow one unreachable — and that is a compile error, not a warning.
+</p>
+
+<figure class="code">
+  <figcaption><b>Wrong order — the compiler rejects it outright</b></figcaption>
+  <pre><code>try {
+    read();
+} catch (IOException e) {           // broad
+} catch (FileNotFoundException e) { // COMPILE ERROR:
+}                                   // exception FileNotFoundException has already been caught
+
+// Correct: subclass first, superclass second.
+try {
+    read();
+} catch (FileNotFoundException e) { // specific
+} catch (IOException e) {           // general fallback
+}</code></pre>
+</figure>
+
+<h3>Multi-catch (Java 7+)</h3>
+<figure class="code">
+  <figcaption><b>One block, several unrelated types</b></figcaption>
+  <pre><code>try {
+    process();
+} catch (IOException | SQLException e) {     // handle both the same way
+    log.error("processing failed", e);
+    throw new ProcessingException(e);
+}</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Two rules for multi-catch</strong>
+  <p>
+    1. The types must <strong>not be related by inheritance</strong> —
+    <code>catch (IOException | FileNotFoundException e)</code> is a compile error, because the
+    second is already covered by the first. 2. The variable <code>e</code> is
+    <strong>implicitly final</strong> — you cannot reassign it inside the block.
+  </p>
+</div>
+
+<h3>finally — and the three ways it can betray you</h3>
+<p>
+  <code>finally</code> runs on the way out no matter how you leave the <code>try</code>: normal
+  completion, an exception, or even a <code>return</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>finally runs even when you return</b></figcaption>
+  <pre><code>int f() {
+    try {
+        return 1;        // value 1 is computed and held...
+    } finally {
+        System.out.println("cleanup");   // ...but this runs BEFORE the method actually returns
+    }
+}
+// prints "cleanup", then returns 1</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Never return (or throw) from finally</strong>
+  <p>
+    A <code>return</code> in <code>finally</code> <strong>discards the exception</strong> that was
+    travelling and overrides the real return value. It is the most effective way to make a bug
+    invisible. Most linters flag it; treat it as banned.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The trap — a swallowed exception</b></figcaption>
+  <pre><code>int bad() {
+    try {
+        throw new RuntimeException("the real problem");
+    } finally {
+        return 42;      // the exception is thrown away. Caller sees 42 and thinks all is well.
+    }
+}
+// bad() returns 42. The RuntimeException vanishes without trace.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>When finally does NOT run</b></figcaption>
+  <pre><code>// 1. The JVM exits
+try { System.exit(0); } finally { System.out.println("never printed"); }
+
+// 2. The thread is killed, or the JVM crashes / is SIGKILLed
+// 3. An infinite loop or deadlock inside try means you never leave it</code></pre>
+</figure>
+
+<h2 id="twr"><span class="num">04.</span> try-with-resources — the only way to close things</h2>
+<p class="lead">
+  <em class="term">try-with-resources</em> (Java 7+) automatically closes anything you open. It
+  replaces the entire class of "I forgot to close the file" bugs, and it handles an edge case that
+  hand-written <code>finally</code> almost always gets wrong.
+</p>
+
+<figure class="code">
+  <figcaption><b>The old way — verbose, and subtly broken</b></figcaption>
+  <pre><code>BufferedReader br = null;
+try {
+    br = new BufferedReader(new FileReader("a.txt"));
+    System.out.println(br.readLine());
+} catch (IOException e) {
+    log.error("read failed", e);
+} finally {
+    if (br != null) {
+        try { br.close(); }          // close() itself throws IOException, so another try...
+        catch (IOException ignored) {}   // ...and now you're swallowing again
+    }
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption>
+    <b>The modern way — same behaviour, plus a fix you didn't know you needed</b>
+  </figcaption>
+  <pre><code>try (BufferedReader br = new BufferedReader(new FileReader("a.txt"))) {
+    System.out.println(br.readLine());
+} catch (IOException e) {
+    log.error("read failed", e);
+}
+// br.close() is called automatically, guaranteed, even if readLine() throws.</code></pre>
+</figure>
+
+<h3>How it works</h3>
+<p>
+  Anything declared in the <code>try (...)</code> header must implement
+  <code>AutoCloseable</code> (or <code>Closeable</code>, which extends it). The compiler generates
+  the <code>finally</code> that calls <code>close()</code> for you.
+</p>
+
+<figure class="code">
+  <figcaption><b>Your own closeable resource</b></figcaption>
+  <pre><code>class Connection implements AutoCloseable {
+    Connection() { System.out.println("open"); }
+    void use()   { System.out.println("using"); }
+    @Override public void close() { System.out.println("closed"); }  // narrowed: throws nothing
+}
+
+try (Connection c = new Connection()) {
+    c.use();
+}
+// open
+// using
+// closed</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Resources close in REVERSE order of declaration</strong>
+  <p>
+    Just like nested <code>finally</code> blocks would. The last thing opened is the first thing
+    closed — which is exactly what you want, since later resources usually depend on earlier ones.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Multiple resources — opened left to right, closed right to left</b></figcaption>
+  <pre><code>try (Connection c = new Connection();
+     Statement s = c.createStatement();
+     ResultSet r = s.executeQuery(sql)) {
+    // use r
+}
+// close order: r, then s, then c
+// Note: the semicolon after the LAST resource is optional.</code></pre>
+</figure>
+
+<h3>Suppressed exceptions — the edge case that matters</h3>
+<p>
+  Here is the problem the old <code>finally</code> style silently got wrong. Suppose the body
+  throws, and then <code>close()</code> <em>also</em> throws. You now have two exceptions and only
+  one can propagate. Which one wins?
+</p>
+
+<div class="key">
+  <strong>The body's exception wins. Always.</strong>
+  <p>
+    That's the right answer — the body's failure is the <em>real</em> problem; the close failure is
+    usually a consequence of it. But the close exception is not thrown away: it is
+    <strong>attached</strong> to the primary one and retrievable via <code>getSuppressed()</code>.
+    Hand-written <code>finally</code> does the opposite — the close exception replaces and destroys
+    the original.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Suppression in action</b></figcaption>
+  <pre><code>class Bad implements AutoCloseable {
+    void use()  { throw new RuntimeException("primary — the real bug"); }
+    public void close() { throw new RuntimeException("secondary — from close()"); }
+}
+
+try (Bad b = new Bad()) {
+    b.use();
+} catch (Exception e) {
+    System.out.println(e.getMessage());                    // primary — the real bug
+    System.out.println(e.getSuppressed()[0].getMessage()); // secondary — from close()
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Why the old style loses information</b></figcaption>
+  <pre><code>Bad b = new Bad();
+try {
+    b.use();               // throws "primary" ...
+} finally {
+    b.close();             // ... then this throws "secondary", REPLACING it entirely.
+}
+// Caller sees only "secondary". The actual bug is gone forever.</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Effectively-final resources (Java 9+)</strong>
+  <p>
+    Before Java 9 you had to declare the resource inside the parentheses. Since Java 9 you can use
+    an existing variable, provided it is final or effectively final:
+    <code>try (br) { ... }</code>.
+  </p>
+</div>
+
+<h2 id="throw-throws"><span class="num">05.</span> throw vs throws, and propagation</h2>
+<p class="lead">
+  One letter apart, completely different jobs. <code>throw</code> is an <strong>action</strong>;
+  <code>throws</code> is a <strong>declaration</strong>.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th><code>throw</code></th>
+        <th><code>throws</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>What it is</td>
+        <td>A statement — actually raises it now</td>
+        <td>Part of the method signature</td>
+      </tr>
+      <tr>
+        <td>Where</td>
+        <td>Inside a method body</td>
+        <td>After the parameter list</td>
+      </tr>
+      <tr>
+        <td>How many</td>
+        <td>One object at a time</td>
+        <td>A comma-separated list of types</td>
+      </tr>
+      <tr>
+        <td>Means</td>
+        <td>"Failing, right now"</td>
+        <td>"This might fail — caller beware"</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Both together</b></figcaption>
+  <pre><code>void withdraw(int amount) throws InsufficientFundsException {   // declaration
+    if (amount &gt; balance) {
+        throw new InsufficientFundsException("need " + amount + ", have " + balance);  // action
+    }
+    balance -= amount;
+}</code></pre>
+</figure>
+
+<h3>Overriding rules — a subclass may never widen the contract</h3>
+<p>
+  If you override a method, you cannot declare <strong>new or broader checked</strong> exceptions
+  than the parent. If you could, code holding a parent reference would be blindsided by an exception
+  it was never told about — breaking the Liskov substitution principle.
+</p>
+
+<figure class="code">
+  <figcaption><b>What an override may and may not declare</b></figcaption>
+  <pre><code>class Parent {
+    void go() throws IOException { }
+}
+
+class Child extends Parent {
+    // ALLOWED — same exception
+    void go() throws IOException { }
+}
+class Child2 extends Parent {
+    // ALLOWED — narrower (FileNotFoundException extends IOException)
+    void go() throws FileNotFoundException { }
+}
+class Child3 extends Parent {
+    // ALLOWED — fewer: declaring nothing at all is always fine
+    void go() { }
+}
+class Child4 extends Parent {
+    // COMPILE ERROR — broader. Exception is a supertype of IOException.
+    void go() throws Exception { }
+}
+class Child5 extends Parent {
+    // COMPILE ERROR — brand new checked exception the parent never mentioned
+    void go() throws SQLException { }
+}
+class Child6 extends Parent {
+    // ALLOWED — unchecked exceptions are never part of the contract, declare freely
+    void go() throws IllegalStateException { }
+}</code></pre>
+</figure>
+
+<h2 id="custom"><span class="num">06.</span> Custom exceptions</h2>
+<p class="lead">
+  Write your own exception when the failure is <strong>meaningful in your domain</strong> and a
+  caller might want to catch <em>that specific thing</em>. Not before.
+</p>
+
+<figure class="code">
+  <figcaption><b>The standard shape — always provide the cause constructor</b></figcaption>
+  <pre><code>// Unchecked: extend RuntimeException (the usual default)
+public class InsufficientFundsException extends RuntimeException {
+
+    private final BigDecimal shortfall;   // carry USEFUL data, not just a string
+
+    public InsufficientFundsException(String message) {
+        super(message);
+        this.shortfall = null;
+    }
+
+    public InsufficientFundsException(String message, Throwable cause) {
+        super(message, cause);            // NEVER drop the cause
+        this.shortfall = null;
+    }
+
+    public InsufficientFundsException(String message, BigDecimal shortfall) {
+        super(message);
+        this.shortfall = shortfall;
+    }
+
+    public BigDecimal getShortfall() { return shortfall; }
+}
+
+// Checked: extend Exception instead — everything else is identical
+public class ConfigurationException extends Exception {
+    public ConfigurationException(String message, Throwable cause) { super(message, cause); }
+}</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Checked or unchecked — the deciding question</strong>
+  <p>
+    Ask:
+    <strong>"can the caller realistically do something different if they catch this?"</strong> If
+    yes (retry, fall back, prompt the user) → consider <strong>checked</strong>. If it just means
+    "someone made a mistake" or "this is broken and nothing will help" → <strong>unchecked</strong>.
+    When unsure, choose <strong>unchecked</strong>; it's the modern default and far easier to change
+    later.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Use the built-ins when they fit</strong>
+  <p>
+    Don't invent <code>MyNullException</code>. Java already has precise, universally understood
+    names: <code>IllegalArgumentException</code> (bad input),
+    <code>IllegalStateException</code> (wrong time to call this),
+    <code>UnsupportedOperationException</code> (not implemented / not allowed),
+    <code>NullPointerException</code> (use <code>Objects.requireNonNull</code>).
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Validation with the standard exceptions</b></figcaption>
+  <pre><code>void setAge(int age) {
+    if (age &lt; 0) throw new IllegalArgumentException("age must be &gt;= 0, got: " + age);
+    this.age = age;
+}
+
+void send() {
+    if (!connected) throw new IllegalStateException("call connect() before send()");
+    ...
+}
+
+Order(Customer c) {
+    // throws NPE with a clear message instead of a mystery NPE three calls later
+    this.customer = Objects.requireNonNull(c, "customer must not be null");
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Put real facts in the message</strong>
+  <p>
+    <code>"Invalid input"</code> is worthless at 3am.
+    <code>"age must be &gt;= 0, got: -5"</code> tells you the rule <em>and</em> the actual value.
+    Include the values — never include passwords, tokens or personal data.
+  </p>
+</div>
+
+<h2 id="wrap"><span class="num">07.</span> Wrap vs propagate — the design judgment</h2>
+<p class="lead">
+  This is the part that separates people who "know the syntax" from people who write good Java.
+  There are exactly <strong>four</strong> things you can do with an exception, and choosing
+  correctly is the whole skill.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Option</th>
+        <th>Do it when…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1. Handle it</strong></td>
+        <td>You can genuinely fix or recover here — retry, use a cached value, use a default</td>
+      </tr>
+      <tr>
+        <td><strong>2. Propagate</strong></td>
+        <td>The caller is in a better position to decide. The default for most methods.</td>
+      </tr>
+      <tr>
+        <td><strong>3. Wrap and rethrow</strong></td>
+        <td>You are crossing a layer boundary and the low-level type would leak</td>
+      </tr>
+      <tr>
+        <td><strong>4. Swallow</strong></td>
+        <td>
+          <span class="no">Almost never.</span> Only when the failure is truly irrelevant — and log
+          it anyway.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Propagate — say nothing, do nothing</h3>
+<p>
+  If you can't add value, get out of the way. The worst code catches, logs, and rethrows at every
+  single level, producing the same stack trace six times in the log.
+</p>
+
+<figure class="code">
+  <figcaption><b>Just let it fly</b></figcaption>
+  <pre><code>String read(Path p) throws IOException {
+    return Files.readString(p);   // nothing useful to add here — let the caller deal with it
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>The log-and-rethrow anti-pattern</strong>
+  <p>
+    <code>catch (X e) { log.error("failed", e); throw e; }</code> at every layer means one failure
+    prints five near-identical stack traces, and it becomes genuinely hard to tell whether you had
+    one problem or five. <strong>Log once</strong>, at the boundary where you actually handle it.
+  </p>
+</div>
+
+<h3>Wrap — translate at a layer boundary</h3>
+<p>
+  Your <code>UserService</code> shouldn't throw <code>SQLException</code>. That leaks the fact that
+  you use a database — the caller can't act on it, and the day you switch to a REST API, every
+  caller breaks. Wrap it in something meaningful for your layer.
+</p>
+
+<figure class="code">
+  <figcaption><b>Exception translation — hide the mechanism, keep the evidence</b></figcaption>
+  <pre><code>public User findUser(long id) {
+    try {
+        return jdbc.query("SELECT ...", id);
+    } catch (SQLException e) {
+        // Translate to MY layer's vocabulary — but keep `e` as the cause!
+        throw new UserLookupException("could not load user " + id, e);
+    }
+}</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The single most important rule in this entire document</strong>
+  <p>
+    <strong>Always pass the original exception as the cause.</strong>
+    <code>new MyException(msg, e)</code> — never <code>new MyException(msg)</code>. Drop the cause
+    and you destroy the stack trace pointing at the actual line that failed, leaving you with a
+    useless "could not load user 7" and no idea why.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>What the cause buys you — the "Caused by" chain</b></figcaption>
+  <pre><code>UserLookupException: could not load user 7
+    at UserService.findUser(UserService.java:22)
+    at UserController.get(UserController.java:14)
+Caused by: java.sql.SQLException: connection refused        &lt;- the actual reason
+    at org.postgresql.Driver.connect(Driver.java:198)
+    ... 12 more</code></pre>
+</figure>
+
+<div class="dd">
+  <div class="do">
+    <h5>✓ Do</h5>
+    <ul>
+      <li>Throw at the level of abstraction the caller understands.</li>
+      <li>Always chain the cause: <code>new X("msg", e)</code>.</li>
+      <li>Catch the <strong>narrowest</strong> type you can actually handle.</li>
+      <li>
+        Handle (and log) once, at a real boundary — a controller, a job runner, <code>main</code>.
+      </li>
+      <li>Include the offending values in the message.</li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h5>✗ Don't</h5>
+    <ul>
+      <li>Swallow: <code>catch (Exception e) {}</code>.</li>
+      <li><code>catch (Exception e)</code> or <code>catch (Throwable t)</code> as a blanket.</li>
+      <li>Log <em>and</em> rethrow at every layer.</li>
+      <li><code>return</code> or <code>throw</code> from <code>finally</code>.</li>
+      <li>Use exceptions for normal control flow (see gotchas).</li>
+      <li>Drop the cause when wrapping.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note">
+  <strong>Catching <code>Exception</code> at the very top is fine</strong>
+  <p>
+    The blanket ban has one exception: the <strong>outermost boundary</strong>. A web framework's
+    error handler, a scheduled job's loop, or <code>main</code> should catch broadly so that one bad
+    request doesn't kill the server. That's a deliberate safety net, not laziness — and it logs.
+  </p>
+</div>
+
+<h2 id="stacktrace"><span class="num">08.</span> Reading a stack trace</h2>
+<p class="lead">
+  A stack trace is not noise. It tells you <strong>what failed</strong>, <strong>where</strong>, and
+  <strong>how you got there</strong> — read it top-down and you rarely need a debugger.
+</p>
+
+<figure class="code">
+  <figcaption><b>Anatomy of a trace</b></figcaption>
+  <pre><code>Exception in thread "main" java.lang.NullPointerException: Cannot invoke
+    "String.length()" because "name" is null                 &lt;- (1) WHAT + why (helpful NPE, Java 14+)
+    at com.app.User.nameLength(User.java:42)                 &lt;- (2) WHERE it was thrown — start here
+    at com.app.UserService.process(UserService.java:18)      &lt;- (3) who called it
+    at com.app.Main.main(Main.java:7)                        &lt;- (4) the entry point
+Caused by: java.sql.SQLException: connection refused         &lt;- (5) the ROOT cause — often the real story
+    at org.postgresql.Driver.connect(Driver.java:198)
+    ... 12 more                                              &lt;- (6) frames identical to the trace above</code></pre>
+</figure>
+
+<div class="key">
+  <strong>How to actually read one</strong>
+  <p>
+    <strong>1.</strong> Scroll to the <strong>bottom</strong> — the last <code>Caused by</code> is
+    usually the real problem. <strong>2.</strong> Then read the
+    <strong>topmost line of your own package</strong> in that block — library frames are rarely the
+    bug. <strong>3.</strong> The exception type and message tell you what invariant broke.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Helpful NullPointerExceptions (Java 14+)</strong>
+  <p>
+    Modern Java tells you <em>which</em> reference was null:
+    <code>Cannot invoke "String.length()" because "name" is null</code>. On older versions you'd get
+    a bare <code>NullPointerException</code> and a line with five possible culprits. This alone is a
+    strong reason to be on a recent JDK.
+  </p>
+</div>
+
+<h2 id="gotchas"><span class="num">09.</span> Gotchas — where Java surprises you</h2>
+
+<div class="qa">
+  <p class="q">1. Exceptions are expensive — but not for the reason you think.</p>
+  <p class="a">
+    The cost is almost entirely in <code>fillInStackTrace()</code>, which walks the whole stack when
+    the exception is <strong>constructed</strong> (not when thrown or caught). A <code>try</code>
+    block that doesn't throw costs essentially nothing. This is why using exceptions for normal
+    control flow — like ending a loop — is slow as well as unreadable.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. <code>catch (Exception e)</code> does not catch everything.</p>
+  <p class="a">
+    It misses <code>Error</code> (e.g. <code>OutOfMemoryError</code>,
+    <code>StackOverflowError</code>). Only <code>catch (Throwable t)</code> catches literally
+    everything — and you should not.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. <code>finally</code> overrides the <code>try</code>'s return value.</p>
+  <p class="a">
+    If <code>finally</code> has its own <code>return</code>, it wins and any in-flight exception is
+    discarded. But note the subtlety: <code>finally</code> mutating a <em>primitive local</em> after
+    <code>return x</code> does <strong>not</strong> change the returned value — the value was
+    already copied. Mutating an <em>object's fields</em> <strong>does</strong> show up, because the
+    reference was copied, not the object.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. Swallowing <code>InterruptedException</code> breaks cancellation.</p>
+  <p class="a">
+    Catching it <strong>clears the thread's interrupt flag</strong>. If you don't rethrow it, at
+    minimum restore the flag with <code>Thread.currentThread().interrupt()</code> — otherwise the
+    code above you never learns it was asked to stop, and your shutdown hangs.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Lambdas and streams cannot throw checked exceptions.</p>
+  <p class="a">
+    <code>Function&lt;T,R&gt;.apply</code> declares no checked exceptions, so
+    <code>list.forEach(f -&gt; Files.readString(f))</code> won't compile. You must catch inside the
+    lambda and wrap in an unchecked exception (or use a plain <code>for</code> loop). This friction
+    is a big part of why modern Java drifted toward unchecked.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    6. A constructor that throws leaves you with no object — but its resources may leak.
+  </p>
+  <p class="a">
+    If a constructor throws partway, the object is never handed to you and becomes garbage. Anything
+    it already opened is now unreachable and unclosed. Open resources last, or clean up on the way
+    out.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">7. <code>e.printStackTrace()</code> is not logging.</p>
+  <p class="a">
+    It writes to <code>System.err</code>, bypassing your log framework — so it has no timestamp, no
+    level, no correlation id, and in production it's very often routed straight to
+    <code>/dev/null</code>. Use <code>log.error("context", e)</code>.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">10.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: Checked vs unchecked — what's the actual rule?</p>
+  <p class="a">
+    Unchecked = <code>RuntimeException</code> and <code>Error</code> and their subclasses. Checked =
+    everything else under <code>Exception</code>. Checked exceptions must be caught or declared with
+    <code>throws</code>; the compiler enforces it. The intent: checked for recoverable, external
+    problems; unchecked for programming bugs.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Will <code>finally</code> always run?</p>
+  <p class="a">
+    Practically always — including when <code>try</code> returns or throws. It won't run if
+    <code>System.exit()</code> is called, the JVM crashes or is killed, or the thread never leaves
+    the <code>try</code> (infinite loop/deadlock).
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What's the point of try-with-resources over finally?</p>
+  <p class="a">
+    Less code, impossible to forget, closes in reverse order — and crucially it gets
+    <strong>suppressed exceptions</strong> right. If the body and <code>close()</code> both throw,
+    the body's exception propagates and the close exception is attached via
+    <code>getSuppressed()</code>. Hand-written <code>finally</code> loses the original entirely.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: <code>throw</code> vs <code>throws</code>?</p>
+  <p class="a">
+    <code>throw</code> is a statement that raises one exception object now. <code>throws</code> is a
+    signature clause declaring which checked exceptions a method may emit.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Can an overriding method throw a broader checked exception?</p>
+  <p class="a">
+    No. It may throw the same, a subclass, fewer, or none. It may declare any unchecked exceptions
+    freely, since those aren't part of the contract. Widening would break callers holding a
+    supertype reference.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why shouldn't you catch <code>Exception</code> or <code>Throwable</code>?</p>
+  <p class="a">
+    You catch things you never anticipated — including bugs like
+    <code>NullPointerException</code> and, with <code>Throwable</code>,
+    <code>OutOfMemoryError</code> — and then carry on as if fine. Catch the narrowest type you can
+    genuinely handle. The one legitimate exception is a top-level boundary handler that logs and
+    keeps the process alive.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is exception chaining and why does it matter?</p>
+  <p class="a">
+    Passing the original as the cause: <code>new MyException("msg", e)</code>. It preserves the
+    original stack trace under <code>Caused by:</code>, so you keep the real point of failure while
+    presenting a meaningful type to your callers. Without it, wrapping destroys the evidence.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Are exceptions slow?</p>
+  <p class="a">
+    Building one is — <code>fillInStackTrace()</code> walks the stack at construction time. Entering
+    a <code>try</code> that doesn't throw is effectively free. So: fine for exceptional cases,
+    genuinely bad for control flow in a hot loop.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What happens if an exception is thrown inside a <code>catch</code> block?</p>
+  <p class="a">
+    It propagates normally — sibling <code>catch</code> blocks of the same <code>try</code> do
+    <strong>not</strong> get a chance at it. The <code>finally</code> still runs, and if
+    <code>finally</code> throws too, its exception replaces the one from the catch block.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">11.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Hierarchy:</strong> <code>Throwable</code> → <code>Error</code> (don't catch) +
+    <code>Exception</code> → <code>RuntimeException</code> (unchecked) + the rest (checked).
+  </li>
+  <li>
+    <strong>Checked rule:</strong> extends <code>Exception</code> but not
+    <code>RuntimeException</code> → must catch or declare.
+  </li>
+  <li>
+    <strong>Meaning:</strong> checked = the world broke (recoverable) · unchecked = you broke it
+    (fix the code).
+  </li>
+  <li>
+    <strong>Catch order:</strong> most specific first — broad-before-narrow is a compile error.
+  </li>
+  <li>
+    <strong>Multi-catch:</strong> <code>catch (A | B e)</code> — unrelated types only,
+    <code>e</code> is final.
+  </li>
+  <li>
+    <strong>finally:</strong> always runs (except <code>System.exit</code>/crash). Never
+    <code>return</code> or <code>throw</code> from it.
+  </li>
+  <li>
+    <strong>try-with-resources:</strong> needs <code>AutoCloseable</code> · closes in
+    <strong>reverse</strong> order · body's exception wins, close's is <code>getSuppressed()</code>.
+  </li>
+  <li>
+    <strong>throw</strong> = do it now (statement) · <strong>throws</strong> = might happen
+    (signature).
+  </li>
+  <li><strong>Override:</strong> same / narrower / fewer / none — never broader checked.</li>
+  <li><strong>Wrapping:</strong> always chain the cause — <code>new X("msg", e)</code>.</li>
+  <li>
+    <strong>Built-ins:</strong> <code>IllegalArgumentException</code> (bad input) ·
+    <code>IllegalStateException</code> (bad timing) ·
+    <code>UnsupportedOperationException</code> (not allowed) ·
+    <code>Objects.requireNonNull</code> (null checks).
+  </li>
+  <li>
+    <strong>Never:</strong> swallow · <code>printStackTrace()</code> · log-and-rethrow at every
+    layer · exceptions as control flow.
+  </li>
+  <li>
+    <strong>Reading a trace:</strong> bottom-most <code>Caused by</code> first, then the top frame
+    in your own package.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

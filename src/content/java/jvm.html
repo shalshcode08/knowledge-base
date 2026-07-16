@@ -1,0 +1,1182 @@
+<h1>JVM Internals — Complete Notes</h1>
+<p class="subtitle">
+  Heap vs stack, class loading, garbage collection, and the errors that wake you at 3am — enough to
+  debug a real production problem and answer "why is your service using 4GB?" with something better
+  than a shrug.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> What the JVM actually is</h2>
+<p class="lead">
+  The <em class="term">Java Virtual Machine</em> is a program that pretends to be a computer. Your
+  code is compiled for <strong>that imaginary machine</strong>, not for yours — and the JVM
+  translates, on the fly, to whatever real CPU it's standing on.
+</p>
+
+<figure class="code">
+  <figcaption><b>The journey from source to CPU</b></figcaption>
+  <pre><code>Hello.java          your source
+    |  javac                        &lt;- compiles ONCE, at build time
+    v
+Hello.class         BYTECODE — platform-independent instructions for the imaginary machine
+    |  java Hello
+    v
+   JVM              loads it, verifies it, runs it
+    |  interpreter (immediately)  +  JIT compiler (for the hot parts)
+    v
+machine code        actual x86 / ARM instructions for THIS CPU</code></pre>
+</figure>
+
+<div class="key">
+  <strong>"Write once, run anywhere" — this is the mechanism</strong>
+  <p>
+    <code>javac</code> does <strong>not</strong> produce machine code. It produces bytecode, which
+    is identical on every platform. The <strong>JVM</strong> is the part that's platform-specific —
+    there's a different JVM binary for Linux/x86, macOS/ARM, and so on. Your
+    <code>.class</code> file doesn't change; the thing interpreting it does.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Bytecode is real and readable — go look at it</b></figcaption>
+  <pre><code>// Source:
+int add(int a, int b) { return a + b; }
+
+// javap -c Hello.class  -&gt;
+//   0: iload_1        // push local var 1 (a) onto the operand stack
+//   1: iload_2        // push local var 2 (b)
+//   2: iadd           // pop both, add, push result
+//   3: ireturn        // pop and return it
+
+// Note there are no registers — the JVM is a STACK machine. Everything is
+// push/pop on an operand stack. That's what makes it portable.</code></pre>
+</figure>
+
+<div class="analogy">
+  <p>
+    Bytecode is a <strong>recipe written in metric units</strong>. It doesn't matter whether the
+    kitchen is American or British — each kitchen has its own converter (the JVM) that turns "200ml"
+    into whatever its local measuring cups understand. One recipe, every kitchen.
+  </p>
+</div>
+
+<h2 id="architecture"><span class="num">01.</span> The JVM's three parts</h2>
+<p class="lead">
+  Every JVM is the same three subsystems: something that <strong>loads</strong> classes, somewhere
+  to <strong>put data</strong>, and something that <strong>executes</strong>.
+</p>
+
+<figure class="code">
+  <figcaption><b>The whole machine on one screen</b></figcaption>
+  <pre><code>+---------------------------------------------------------------+
+|                    1. CLASS LOADER SUBSYSTEM                  |
+|      Loading  -&gt;  Linking (Verify/Prepare/Resolve)  -&gt;  Init  |
++---------------------------------------------------------------+
+                              |
+                              v
++---------------------------------------------------------------+
+|                    2. RUNTIME DATA AREAS                      |
+|                                                               |
+|   SHARED BY ALL THREADS        |    PER-THREAD                |
+|  +-------------------------+   |   +----------------------+   |
+|  |         HEAP            |   |   |    JVM Stack         |   |
+|  |  Young  |     Old       |   |   |  (frames: locals +   |   |
+|  | E S0 S1 |               |   |   |   operand stack)     |   |
+|  +-------------------------+   |   +----------------------+   |
+|  +-------------------------+   |   +----------------------+   |
+|  |  Metaspace (native mem) |   |   |   PC Register        |   |
+|  |  class metadata         |   |   +----------------------+   |
+|  +-------------------------+   |   +----------------------+   |
+|  +-------------------------+   |   |  Native Method Stack |   |
+|  |  Code Cache (JIT output)|   |   +----------------------+   |
+|  +-------------------------+   |                              |
++---------------------------------------------------------------+
+                              |
+                              v
++---------------------------------------------------------------+
+|                    3. EXECUTION ENGINE                        |
+|      Interpreter   |   JIT Compiler (C1/C2)   |   GC          |
++---------------------------------------------------------------+
+                              |
+                    JNI  -&gt;  Native libraries</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The line that matters most</strong>
+  <p>
+    <strong>Shared</strong> (heap, metaspace, code cache) is where threads can collide — everything
+    in the <a href="concurrency.html">Concurrency</a> notes exists because of this box.
+    <strong>Per-thread</strong> (stack, PC register) is private by construction, which is why local
+    variables are automatically thread-safe.
+  </p>
+</div>
+
+<h2 id="classloading"><span class="num">02.</span> Class loading</h2>
+<p class="lead">
+  Classes aren't loaded when the program starts. Each one is loaded <strong>lazily</strong>, the
+  first time it's genuinely needed, and goes through three phases before it can be used.
+</p>
+
+<figure class="code">
+  <figcaption><b>Loading → Linking → Initialization</b></figcaption>
+  <pre><code>1. LOADING
+     Find Foo.class (disk / jar / network), read the bytes,
+     create a java.lang.Class object representing it. Metadata -&gt; Metaspace.
+
+2. LINKING
+     a. VERIFICATION   — is this bytecode legal and safe? (no stack overflows, valid types,
+                          no jumping into the middle of an instruction). This is why the JVM
+                          can safely run untrusted bytecode. Also why it rejects a corrupt .class.
+     b. PREPARATION    — allocate static fields and set them to DEFAULT values.
+                          static int x = 5;  -&gt;  x becomes 0 here. NOT 5. Not yet.
+     c. RESOLUTION     — turn symbolic references ("the class named com.Foo") into direct
+                          references (a pointer). May be lazy — often deferred to first use.
+
+3. INITIALIZATION
+     Run the static initialisers and static field assignments, in source order —
+     the compiler bundles them into a method called &lt;clinit&gt;.
+     NOW  static int x = 5;  actually assigns 5.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Preparation vs Initialization — the classic gotcha</strong>
+  <p>
+    <code>static int x = 5;</code> happens <strong>twice</strong>. During
+    <strong>preparation</strong> <code>x</code> is set to its default <code>0</code>. Only during
+    <strong>initialization</strong> is <code>5</code> assigned. That gap is what lets circular
+    static initialisation read a <code>0</code> or a <code>null</code> that "can't possibly" be
+    there.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Initialization is lazy — and precisely specified</b></figcaption>
+  <pre><code>class Holder {
+    static { System.out.println("Holder initialised"); }
+    static int VALUE = 42;
+    static final int CONSTANT = 99;         // compile-time constant!
+}
+
+// TRIGGERS initialization:
+new Holder();                  // instantiating
+Holder.VALUE;                  // reading a non-final static
+Holder.someStaticMethod();     // calling a static method
+Class.forName("Holder");       // reflection (by default)
+
+// Does NOT trigger it:
+Holder[] arr = new Holder[10];  // creating an array of them
+Holder.CONSTANT;                // static final with a constant initialiser is INLINED by javac
+                                // at compile time — the class is never even loaded!
+Sub.inheritedStaticField;       // only the DECLARING class is initialised, not the subclass</code></pre>
+</figure>
+
+<h3>The three loaders and parent delegation</h3>
+<figure class="code">
+  <figcaption><b>The hierarchy</b></figcaption>
+  <pre><code>Bootstrap ClassLoader        (written in C++, shows as `null` from Java)
+    |                        loads the core JDK: java.lang.*, java.util.*  (java.base module)
+    v
+Platform ClassLoader         (called "Extension" before Java 9)
+    |                        loads JDK modules that aren't core
+    v
+Application ClassLoader      loads YOUR classes from the classpath / modulepath
+    |
+    v
+(your own custom loaders — Tomcat, Spring Boot, OSGi, plugin systems)</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Parent delegation — always ask upward first</b></figcaption>
+  <pre><code>// When asked to load "com.example.Foo", a loader:
+//   1. Have I already loaded it? -&gt; return the cached Class
+//   2. Ask my PARENT to load it  -&gt; recursion, all the way to Bootstrap
+//   3. Only if every ancestor failed do I try to load it myself
+
+System.out.println(String.class.getClassLoader());        // null  -&gt; Bootstrap
+System.out.println(MyClass.class.getClassLoader());       // jdk...AppClassLoader</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why delegate upward? Security.</strong>
+  <p>
+    Write your own <code>java.lang.String</code> and put it on the classpath. Delegation means the
+    request reaches <strong>Bootstrap first</strong>, which finds the real one and returns it — your
+    impostor is never loaded. Without delegation, any jar could replace core classes and own your
+    process. It also guarantees core classes are loaded <strong>exactly once</strong>.
+  </p>
+</div>
+
+<div class="note">
+  <strong>A class's identity = its name AND its loader</strong>
+  <p>
+    The same <code>Foo.class</code> file loaded by two different loaders produces
+    <strong>two distinct types</strong>. They are not assignment-compatible, and casting between
+    them throws <code>ClassCastException: Foo cannot be cast to Foo</code> — one of the most
+    confusing messages in Java. This is exactly how an app server isolates two deployed apps that
+    each ship a different version of the same library.
+  </p>
+</div>
+
+<h2 id="memory"><span class="num">03.</span> Runtime memory areas</h2>
+<p class="lead">
+  Five regions. Two of them (heap, metaspace) are shared and are where your memory problems live;
+  three are per-thread.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Shared?</th>
+        <th>Holds</th>
+        <th>Error when full</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Heap</strong></td>
+        <td>Shared</td>
+        <td>All objects &amp; arrays, the String pool</td>
+        <td><code>OutOfMemoryError: Java heap space</code></td>
+      </tr>
+      <tr>
+        <td><strong>Metaspace</strong></td>
+        <td>Shared</td>
+        <td>Class metadata, method bytecode, static fields</td>
+        <td><code>OutOfMemoryError: Metaspace</code></td>
+      </tr>
+      <tr>
+        <td><strong>Code cache</strong></td>
+        <td>Shared</td>
+        <td>JIT-compiled native code</td>
+        <td>Falls back to the interpreter (much slower)</td>
+      </tr>
+      <tr>
+        <td><strong>JVM stack</strong></td>
+        <td>Per thread</td>
+        <td>Frames: locals, operand stack, return address</td>
+        <td><code>StackOverflowError</code></td>
+      </tr>
+      <tr>
+        <td><strong>PC register</strong></td>
+        <td>Per thread</td>
+        <td>Address of the current instruction</td>
+        <td>—</td>
+      </tr>
+      <tr>
+        <td><strong>Native stack</strong></td>
+        <td>Per thread</td>
+        <td>Frames for JNI/native calls</td>
+        <td><code>StackOverflowError</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Metaspace — and the PermGen it replaced</h3>
+<div class="note">
+  <strong>Java 8 deleted PermGen</strong>
+  <p>
+    Before Java 8, class metadata lived in <strong>PermGen</strong>, a fixed-size region
+    <em>inside</em> the heap. It was a constant source of
+    <code>OutOfMemoryError: PermGen space</code> — every app server redeploy leaked classloaders
+    until it filled up. Java 8 moved metadata to <strong>Metaspace</strong>, which lives in
+    <strong>native memory</strong> and grows automatically. That's why the error you see today is
+    <code>Metaspace</code>, not <code>PermGen</code> — and why the fix is usually "stop leaking
+    classloaders", not "raise the limit".
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Metaspace is unbounded by default</strong>
+  <p>
+    It grows until it exhausts <strong>system RAM</strong>. That's usually the right default, but a
+    classloader leak will now eat the whole machine instead of failing fast. Setting
+    <code>-XX:MaxMetaspaceSize=256m</code> turns a slow server death into a clear, early error.
+  </p>
+</div>
+
+<h2 id="heap-stack"><span class="num">04.</span> Heap vs stack — the interview classic</h2>
+<p class="lead">
+  The <strong>stack</strong> holds the bookkeeping of method calls. The <strong>heap</strong> holds
+  the objects. The single sentence:
+  <strong>references live on the stack, objects live on the heap.</strong>
+</p>
+
+<figure class="code">
+  <figcaption><b>Watch where each piece goes</b></figcaption>
+  <pre><code>void method() {
+    int x = 5;                          // the VALUE 5 -&gt; stack (primitive local)
+    String s = "hello";                 // the REFERENCE -&gt; stack; the String object -&gt; heap (pool)
+    Person p = new Person("Ann");       // the REFERENCE p -&gt; stack; the Person OBJECT -&gt; heap
+    int[] a = new int[1000];            // reference -&gt; stack; the 1000-int array -&gt; heap
+}
+// When method() returns, its whole frame is popped:
+//   x, s, p, a all vanish instantly — no GC involved.
+//   The Person and int[] on the heap are now unreachable, and become GC's problem.</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Stack</th>
+        <th>Heap</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Stores</td>
+        <td>Primitives &amp; references (locals), frames</td>
+        <td>Objects, arrays, instance fields</td>
+      </tr>
+      <tr>
+        <td>Scope</td>
+        <td>One thread — private</td>
+        <td>All threads — shared</td>
+      </tr>
+      <tr>
+        <td>Lifetime</td>
+        <td>Exactly the method call</td>
+        <td>Until unreachable, then GC'd</td>
+      </tr>
+      <tr>
+        <td>Managed by</td>
+        <td>Automatic push/pop — free</td>
+        <td>The garbage collector</td>
+      </tr>
+      <tr>
+        <td>Speed</td>
+        <td>Very fast (just move a pointer)</td>
+        <td>Slower (allocate, then collect later)</td>
+      </tr>
+      <tr>
+        <td>Size</td>
+        <td>Small (<code>-Xss</code>, ~512KB–1MB)</td>
+        <td>Large (<code>-Xmx</code>, GBs)</td>
+      </tr>
+      <tr>
+        <td>Runs out →</td>
+        <td><code>StackOverflowError</code></td>
+        <td><code>OutOfMemoryError</code></td>
+      </tr>
+      <tr>
+        <td>Thread-safe?</td>
+        <td><span class="yes">Inherently</span></td>
+        <td><span class="no">No</span> — you must synchronise</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>A stack frame — what one method call costs</b></figcaption>
+  <pre><code>main() calls a(), which calls b():
+
+        |  b()'s frame   |  &lt;- top: local variable array, operand stack, return address
+        |  a()'s frame   |
+        |  main()'s frame|
+        +----------------+
+// Each call PUSHES a frame; each return POPS it.
+// Infinite recursion = push forever = StackOverflowError.
+// This stack of frames is EXACTLY what gets printed as a stack trace.</code></pre>
+</figure>
+
+<div class="analogy">
+  <p>
+    The <strong>stack</strong> is a spring-loaded plate dispenser: plates only go on and off the
+    top, in strict order, and it's instant. The <strong>heap</strong> is a warehouse: things get put
+    anywhere there's room, anyone with the address can reach them, and someone has to come round
+    periodically and clear out what nobody references anymore.
+  </p>
+</div>
+
+<div class="note">
+  <strong>The nuance: escape analysis</strong>
+  <p>
+    "Objects always live on the heap" is the right interview answer, but the JIT can prove that an
+    object <strong>never escapes</strong> its method and then <strong>scalar-replace</strong> it —
+    exploding it into plain locals on the stack, with no allocation and nothing for GC to collect.
+    So the <em>specification</em> says heap; the <em>implementation</em> often quietly does better.
+  </p>
+</div>
+
+<h2 id="gc"><span class="num">05.</span> Garbage collection</h2>
+<p class="lead">
+  The GC finds objects nobody can reach anymore and reclaims their memory. It is not reference
+  counting, and it does not care whether a variable "went out of scope" —
+  <strong>the only question is reachability</strong>.
+</p>
+
+<h3>GC roots and reachability</h3>
+<figure class="code">
+  <figcaption><b>An object is alive if a root can reach it. That's the entire rule.</b></figcaption>
+  <pre><code>GC ROOTS (the starting points, definitionally alive):
+  - local variables &amp; parameters in every live thread's stack frames
+  - static fields of loaded classes
+  - active threads themselves
+  - JNI references from native code
+  - objects used as monitors (locked)
+
+Then: mark everything reachable from a root, transitively.
+      Everything NOT marked is garbage — no matter how many references
+      those garbage objects hold to EACH OTHER.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why Java has no reference-counting leak</strong>
+  <p>
+    Two objects pointing at each other, with nothing else pointing at them, are
+    <strong>both garbage</strong> — because no root reaches them. A reference-counting system (like
+    old Python or C++ <code>shared_ptr</code>) would see counts of 1 each and leak them forever.
+    Tracing from roots makes cycles a non-issue.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Cycles are collected fine</b></figcaption>
+  <pre><code>class Node { Node other; }
+
+void f() {
+    Node a = new Node();
+    Node b = new Node();
+    a.other = b;
+    b.other = a;      // circular reference
+}
+// After f() returns: a and b are gone from the stack. Nothing reaches either node.
+// BOTH are collected. The cycle is irrelevant.</code></pre>
+</figure>
+
+<h3>The generational hypothesis</h3>
+<div class="key">
+  <strong>The observation the whole heap layout is built on</strong>
+  <p>
+    <strong>Most objects die young.</strong> Empirically, the overwhelming majority of objects
+    become garbage almost immediately (loop temporaries, string builders, DTOs). A small minority
+    survive and then tend to live a very long time. So: don't scan the whole heap every time. Scan
+    the <strong>young</strong> part often and cheaply; scan the old part rarely.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The heap layout that follows from it</b></figcaption>
+  <pre><code>+---------------------------------------------------+----------------------+
+|                  YOUNG GENERATION                 |    OLD GENERATION    |
+|                                                   |      (Tenured)       |
+|  +-------------------+  +--------+  +--------+    |                      |
+|  |       Eden        |  |   S0   |  |   S1   |    |  long-lived objects  |
+|  |  new objects here |  |survivor|  |survivor|    |                      |
+|  +-------------------+  +--------+  +--------+    |                      |
++---------------------------------------------------+----------------------+
+        ~80%                 ~10%       ~10%              usually ~2/3 of heap
+
+Minor GC (frequent, fast)  ------^                   Major/Full GC (rare, slow) --^</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>An object's life story</b></figcaption>
+  <pre><code>1. `new Foo()`            -&gt; allocated in EDEN (just bump a pointer — allocation is nearly free)
+
+2. Eden fills up         -&gt; MINOR GC ("young collection"):
+                              - mark live objects in Eden + the in-use survivor space
+                              - COPY the survivors to the OTHER survivor space, age += 1
+                              - wipe Eden and the old survivor space ENTIRELY — instantly
+                              - S0 and S1 swap roles
+
+   Key insight: cost is proportional to how many objects SURVIVE, not how many died.
+   If 99% of Eden is garbage, a minor GC is almost free. Dead objects cost nothing.
+
+3. Survives ~15 minor GCs (-XX:MaxTenuringThreshold) -&gt; PROMOTED to the Old generation
+
+4. Old generation fills   -&gt; MAJOR / FULL GC: expensive, may pause everything
+
+Also: an object too big for Eden is allocated straight into Old ("humongous" in G1).</code></pre>
+</figure>
+
+<div class="analogy">
+  <p>
+    Eden is the <strong>arrivals hall</strong> — everyone lands there. Most leave within minutes.
+    Periodically security sweeps the hall and moves the few people still around into a
+    <strong>waiting lounge</strong> (survivor space), stamping their pass each time. Get stamped
+    fifteen times and you clearly live here — you're moved to the
+    <strong>residential district</strong> (old gen), which is only swept on rare occasions.
+  </p>
+</div>
+
+<h3>Mark-Sweep-Compact</h3>
+<figure class="code">
+  <figcaption><b>The three phases</b></figcaption>
+  <pre><code>1. MARK     — walk from the GC roots, flag everything reachable.
+              Cost is proportional to LIVE data.
+
+2. SWEEP    — reclaim everything unmarked.
+              Fast, but leaves the heap full of holes -&gt; FRAGMENTATION.
+              You can then have 500MB free and still fail to allocate a 1MB array.
+
+3. COMPACT  — slide the survivors together so free space is one contiguous block.
+              Expensive (objects move, so every reference must be updated),
+              but makes the next allocation a simple pointer bump.
+
+The young generation instead uses COPYING: survivors are copied out and the whole
+region is wiped. Compaction is a free side effect — which is why minor GCs are so cheap.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Stop-the-world</strong>
+  <p>
+    To move objects safely, the GC must <strong>freeze every application thread</strong> — otherwise
+    a thread could use a reference the GC is busy relocating. This is a
+    <em class="term">stop-the-world pause</em>. Every GC has them; modern collectors work to make
+    them short and predictable rather than to eliminate them. A "GC pause" in your latency graph is
+    this.
+  </p>
+</div>
+
+<h2 id="gc-algos"><span class="num">06.</span> The collectors</h2>
+<p class="lead">
+  Every collector trades between <strong>throughput</strong> (total work done),
+  <strong>latency</strong> (longest pause), and <strong>footprint</strong> (memory used). You cannot
+  win all three; you pick two.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Collector</th>
+        <th>Flag</th>
+        <th>Optimised for</th>
+        <th>Use when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Serial</strong></td>
+        <td><code>-XX:+UseSerialGC</code></td>
+        <td>Tiny footprint</td>
+        <td>Small heaps, containers, single core, CLI tools</td>
+      </tr>
+      <tr>
+        <td><strong>Parallel</strong></td>
+        <td><code>-XX:+UseParallelGC</code></td>
+        <td>Throughput</td>
+        <td>Batch jobs where a 2s pause is fine (default in Java 8)</td>
+      </tr>
+      <tr>
+        <td><strong>G1</strong></td>
+        <td><code>-XX:+UseG1GC</code></td>
+        <td>Balance</td>
+        <td><strong>The default since Java 9.</strong> Almost always right.</td>
+      </tr>
+      <tr>
+        <td><strong>ZGC</strong></td>
+        <td><code>-XX:+UseZGC</code></td>
+        <td>Latency</td>
+        <td>Huge heaps, sub-millisecond pauses required</td>
+      </tr>
+      <tr>
+        <td><strong>Shenandoah</strong></td>
+        <td><code>-XX:+UseShenandoahGC</code></td>
+        <td>Latency</td>
+        <td>Same goal as ZGC, different design</td>
+      </tr>
+      <tr>
+        <td><strong>Epsilon</strong></td>
+        <td><code>-XX:+UseEpsilonGC</code></td>
+        <td>Nothing — never collects</td>
+        <td>Benchmarking &amp; testing only. It will OOM. Deliberately.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>G1 — the one you're actually running</h3>
+<figure class="code">
+  <figcaption>
+    <b>G1 divides the heap into equal regions instead of fixed generations</b>
+  </figcaption>
+  <pre><code>+---+---+---+---+---+---+---+---+
+| E | O | S | E | O | O | H | E |    ~2048 regions, each 1-32MB
++---+---+---+---+---+---+---+---+
+| O | E | O | S | E | O | E | O |    E=Eden  S=Survivor  O=Old  H=Humongous
++---+---+---+---+---+---+---+---+
+
+// A region's ROLE is dynamic — young and old are just labels, not fixed address ranges.
+// G1 tracks how much garbage each region holds, then collects the FULLEST-OF-GARBAGE
+// regions first. Hence "Garbage First".
+//
+// Crucially, it collects only AS MANY regions as fit in your pause budget:
+-XX:MaxGCPauseMillis=200          // "keep pauses under 200ms" — a goal, not a guarantee</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why G1 is the default</strong>
+  <p>
+    You give it a <strong>pause target</strong> instead of tuning generation sizes by hand. It
+    collects a partial, budget-sized set of regions each cycle, compacts as it goes (so no
+    fragmentation), and degrades gracefully. It gives up some raw throughput versus Parallel GC in
+    exchange for predictable pauses — the right trade for almost every service.
+  </p>
+</div>
+
+<div class="note">
+  <strong>CMS is gone</strong>
+  <p>
+    The Concurrent Mark Sweep collector was the low-pause option for years. It never compacted, so
+    it fragmented until it hit a "concurrent mode failure" and fell back to a
+    <strong>single-threaded full GC</strong> — a multi-second pause at the worst possible moment. It
+    was deprecated in Java 9 and <strong>removed in Java 14</strong>. If you see
+    <code>-XX:+UseConcMarkSweepGC</code> in a config, that config predates 2020.
+  </p>
+</div>
+
+<div class="note">
+  <strong>ZGC's trick</strong>
+  <p>
+    ZGC does nearly all its work <strong>concurrently</strong> with your application, using
+    <em>coloured pointers</em> and <em>load barriers</em> — metadata is stored in unused bits of
+    each pointer, so a thread reading a reference to a relocating object transparently fixes it up
+    on the fly. Pauses are sub-millisecond and, remarkably,
+    <strong>independent of heap size</strong> — 8GB or 8TB, same pause. The cost is throughput and
+    memory overhead.
+  </p>
+</div>
+
+<h2 id="errors"><span class="num">07.</span> OutOfMemoryError vs StackOverflowError</h2>
+<p class="lead">
+  Both are <code>Error</code>s, not exceptions — meaning <strong>do not catch them</strong>. They
+  tell you the JVM has run out of a resource you can't conjure from a catch block.
+</p>
+
+<h3>StackOverflowError — one thread's stack is full</h3>
+<figure class="code">
+  <figcaption><b>Almost always recursion</b></figcaption>
+  <pre><code>void recurse() { recurse(); }      // no base case -&gt; frames pile up -&gt; boom
+recurse();
+// Exception in thread "main" java.lang.StackOverflowError
+//     at Main.recurse(Main.java:3)
+//     at Main.recurse(Main.java:3)
+//     ... the same line, thousands of times
+
+// Real-world causes:
+//  - a missing/incorrect recursion base case
+//  - accidental mutual recursion: a() -&gt; b() -&gt; a()
+//  - toString() calling itself:  return "Foo" + this;   // implicit this.toString()
+//  - equals()/hashCode() recursing through a cyclic object graph
+//  - a genuinely too-deep (but correct) recursion on a deep tree</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>The fix is a bigger algorithm, not a bigger stack</b></figcaption>
+  <pre><code>// -Xss2m   raises the per-thread stack size.
+// This is a legitimate fix ONLY when the recursion is correct and genuinely deep.
+// For a bug, raising it just means the crash takes slightly longer.
+//
+// Note: Java has NO tail-call optimisation. A tail-recursive method still
+// pushes a frame per call. Deep recursion must be rewritten as a loop
+// with an explicit ArrayDeque as your stack.</code></pre>
+</figure>
+
+<h3>OutOfMemoryError — the heap (or another region) is full</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Message</th>
+        <th>Means</th>
+        <th>Usual cause</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Java heap space</code></td>
+        <td>Can't allocate; GC can't free enough</td>
+        <td>A leak, or <code>-Xmx</code> genuinely too small</td>
+      </tr>
+      <tr>
+        <td><code>GC overhead limit exceeded</code></td>
+        <td>&gt;98% of time in GC, &lt;2% heap recovered</td>
+        <td>Same as above, caught earlier</td>
+      </tr>
+      <tr>
+        <td><code>Metaspace</code></td>
+        <td>Too much class metadata</td>
+        <td>Classloader leak, or runtime class generation</td>
+      </tr>
+      <tr>
+        <td><code>unable to create new native thread</code></td>
+        <td>OS refused a thread</td>
+        <td>Thread leak — <strong>not</strong> a heap problem; <code>-Xmx</code> won't help</td>
+      </tr>
+      <tr>
+        <td><code>Requested array size exceeds VM limit</code></td>
+        <td>Array bigger than <code>Integer.MAX_VALUE</code>-ish</td>
+        <td>A bug in a size calculation</td>
+      </tr>
+      <tr>
+        <td><code>Direct buffer memory</code></td>
+        <td>Off-heap NIO buffers exhausted</td>
+        <td>Netty/NIO leak — again, outside <code>-Xmx</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>An OOM is a leak until proven otherwise</strong>
+  <p>
+    The instinct is to raise <code>-Xmx</code>. That only buys time if the cause is a
+    <strong>leak</strong> — you'll simply OOM later, with a bigger heap dump and a longer full GC on
+    the way down. First take a heap dump and find <em>what is holding the memory</em>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>A real memory leak — the static collection</b></figcaption>
+  <pre><code>class Cache {
+    private static final Map&lt;String, byte[]&gt; CACHE = new HashMap&lt;&gt;();   // static = a GC ROOT
+
+    public static void put(String k, byte[] v) {
+        CACHE.put(k, v);     // nothing is ever removed. This map is reachable forever.
+    }
+}
+// Every entry is permanently reachable from a root, so GC can never touch it.
+// Java "can't leak" only in the C sense — you can absolutely retain objects forever.
+
+// Fixes: an eviction policy (Caffeine, Guava), a bounded LinkedHashMap with
+// removeEldestEntry, or WeakHashMap if the key's lifetime should drive it.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>The other classic leaks</b></figcaption>
+  <pre><code>// 1. Listeners you register and never remove
+button.addListener(this);      // the button now holds `this` forever
+
+// 2. ThreadLocal in a thread pool — the thread never dies, so the value never clears
+private static final ThreadLocal&lt;BigThing&gt; TL = new ThreadLocal&lt;&gt;();
+TL.set(big);                   // must TL.remove() in a finally!
+
+// 3. Unclosed resources holding native memory
+// 4. A HashMap key whose hashCode changes after insertion -&gt; the entry is
+//    unreachable by lookup but still strongly referenced by the map</code></pre>
+</figure>
+
+<h2 id="jit"><span class="num">08.</span> The JIT compiler</h2>
+<p class="lead">
+  The JVM starts by <strong>interpreting</strong> bytecode — slow, but instant to start. Meanwhile
+  it watches which methods run often, and compiles those to native code. This is why Java is slow
+  for the first few seconds and fast afterwards.
+</p>
+
+<figure class="code">
+  <figcaption><b>Tiered compilation — the escalator</b></figcaption>
+  <pre><code>Level 0: INTERPRETER   — execute bytecode directly. Starts instantly, ~20x slower.
+                         Counts invocations and loop iterations as it goes.
+   |  called often enough
+   v
+Level 1-3: C1 (client)  — compile fast, optimise lightly. Good code in milliseconds.
+                          Also inserts PROFILING counters (which branches? which types?).
+   |  still hot (~10,000 invocations)
+   v
+Level 4: C2 (server)    — compile slowly, optimise aggressively, USING that profile data.
+                          This is the code that runs at "Java speed" — often at or near C.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why a JIT can beat an ahead-of-time compiler</strong>
+  <p>
+    <code>gcc</code> must produce code that works for <strong>every</strong> possible input,
+    forever. The JIT knows what <em>actually happened</em> in this run: this call site only ever saw
+    <code>ArrayList</code>, this branch is never taken, this method is always tiny. So it optimises
+    for reality and keeps a <strong>guard</strong> in case reality changes. That's information a
+    static compiler can never have.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>What C2 actually does</b></figcaption>
+  <pre><code>// INLINING — the most valuable optimisation, because it enables all the others
+int getX() { return x; }
+int sum = getX() + getX();      // becomes: int sum = x + x;  — the calls vanish entirely
+
+// MONOMORPHIC DISPATCH — profile says this call site only ever saw ArrayList,
+// so devirtualise the interface call into a direct one (with a type guard).
+for (Object o : list) { ... }
+
+// ESCAPE ANALYSIS + SCALAR REPLACEMENT — this object never leaves the method,
+// so don't allocate it at all; keep its fields in registers.
+Point p = new Point(1, 2);
+return p.x + p.y;               // becomes: return 1 + 2;  -&gt; return 3;  and nothing is allocated
+
+// Plus: dead code elimination, loop unrolling, constant folding,
+// lock elision (removing locks on provably thread-confined objects)</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Deoptimization</strong>
+  <p>
+    Every speculative optimisation has a guard. If a call site that only ever saw
+    <code>ArrayList</code> suddenly gets a <code>LinkedList</code>, the guard fails and the JVM
+    <strong>deoptimizes</strong>: throws the compiled code away, falls back to the interpreter, and
+    later recompiles with the new reality. This is also why Java microbenchmarks are so treacherous
+    — and why you use <strong>JMH</strong>, which handles warmup and defeats dead-code elimination
+    for you.
+  </p>
+</div>
+
+<h2 id="tuning"><span class="num">09.</span> Flags &amp; debugging a real problem</h2>
+<p class="lead">
+  You will not tune GC by intuition. You take a measurement, form a hypothesis, and change one
+  thing.
+</p>
+
+<figure class="code">
+  <figcaption><b>The flags worth knowing</b></figcaption>
+  <pre><code># --- sizing ---
+-Xms2g                      # initial heap. Set it EQUAL to -Xmx in production:
+-Xmx2g                      #   avoids pause-inducing resizes and pre-commits the memory
+-Xss1m                      # per-thread stack size
+-XX:MaxMetaspaceSize=256m   # cap metaspace so a classloader leak fails fast
+
+# --- collector ---
+-XX:+UseG1GC                # default since 9
+-XX:MaxGCPauseMillis=200    # G1's pause goal
+
+# --- diagnostics: ALWAYS set these in production ---
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/app/heap.hprof
+-Xlog:gc*:file=/var/log/app/gc.log:time,uptime:filecount=5,filesize=10M   # Java 9+ unified logging
+
+# --- containers (Java 10+, on by default) ---
+-XX:MaxRAMPercentage=75.0   # use 75% of the CONTAINER limit, not the host's RAM
+                            # Use this instead of -Xmx in Kubernetes.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>The container trap</strong>
+  <p>
+    An old JVM (pre-8u191) reads the <strong>host's</strong> RAM, not the cgroup limit. Give it a
+    512MB container on a 64GB node and it sizes its heap for 64GB — then the kernel OOM-kills the
+    pod with exit code 137, and there's no Java stack trace because the JVM never knew. Modern JVMs
+    are container-aware by default; use <code>-XX:MaxRAMPercentage</code> rather than a hardcoded
+    <code>-Xmx</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The toolbox</b></figcaption>
+  <pre><code>jps                          # list running JVMs and their pids
+jstat -gc &lt;pid&gt; 1s           # live GC stats every second — is it collecting constantly?
+jstack &lt;pid&gt;                 # thread dump — hangs, deadlocks (it detects them for you)
+jmap -histo &lt;pid&gt;            # object histogram: what's on the heap, by count and bytes
+jmap -dump:live,format=b,file=heap.hprof &lt;pid&gt;    # full heap dump
+jcmd &lt;pid&gt; VM.native_memory  # off-heap usage (needs -XX:NativeMemoryTracking=summary)
+jcmd &lt;pid&gt; GC.heap_info
+
+# Then open heap.hprof in Eclipse MAT: "Leak Suspects" report usually names the culprit outright.
+# For CPU/allocation profiling: Java Flight Recorder (JFR) — near-zero overhead, ships with the JDK
+jcmd &lt;pid&gt; JFR.start duration=60s filename=rec.jfr</code></pre>
+</figure>
+
+<h3>"Why is your service using 4GB?"</h3>
+<div class="key">
+  <strong>The answer that gets you hired</strong>
+  <p>
+    <strong>1.</strong> Because RSS ≠ heap. Total = heap + metaspace + code cache + thread stacks
+    (1MB × threads!) + direct/NIO buffers + GC structures + the JVM itself.
+    <strong>2.</strong> Because a JVM <strong>doesn't return memory it isn't asked to</strong> —
+    with <code>-Xms4g</code> it will hold 4GB whether it needs it or not. <strong>3.</strong> Then
+    check <em>whether it's a leak</em>: watch <strong>post-full-GC live-set</strong> over time
+    (<code>jstat</code>). Flat sawtooth = healthy, just garbage. A rising floor after every full GC
+    = a real leak → take a heap dump and open MAT.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Reading the sawtooth</b></figcaption>
+  <pre><code>HEALTHY — used memory drops back to the same floor every collection:
+  used |    /|    /|    /|    /|
+       |   / |   / |   / |   / |
+       |__/__|__/__|__/__|__/__|____
+       floor stays flat -&gt; the live set is constant. This is just normal garbage.
+
+LEAKING — the floor climbs after every full GC:
+  used |      /|     /|    /|   /|
+       |    _/ |   _/ |  _/ | _/ |
+       |  _/   | _/   |_/   |/   |
+       |_/_____|/_____|_____|____|__
+       floor rising -&gt; something is retained forever -&gt; OOM is coming. Heap dump now.</code></pre>
+</figure>
+
+<h2 id="gotchas"><span class="num">10.</span> Gotchas — where the JVM surprises you</h2>
+
+<div class="qa">
+  <p class="q">1. <code>System.gc()</code> is a suggestion, and using it is almost always wrong.</p>
+  <p class="a">
+    It <em>requests</em> a full GC. The JVM may ignore it entirely (<code
+      >-XX:+DisableExplicitGC</code
+    >
+    makes it a no-op). When it doesn't ignore it, you've forced an expensive stop-the-world pause
+    the collector had deliberately avoided. You cannot out-think G1 from application code.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. <code>finalize()</code> is deprecated, unpredictable, and dangerous.</p>
+  <p class="a">
+    It may run late, or <strong>never</strong>. It runs on an unbounded queue served by one thread,
+    so it can leak; it can resurrect the object; and an exception inside it is swallowed. Deprecated
+    since Java 9. Use try-with-resources, or <code>java.lang.ref.Cleaner</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. Java absolutely can leak memory.</p>
+  <p class="a">
+    "No manual free" ≠ "no leaks". Any object reachable from a GC root lives forever — a static
+    collection that only grows, an unremoved listener, a <code>ThreadLocal</code> on a pool thread.
+    GC frees the <em>unreachable</em>; it can't know you <em>meant</em> to forget something.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. A memory leak and a heap that's simply too small look identical.</p>
+  <p class="a">
+    Both end in <code>OutOfMemoryError: Java heap space</code>. The distinguishing evidence is the
+    <strong>live set after a full GC</strong>: constant → you just need a bigger heap; rising → a
+    leak, and a bigger heap only delays it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. <code>static final int</code> constants are inlined at compile time.</p>
+  <p class="a">
+    <code>static final int X = 5;</code> is copied <strong>into the caller's bytecode</strong>. If
+    you change the constant and recompile only that class, callers keep the
+    <strong>old value</strong> until they're recompiled too. This produces genuinely baffling bugs.
+    (It doesn't apply to <code>static final</code> objects — only compile-time constants.)
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. Threads cost ~1MB of stack each, outside the heap.</p>
+  <p class="a">
+    1,000 threads ≈ 1GB of virtual memory that <code>-Xmx</code> knows nothing about. This is why
+    <code>unable to create new native thread</code> happens on a machine with plenty of "free" heap,
+    and why you size pools rather than spawning per request.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    7. The String pool is on the heap (since Java 7), and <code>intern()</code> is a trap.
+  </p>
+  <p class="a">
+    String literals are automatically pooled and shared. <code>new String("a")</code> deliberately
+    creates a distinct object — which is why <code>==</code> fails on it and <code>equals</code> is
+    mandatory. Calling <code>intern()</code> by hand on many distinct strings is usually slower than
+    the allocation you were avoiding.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">8. Two classes with the same name can be different types.</p>
+  <p class="a">
+    Identity is <strong>name + classloader</strong>. Loaded by two loaders, they're incompatible —
+    hence <code>ClassCastException: Foo cannot be cast to Foo</code>. If you see that, you have a
+    classloader problem, not a typing problem.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">9. Allocation is cheap. Really cheap.</p>
+  <p class="a">
+    Allocating in Eden is a <strong>pointer bump</strong> in a thread-local buffer (TLAB) — a few
+    instructions, no locking. Combined with escape analysis, "avoid creating objects" is usually
+    premature optimisation. Object <em>retention</em> is what costs you, not creation.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">11.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: Heap vs stack?</p>
+  <p class="a">
+    Stack is per-thread, holds frames with primitives and references, freed automatically on return,
+    small, fast, inherently thread-safe, overflows with <code>StackOverflowError</code>. Heap is
+    shared, holds all objects and arrays, reclaimed by GC, large, needs synchronisation, exhausts
+    with <code>OutOfMemoryError</code>. References on the stack, objects on the heap.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How does the JVM decide an object is garbage?</p>
+  <p class="a">
+    <strong>Reachability</strong>, not reference counting. It traces from GC roots (thread stack
+    locals, statics, active threads, JNI refs, monitors) and marks everything reachable; the rest is
+    garbage. That's why reference cycles are collected without any special handling.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Explain the generational heap.</p>
+  <p class="a">
+    Built on the observation that <strong>most objects die young</strong>. New objects go in Eden; a
+    minor GC copies the few survivors between survivor spaces, ageing them; after ~15 survivals they
+    are promoted to Old, which is collected rarely. Minor GC cost is proportional to
+    <strong>survivors</strong>, not garbage — so a mostly-dead Eden is nearly free to collect.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Minor vs major vs full GC?</p>
+  <p class="a">
+    Minor = young generation only; frequent, fast, always stop-the-world but brief. Major = the old
+    generation. Full = the whole heap (plus metaspace); rare and the most expensive. Frequent full
+    GCs are a red flag: either the heap is too small or you're leaking.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: PermGen vs Metaspace?</p>
+  <p class="a">
+    PermGen (≤ Java 7) held class metadata inside the heap at a fixed size, and overflowed
+    constantly on redeploys. Java 8 replaced it with Metaspace in <strong>native memory</strong>,
+    growing dynamically — so <code>OutOfMemoryError: PermGen space</code> no longer exists, but an
+    unbounded Metaspace can now eat the whole machine.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What's G1 and why is it the default?</p>
+  <p class="a">
+    A region-based collector: the heap is ~2048 equal regions whose generational role is dynamic. It
+    collects the regions with the most garbage first ("garbage first"), only as many as fit your
+    <code>MaxGCPauseMillis</code> budget, and compacts as it copies. You get predictable pauses
+    without hand-tuning generation sizes.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: <code>OutOfMemoryError</code> vs <code>StackOverflowError</code>?</p>
+  <p class="a">
+    OOM = the heap (or metaspace/native memory) can't satisfy an allocation — a leak or an
+    undersized heap. SOE = one thread's stack is full — nearly always runaway recursion. Both are
+    <code>Error</code>s; don't catch them.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How would you find a memory leak in production?</p>
+  <p class="a">
+    Confirm it first: <code>jstat -gc</code> and watch the
+    <strong>live set after full GCs</strong> — a rising floor means a leak. Then dump the heap
+    (<code>-XX:+HeapDumpOnOutOfMemoryError</code> or <code>jmap</code>), open it in Eclipse MAT, and
+    run Leak Suspects / dominator tree to find what's retaining the most and which GC root holds it.
+    Usual culprits: an unbounded static cache, unremoved listeners, <code>ThreadLocal</code> on pool
+    threads.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is the JIT and why is Java fast despite being interpreted?</p>
+  <p class="a">
+    It compiles hot methods to native code at runtime, using tiered compilation (interpreter → C1
+    with profiling → C2 with aggressive optimisation). Because it knows the actual runtime profile,
+    it can inline, devirtualise, and scalar-replace based on what really happens, guarding the
+    assumptions and deoptimizing if they break — information no ahead-of-time compiler has.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Explain the class loading process.</p>
+  <p class="a">
+    Loading (read bytes, make the <code>Class</code>) → Linking: Verification (is the bytecode
+    safe?), Preparation (statics get <em>default</em> values), Resolution (symbolic → direct refs) →
+    Initialization (run <code>&lt;clinit&gt;</code>: static blocks and assignments). It's lazy —
+    triggered on first real use. Loaders use <strong>parent delegation</strong> (ask upward first)
+    so nobody can spoof <code>java.lang.String</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why is your service using 4GB?</p>
+  <p class="a">
+    Because RSS is heap + metaspace + code cache + ~1MB per thread stack + direct buffers + GC
+    metadata + the JVM binary — and because with <code>-Xms4g</code> the JVM reserves it whether it
+    needs it or not, and rarely returns memory to the OS. Whether that's a <em>problem</em> depends
+    on the post-full-GC live set, not on RSS.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">12.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Pipeline:</strong> <code>.java</code> →(javac)→ bytecode <code>.class</code> →(JVM:
+    interpreter + JIT)→ native. Bytecode is portable; the JVM isn't.
+  </li>
+  <li>
+    <strong>Three subsystems:</strong> class loader · runtime data areas · execution engine
+    (interpreter + JIT + GC).
+  </li>
+  <li>
+    <strong>Class loading:</strong> Load → Link (Verify → Prepare[defaults] → Resolve) →
+    Init(<code>&lt;clinit&gt;</code>). Lazy. <strong>Parent delegation</strong> = ask upward first.
+    Identity = name + loader.
+  </li>
+  <li>
+    <strong>Shared:</strong> heap, metaspace (native, replaced PermGen in 8), code cache.
+    <strong>Per-thread:</strong> stack, PC register, native stack.
+  </li>
+  <li>
+    <strong>Stack:</strong> frames, primitives + references, auto-freed, ~1MB (<code>-Xss</code>) →
+    <code>StackOverflowError</code>. <strong>Heap:</strong> objects, shared, GC'd
+    (<code>-Xmx</code>) → <code>OutOfMemoryError</code>.
+  </li>
+  <li>
+    <strong>GC roots:</strong> stack locals · statics · active threads · JNI refs · monitors.
+    Reachable = alive. Cycles collect fine.
+  </li>
+  <li>
+    <strong>Generations:</strong> Eden → S0/S1 (age++) → Old at ~15. Minor GC cost ∝
+    <strong>survivors</strong>, not garbage.
+  </li>
+  <li>
+    <strong>Phases:</strong> mark → sweep (fragments) → compact. Young gen copies instead. All
+    require a stop-the-world pause.
+  </li>
+  <li>
+    <strong>Collectors:</strong> Serial (tiny) · Parallel (throughput, 8's default) ·
+    <strong>G1 (default since 9, region-based, pause target)</strong> · ZGC/Shenandoah (sub-ms) ·
+    CMS <strong>removed in 14</strong>.
+  </li>
+  <li>
+    <strong>OOM flavours:</strong> heap space · GC overhead limit · Metaspace · unable to create
+    native thread (thread leak!) · direct buffer memory.
+  </li>
+  <li>
+    <strong>Leaks:</strong> static collections · listeners · <code>ThreadLocal</code> in pools ·
+    mutated hash keys. GC frees unreachable, not unwanted.
+  </li>
+  <li>
+    <strong>JIT:</strong> interpreter → C1 (fast + profile) → C2 (aggressive). Inlining · escape
+    analysis · devirtualisation · deopt when a guard fails. Benchmark with JMH.
+  </li>
+  <li>
+    <strong>Prod flags:</strong> <code>-Xms == -Xmx</code> · <code>-XX:MaxRAMPercentage</code> in
+    containers · <code>-XX:+HeapDumpOnOutOfMemoryError</code> · <code>-Xlog:gc*</code>.
+  </li>
+  <li>
+    <strong>Tools:</strong> <code>jps</code> · <code>jstat -gc</code> (is it leaking?) ·
+    <code>jstack</code> (hangs/deadlock) · <code>jmap -histo</code>/dump · MAT · JFR.
+  </li>
+  <li>
+    <strong>Leak test:</strong> live set <em>after full GC</em> — flat floor = fine, rising floor =
+    leak.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

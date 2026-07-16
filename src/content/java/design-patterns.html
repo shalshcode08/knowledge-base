@@ -1,0 +1,1127 @@
+<h1>Design Patterns in Java — Complete Notes</h1>
+<p class="subtitle">
+  Singleton, Factory, Builder, Strategy, Observer and Decorator — the six that actually come up.
+  Don't memorise all 23; understand these deeply enough to code them from scratch and to know when
+  <em>not</em> to.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> What a pattern is (and isn't)</h2>
+<p class="lead">
+  A <em class="term">design pattern</em> is a
+  <strong>named, proven solution to a problem that keeps recurring</strong>. It is not a library,
+  not code you copy, and definitely not a goal. It's vocabulary.
+</p>
+
+<div class="key">
+  <strong>The real value is the name</strong>
+  <p>
+    Saying <strong>"let's use a Builder here"</strong> transmits an entire design — the intent, the
+    structure, the trade-offs — in three words. That's the actual payoff: patterns are
+    <strong>compressed communication between engineers</strong>. The code is secondary.
+  </p>
+</div>
+
+<div class="analogy">
+  <p>
+    Patterns are like <strong>chess openings</strong>. Nobody invented the Sicilian Defence and
+    forced everyone to play it — people noticed the same strong position arising repeatedly and gave
+    it a name. Knowing the name lets two players discuss a whole board state in one word. But you
+    don't play the Sicilian because it's famous; you play it because the position calls for it.
+  </p>
+</div>
+
+<h3>The three categories</h3>
+<div class="pillar-grid">
+  <div class="pcard">
+    <div class="pn">CATEGORY 1</div>
+    <h4>Creational</h4>
+    <p>
+      <strong>How objects get made.</strong> They hide construction so the caller doesn't depend on
+      concrete classes. <em>Singleton, Factory, Builder, Prototype, Abstract Factory.</em>
+    </p>
+  </div>
+  <div class="pcard">
+    <div class="pn">CATEGORY 2</div>
+    <h4>Structural</h4>
+    <p>
+      <strong>How objects are composed.</strong> They assemble things into bigger things while
+      keeping them flexible.
+      <em>Decorator, Adapter, Facade, Proxy, Composite, Bridge, Flyweight.</em>
+    </p>
+  </div>
+  <div class="pcard">
+    <div class="pn">CATEGORY 3</div>
+    <h4>Behavioural</h4>
+    <p>
+      <strong>How objects talk and share work.</strong> They assign responsibility and
+      communication.
+      <em
+        >Strategy, Observer, Command, Template Method, State, Iterator, Chain of Responsibility.</em
+      >
+    </p>
+  </div>
+</div>
+
+<div class="warn">
+  <strong>The two principles behind nearly all of them</strong>
+  <p>
+    <strong>1. "Program to an interface, not an implementation."</strong>
+    <strong>2. "Favour composition over inheritance."</strong> If you deeply understand these two,
+    most patterns become obvious rather than memorised — they're just these ideas applied to a
+    specific problem.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Patternitis is real</strong>
+  <p>
+    The failure mode of learning patterns is applying them everywhere. A
+    <code>SimpleBeanFactoryAwareAspectInstanceFactory</code> is what happens when patterns become
+    the goal. <strong>Write the simple thing first.</strong> Reach for a pattern when the simple
+    thing has actually started to hurt.
+  </p>
+</div>
+
+<h2 id="singleton"><span class="num">01.</span> Singleton</h2>
+<p class="lead">
+  <strong>Intent:</strong> guarantee a class has <strong>exactly one instance</strong>, with one
+  global access point. The most famous pattern, the most abused, and the one most likely to be a
+  trick question.
+</p>
+
+<h3>The naive version, and why it's broken</h3>
+<figure class="code">
+  <figcaption><b>Lazy singleton — completely broken under concurrency</b></figcaption>
+  <pre><code>public class Broken {
+    private static Broken instance;
+    private Broken() { }                       // private ctor: nobody else can `new` it
+
+    public static Broken getInstance() {
+        if (instance == null) {                // check-then-act — a RACE CONDITION
+            instance = new Broken();           // two threads can BOTH pass the check
+        }
+        return instance;
+    }
+}
+// Thread A checks -&gt; null. Thread B checks -&gt; null. Both construct. Two singletons.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Fix 1: synchronize — correct, but slow forever</b></figcaption>
+  <pre><code>public static synchronized Broken getInstance() {
+    if (instance == null) instance = new Broken();
+    return instance;
+}
+// Correct. But EVERY call locks — including the millions of calls after
+// initialisation, where there's nothing left to synchronise. Pure waste.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Fix 2: double-checked locking — correct ONLY with volatile</b></figcaption>
+  <pre><code>public class DCL {
+    private static volatile DCL instance;      // the `volatile` is NOT optional
+    private DCL() { }
+
+    public static DCL getInstance() {
+        if (instance == null) {                // 1st check — no lock, the fast path
+            synchronized (DCL.class) {
+                if (instance == null) {        // 2nd check — someone may have won the race
+                    instance = new DCL();
+                }
+            }
+        }
+        return instance;
+    }
+}</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why DCL without <code>volatile</code> is subtly, famously broken</strong>
+  <p>
+    <code>instance = new DCL()</code> is three steps: <strong>1.</strong> allocate memory,
+    <strong>2.</strong> run the constructor, <strong>3.</strong> assign the reference. The JIT is
+    allowed to <strong>reorder 2 and 3</strong>. Another thread can then see a
+    <strong>non-null reference to a half-constructed object</strong>, skip the first check, and use
+    it. <code>volatile</code> forbids that reordering. This bug is rare, timing-dependent, and
+    essentially undebuggable — which is why the next two approaches exist.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption>
+    <b>Fix 3: the initialization-on-demand holder idiom — lazy, fast, no locks</b>
+  </figcaption>
+  <pre><code>public class Holder {
+    private Holder() { }
+
+    private static class Lazy {                 // a nested class isn't loaded until first USED
+        static final Holder INSTANCE = new Holder();
+    }
+
+    public static Holder getInstance() {
+        return Lazy.INSTANCE;                   // triggers Lazy's initialisation, right here
+    }
+}
+// The JVM ALREADY guarantees class initialisation is thread-safe and happens exactly once.
+// So we get laziness and thread safety for free, with zero synchronisation on any call.
+// No volatile, no locks, no cleverness. Just leaning on the classloader's own guarantees.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Fix 4: the enum singleton — the best one (Effective Java, Item 3)</b></figcaption>
+  <pre><code>public enum Config {
+    INSTANCE;
+
+    private final Map&lt;String,String&gt; values = new HashMap&lt;&gt;();
+
+    public String get(String key) { return values.get(key); }
+}
+
+// Use:
+Config.INSTANCE.get("db.url");</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why enum wins</strong>
+  <p>
+    It's the only version immune to the two attacks that break all the others.
+    <strong>Reflection:</strong> <code>setAccessible(true)</code> on a private constructor lets
+    anyone construct a second instance — but the JVM <em>forbids</em> reflective construction of
+    enums outright. <strong>Serialization:</strong> deserialising a normal singleton creates a
+    <em>new</em> object every time — but enums are serialised by name and always resolve back to the
+    same constant. Plus it's thread-safe and lazy with no code at all.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Approach</th>
+        <th>Thread-safe</th>
+        <th>Lazy</th>
+        <th>Reflection-proof</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Naive lazy</td>
+        <td><span class="no">No</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="no">No</span></td>
+        <td>Broken</td>
+      </tr>
+      <tr>
+        <td>Eager <code>static final</code></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="no">No</span></td>
+        <td><span class="no">No</span></td>
+        <td>Fine if construction is cheap</td>
+      </tr>
+      <tr>
+        <td><code>synchronized</code> method</td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="no">No</span></td>
+        <td>Correct but needlessly slow</td>
+      </tr>
+      <tr>
+        <td>Double-checked + <code>volatile</code></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="no">No</span></td>
+        <td>Works; easy to get wrong</td>
+      </tr>
+      <tr>
+        <td><strong>Static holder</strong></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="no">No</span></td>
+        <td><strong>Best classic idiom</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Enum</strong></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td><strong>Best overall</strong></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>Singleton is widely considered an anti-pattern — know why</strong>
+  <p>
+    It's <strong>global mutable state</strong> in a dinner jacket. It makes unit testing painful
+    (you can't inject a fake, and state leaks between tests), <strong>hides dependencies</strong> (a
+    method's signature says nothing about the singletons it reaches for), and couples every caller
+    to a concrete class. <strong>The modern answer is dependency injection</strong>: let
+    Spring/Guice manage a single instance and <em>hand</em> it to you. You get one instance where it
+    matters, without the global. Note a Spring <code>@Singleton</code> bean is one-per-container,
+    not the GoF pattern.
+  </p>
+</div>
+
+<h2 id="factory"><span class="num">02.</span> Factory</h2>
+<p class="lead">
+  <strong>Intent:</strong> create objects without the caller naming the concrete class.
+  <code>new</code> hardcodes a dependency; a factory turns "which class?" into a decision made in
+  <strong>one place</strong>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Simple Factory — not technically a GoF pattern, but the most used</b></figcaption>
+  <pre><code>interface Notification { void send(String msg); }
+
+class EmailNotification implements Notification {
+    public void send(String msg) { System.out.println("Email: " + msg); }
+}
+class SmsNotification implements Notification {
+    public void send(String msg) { System.out.println("SMS: " + msg); }
+}
+class PushNotification implements Notification {
+    public void send(String msg) { System.out.println("Push: " + msg); }
+}
+
+class NotificationFactory {
+    static Notification create(String type) {
+        return switch (type) {
+            case "email" -&gt; new EmailNotification();
+            case "sms"   -&gt; new SmsNotification();
+            case "push"  -&gt; new PushNotification();
+            default -&gt; throw new IllegalArgumentException("unknown type: " + type);
+        };
+    }
+}
+
+// Caller doesn't know or care which class it gets:
+Notification n = NotificationFactory.create(config.getType());
+n.send("hello");</code></pre>
+</figure>
+
+<div class="key">
+  <strong>What you actually bought</strong>
+  <p>
+    The <code>new</code> is now in <strong>one place</strong>. Adding a
+    <code>SlackNotification</code> means touching one file — every caller keeps working, untouched.
+    Without it, <code>new EmailNotification()</code> is scattered across forty files and every one
+    is welded to a concrete class.
+  </p>
+</div>
+
+<h3>Factory Method — let subclasses decide</h3>
+<figure class="code">
+  <figcaption>
+    <b>The real GoF pattern: the base class defines the flow, subclasses pick the type</b>
+  </figcaption>
+  <pre><code>abstract class Dialog {
+
+    protected abstract Button createButton();   // THE factory method — subclasses answer this
+
+    public void render() {                      // the algorithm lives here, and doesn't change
+        Button b = createButton();
+        b.onClick(this::close);
+        b.render();
+    }
+    void close() { }
+}
+
+class WindowsDialog extends Dialog {
+    protected Button createButton() { return new WindowsButton(); }
+}
+class WebDialog extends Dialog {
+    protected Button createButton() { return new HtmlButton(); }
+}
+
+// render() is written ONCE and works for every platform.
+// The subclass supplies only the one varying decision.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Abstract Factory — a family of related products</b></figcaption>
+  <pre><code>// When products must MATCH each other — you must never mix Windows and Mac widgets
+interface GuiFactory {
+    Button   createButton();
+    Checkbox createCheckbox();
+}
+
+class WindowsFactory implements GuiFactory {
+    public Button   createButton()   { return new WindowsButton(); }
+    public Checkbox createCheckbox() { return new WindowsCheckbox(); }
+}
+class MacFactory implements GuiFactory {
+    public Button   createButton()   { return new MacButton(); }
+    public Checkbox createCheckbox() { return new MacCheckbox(); }
+}
+
+// Choose the family ONCE; every product is guaranteed consistent thereafter.
+GuiFactory f = isWindows ? new WindowsFactory() : new MacFactory();
+Button b = f.createButton();
+Checkbox c = f.createCheckbox();     // cannot accidentally be a MacCheckbox</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Answers</th>
+        <th>Mechanism</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Simple Factory</td>
+        <td>"Give me one of these, based on this input"</td>
+        <td>A method with a switch</td>
+      </tr>
+      <tr>
+        <td>Factory Method</td>
+        <td>"Subclass, which concrete type do you want?"</td>
+        <td>Inheritance — one product</td>
+      </tr>
+      <tr>
+        <td>Abstract Factory</td>
+        <td>"Give me a whole matching family"</td>
+        <td>Composition — many products</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Static factory methods — the everyday cousin</strong>
+  <p>
+    <code>List.of()</code>, <code>Optional.of()</code>, <code>Integer.valueOf()</code>,
+    <code>LocalDate.now()</code>. Not the GoF pattern, but the most common "don't call
+    <code>new</code>" technique — and often the better default. Unlike constructors they have
+    <strong>names</strong>, can <strong>return a cached instance</strong> (<code
+      >Integer.valueOf</code
+    >
+    caches −128..127), and can <strong>return a subtype</strong>. See <em>Effective Java</em>, Item
+    1.
+  </p>
+</div>
+
+<h2 id="builder"><span class="num">03.</span> Builder</h2>
+<p class="lead">
+  <strong>Intent:</strong> construct a complex object step by step. It exists to kill the
+  <em class="term">telescoping constructor</em> — the thing that happens when a class has more than
+  about four fields.
+</p>
+
+<figure class="code">
+  <figcaption><b>The problem — can you spot the bug?</b></figcaption>
+  <pre><code>// Telescoping constructors: the classic disease
+public Pizza(int size) { ... }
+public Pizza(int size, boolean cheese) { ... }
+public Pizza(int size, boolean cheese, boolean pepperoni) { ... }
+public Pizza(int size, boolean cheese, boolean pepperoni, boolean bacon) { ... }
+
+new Pizza(12, true, false, true);
+//            ^^^^  ^^^^^  ^^^^  which one is bacon again?
+
+// And this compiles perfectly, silently doing the wrong thing:
+new Pizza(12, false, true, true);   // meant cheese, got pepperoni. No warning. Ever.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>The Builder — named, safe, immutable, order-independent</b></figcaption>
+  <pre><code>public class Pizza {
+    private final int size;                 // all final -&gt; immutable &amp; thread-safe
+    private final boolean cheese;
+    private final boolean pepperoni;
+    private final boolean bacon;
+
+    private Pizza(Builder b) {              // private ctor: the Builder is the ONLY way in
+        this.size      = b.size;
+        this.cheese    = b.cheese;
+        this.pepperoni = b.pepperoni;
+        this.bacon     = b.bacon;
+    }
+
+    public static Builder builder(int size) { return new Builder(size); }
+
+    public static class Builder {
+        private final int size;             // required -&gt; in the Builder's constructor
+        private boolean cheese;             // optional -&gt; sensible defaults
+        private boolean pepperoni;
+        private boolean bacon;
+
+        public Builder(int size) { this.size = size; }
+
+        public Builder cheese()    { this.cheese = true; return this; }     // return this -&gt; chain
+        public Builder pepperoni() { this.pepperoni = true; return this; }
+        public Builder bacon()     { this.bacon = true; return this; }
+
+        public Pizza build() {
+            if (size &lt; 6) throw new IllegalArgumentException("size must be &gt;= 6");  // validate HERE
+            return new Pizza(this);         // the object is never seen in a partial state
+        }
+    }
+}
+
+// Now read this and tell me it's ambiguous:
+Pizza p = Pizza.builder(12)
+    .cheese()
+    .bacon()
+    .build();</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The four things Builder buys you</strong>
+  <p>
+    <strong>1. Readability</strong> — every argument is named at the call site.
+    <strong>2. Immutability</strong> — all fields <code>final</code>, set once, so the result is
+    automatically thread-safe. <strong>3. Validation in one place</strong> —
+    <code>build()</code> checks invariants <em>across</em> fields before the object exists.
+    <strong>4. Optional parameters</strong> without a combinatorial explosion of constructors.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Builders in the wild</strong>
+  <p>
+    <code>StringBuilder</code> · <code>Stream.Builder</code> ·
+    <code>HttpRequest.newBuilder()</code> · <code>Calendar.Builder</code> — and Lombok's
+    <code>@Builder</code> generates the whole thing from an annotation.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>With records — you often don't need one at all</b></figcaption>
+  <pre><code>// For 2-3 fields a record is simply better. Don't reach for a Builder reflexively.
+record Point(int x, int y) { }
+
+// The Builder earns its keep once there are many optional fields —
+// and records pair with it nicely for the validation:
+record Pizza(int size, boolean cheese, boolean pepperoni, boolean bacon) {
+    Pizza {
+        if (size &lt; 6) throw new IllegalArgumentException("size must be &gt;= 6");
+    }
+    static Builder builder(int size) { return new Builder(size); }
+    // ... Builder as above, calling the canonical constructor in build()
+}</code></pre>
+</figure>
+
+<h2 id="strategy"><span class="num">04.</span> Strategy</h2>
+<p class="lead">
+  <strong>Intent:</strong> define a family of interchangeable algorithms, encapsulate each one, and
+  make them swappable at runtime. In modern Java this is usually <strong>one lambda</strong>.
+</p>
+
+<figure class="code">
+  <figcaption><b>The problem — a switch that grows forever</b></figcaption>
+  <pre><code>class Checkout {
+    double pay(double amount, String method) {
+        if (method.equals("card")) {
+            // 20 lines of card logic
+        } else if (method.equals("paypal")) {
+            // 20 lines of PayPal logic
+        } else if (method.equals("crypto")) {
+            // 20 lines of crypto logic
+        }
+        // Adding "applepay" means EDITING this class. Again.
+        // It violates Open/Closed: you can't extend it without modifying it.
+        // And it's untestable in isolation, and 300 lines long.
+    }
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Strategy — each algorithm is its own object</b></figcaption>
+  <pre><code>interface PaymentStrategy {              // the strategy interface
+    void pay(double amount);
+}
+
+class CardPayment implements PaymentStrategy {
+    private final String cardNumber;
+    CardPayment(String cardNumber) { this.cardNumber = cardNumber; }
+    public void pay(double amount) { System.out.println("Card: " + amount); }
+}
+class PayPalPayment implements PaymentStrategy {
+    public void pay(double amount) { System.out.println("PayPal: " + amount); }
+}
+
+class Checkout {                          // the CONTEXT — knows the interface, not the classes
+    private PaymentStrategy strategy;
+    void setStrategy(PaymentStrategy s) { this.strategy = s; }
+    void checkout(double amount) { strategy.pay(amount); }   // just delegate
+}
+
+Checkout c = new Checkout();
+c.setStrategy(new CardPayment("4111..."));
+c.checkout(99.99);
+c.setStrategy(new PayPalPayment());       // swapped at RUNTIME
+c.checkout(50.00);
+
+// Adding ApplePay = adding ONE new class. Checkout is never touched. That's Open/Closed.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Strategy is composition beating inheritance</strong>
+  <p>
+    The inheritance answer would be <code>CardCheckout extends Checkout</code> — which fixes the
+    behaviour at <strong>compile time</strong> and can never change. Strategy makes behaviour a
+    <strong>field</strong>, so it can change per instance, per call, per config, at runtime. This is
+    literally the "favour composition over inheritance" principle in pattern form.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>In modern Java, a Strategy is usually just a lambda</b></figcaption>
+  <pre><code>// PaymentStrategy has ONE abstract method -&gt; it's a functional interface -&gt; lambda territory
+Checkout c = new Checkout();
+c.setStrategy(amount -&gt; System.out.println("Card: " + amount));
+c.setStrategy(amount -&gt; System.out.println("PayPal: " + amount));
+
+// Often you don't even need your own interface:
+Comparator&lt;Person&gt; byName = Comparator.comparing(Person::getName);   // a sorting strategy
+list.sort(byName);                                                   // ...injected here
+
+// A registry of strategies, no switch anywhere:
+Map&lt;String, PaymentStrategy&gt; strategies = Map.of(
+    "card",   amount -&gt; chargeCard(amount),
+    "paypal", amount -&gt; chargePayPal(amount)
+);
+strategies.get(method).pay(amount);</code></pre>
+</figure>
+
+<div class="note">
+  <strong>You've been using Strategy all along</strong>
+  <p>
+    <code>Comparator</code> passed to <code>sort</code> · <code>Predicate</code> passed to
+    <code>filter</code> · a <code>ThreadFactory</code> given to an executor · a
+    <code>RejectedExecutionHandler</code>. Every "pass me the behaviour" API in the JDK is Strategy.
+  </p>
+</div>
+
+<h2 id="observer"><span class="num">05.</span> Observer</h2>
+<p class="lead">
+  <strong>Intent:</strong> when one object changes state, everything that cares is notified
+  automatically. A one-to-many dependency, with the subject knowing <strong>nothing</strong> about
+  who's listening.
+</p>
+
+<figure class="code">
+  <figcaption><b>The pattern</b></figcaption>
+  <pre><code>interface Observer {                     // what listeners implement
+    void update(String event);
+}
+
+class Subject {                          // the thing being watched
+    private final List&lt;Observer&gt; observers = new CopyOnWriteArrayList&lt;&gt;();  // safe iteration
+
+    public void subscribe(Observer o)   { observers.add(o); }
+    public void unsubscribe(Observer o) { observers.remove(o); }   // ESSENTIAL — see gotchas
+
+    protected void notifyAll(String event) {
+        for (Observer o : observers) o.update(event);   // fire away
+    }
+}
+
+class OrderService extends Subject {
+    public void placeOrder(Order order) {
+        save(order);
+        notifyAll("ORDER_PLACED:" + order.getId());     // I don't know or care who listens
+    }
+}
+
+// Listeners register themselves
+OrderService svc = new OrderService();
+svc.subscribe(e -&gt; emailService.sendConfirmation(e));
+svc.subscribe(e -&gt; analytics.track(e));
+svc.subscribe(e -&gt; inventory.reserve(e));
+// Adding an SMS notification = one more subscribe(). OrderService is never modified.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The point is the direction of the dependency</strong>
+  <p>
+    Without Observer, <code>OrderService</code> would call <code>emailService</code>,
+    <code>analytics</code> and <code>inventory</code> directly — three hard dependencies, and a
+    fourth every time the business adds a feature. With it, the arrows
+    <strong>point inward</strong>: listeners depend on the subject, the subject depends on nobody.
+    That's <em class="term">loose coupling</em>, and it's why event-driven architectures scale
+    organisationally.
+  </p>
+</div>
+
+<div class="analogy">
+  <p>
+    A <strong>newsletter</strong>. The publisher doesn't phone each reader; it maintains a
+    subscriber list and sends one broadcast. Readers subscribe and unsubscribe freely. The publisher
+    has no idea who's on the list, and doesn't need to — adding a reader requires zero changes to
+    the publishing process.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Don't use <code>java.util.Observable</code></strong>
+  <p>
+    It was <strong>deprecated in Java 9</strong>. It's a class (so it burns your one inheritance
+    slot), it isn't serialisable, it isn't thread-safe, and its notification order is unspecified.
+    Roll your own listener interface (five lines, as above), or use
+    <code>PropertyChangeSupport</code>, an event bus, Spring's
+    <code>ApplicationEventPublisher</code>, or reactive streams.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Observer everywhere you look</b></figcaption>
+  <pre><code>button.addActionListener(e -&gt; save());        // Swing/AWT
+element.addEventListener("click", handler);   // the DOM
+publisher.subscribe(subscriber);              // Flow API (Java 9) / Reactive Streams
+@EventListener void onOrder(OrderEvent e) { } // Spring
+// Kafka, RabbitMQ, webhooks — pub/sub is Observer at network scale.</code></pre>
+</figure>
+
+<h2 id="decorator"><span class="num">06.</span> Decorator</h2>
+<p class="lead">
+  <strong>Intent:</strong> add behaviour to an object by <strong>wrapping</strong> it, at runtime,
+  without touching its class. The alternative to an explosion of subclasses.
+</p>
+
+<figure class="code">
+  <figcaption><b>The problem — the combinatorial subclass explosion</b></figcaption>
+  <pre><code>// Coffee, and you want milk, sugar, whipped cream...
+class Coffee { }
+class CoffeeWithMilk extends Coffee { }
+class CoffeeWithSugar extends Coffee { }
+class CoffeeWithMilkAndSugar extends Coffee { }
+class CoffeeWithMilkAndWhip extends Coffee { }
+class CoffeeWithMilkAndSugarAndWhip extends Coffee { }
+// ... 3 add-ons -&gt; 8 classes. 10 add-ons -&gt; 1024 classes. It's 2^n. This does not work.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Decorator — wrap instead of subclass</b></figcaption>
+  <pre><code>interface Coffee {
+    double cost();
+    String description();
+}
+
+class SimpleCoffee implements Coffee {                    // the CONCRETE COMPONENT
+    public double cost() { return 2.00; }
+    public String description() { return "coffee"; }
+}
+
+abstract class CoffeeDecorator implements Coffee {        // the BASE DECORATOR
+    protected final Coffee inner;                         // IS-A Coffee, HAS-A Coffee — the trick
+    protected CoffeeDecorator(Coffee inner) { this.inner = inner; }
+}
+
+class Milk extends CoffeeDecorator {
+    Milk(Coffee inner) { super(inner); }
+    public double cost() { return inner.cost() + 0.50; }              // delegate, then ADD
+    public String description() { return inner.description() + " + milk"; }
+}
+class Sugar extends CoffeeDecorator {
+    Sugar(Coffee inner) { super(inner); }
+    public double cost() { return inner.cost() + 0.20; }
+    public String description() { return inner.description() + " + sugar"; }
+}
+
+// Compose freely, at runtime, in any order and any depth:
+Coffee c = new Sugar(new Milk(new SimpleCoffee()));
+System.out.println(c.description());   // coffee + milk + sugar
+System.out.println(c.cost());          // 2.70
+
+// 10 add-ons = 10 classes, not 1024. And each one is independently testable.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The structural trick that makes it work</strong>
+  <p>
+    A decorator <strong>implements the same interface</strong> as the thing it wraps <em>and</em>
+    <strong>holds a reference</strong> to one. That's why a decorated object is still a
+    <code>Coffee</code> — so callers can't tell, and decorators can wrap decorators infinitely. IS-A
+    and HAS-A at the same time.
+  </p>
+</div>
+
+<div class="analogy">
+  <p>
+    <strong>Clothing.</strong> You don't need a "PersonWearingShirtAndJacketAndScarf" class. You put
+    a shirt on the person, a jacket over the shirt, a scarf over the jacket. Each layer adds warmth
+    and knows only about "the layer underneath" — and from the outside, it's still a person.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The canonical example: java.io is Decorator all the way down</b></figcaption>
+  <pre><code>InputStream in =
+    new BufferedInputStream(              // adds buffering
+        new GZIPInputStream(              // adds decompression
+            new FileInputStream("data.gz")));   // the actual source
+
+// Each wrapper adds ONE capability. Reorder or omit at will —
+// this is why java.io looks so verbose, and also why it's so flexible.
+
+// Same idea:
+new BufferedReader(new InputStreamReader(System.in));
+Collections.unmodifiableList(list);        // a decorator that removes a capability
+Collections.synchronizedMap(map);          // a decorator that adds locking</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Same interface?</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Decorator</strong></td>
+        <td><span class="yes">Yes</span></td>
+        <td><strong>Add</strong> behaviour</td>
+      </tr>
+      <tr>
+        <td><strong>Adapter</strong></td>
+        <td><span class="no">No</span> — it changes it</td>
+        <td><strong>Convert</strong> an incompatible interface</td>
+      </tr>
+      <tr>
+        <td><strong>Proxy</strong></td>
+        <td><span class="yes">Yes</span></td>
+        <td><strong>Control access</strong> (lazy load, cache, security, remote)</td>
+      </tr>
+      <tr>
+        <td><strong>Facade</strong></td>
+        <td><span class="no">No</span> — a new, simpler one</td>
+        <td><strong>Simplify</strong> a complex subsystem</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Decorator vs Proxy — they look identical in code</strong>
+  <p>
+    Both wrap an object behind the same interface. The difference is <strong>intent</strong>: a
+    decorator <em>adds</em> something the caller wants (buffering, compression); a proxy
+    <em>controls</em> access to something (lazily creating it, caching it, checking permissions,
+    calling it over the network). Same structure, different reason — which is exactly why patterns
+    are about intent, not shape.
+  </p>
+</div>
+
+<h2 id="comparison"><span class="num">07.</span> Choosing — and how they relate</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>The problem you have</th>
+        <th>The pattern</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>"There must be exactly one of these"</td>
+        <td><strong>Singleton</strong> (but really: dependency injection)</td>
+      </tr>
+      <tr>
+        <td>"The caller shouldn't know which class it gets"</td>
+        <td><strong>Factory</strong></td>
+      </tr>
+      <tr>
+        <td>"This constructor has eight arguments"</td>
+        <td><strong>Builder</strong></td>
+      </tr>
+      <tr>
+        <td>"This <code>if/else</code> chain keeps growing"</td>
+        <td><strong>Strategy</strong></td>
+      </tr>
+      <tr>
+        <td>"Several things must react when this happens"</td>
+        <td><strong>Observer</strong></td>
+      </tr>
+      <tr>
+        <td>"I need optional features in any combination"</td>
+        <td><strong>Decorator</strong></td>
+      </tr>
+      <tr>
+        <td>"This library's interface is wrong for me"</td>
+        <td><strong>Adapter</strong></td>
+      </tr>
+      <tr>
+        <td>"I want to intercept calls to this"</td>
+        <td><strong>Proxy</strong></td>
+      </tr>
+      <tr>
+        <td>"The steps are fixed, one step varies"</td>
+        <td><strong>Template Method</strong></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="dd">
+  <div class="do">
+    <h5>✓ Do</h5>
+    <ul>
+      <li>
+        Let a pattern <strong>emerge</strong> from real pain (usually the third time you copy
+        something).
+      </li>
+      <li>
+        Use the name in conversation and in class names — <code>PaymentStrategy</code>,
+        <code>PizzaBuilder</code>.
+      </li>
+      <li>Prefer the modern Java form: a lambda is a Strategy, a record beats a small Builder.</li>
+      <li>Understand the <em>intent</em>. Decorator and Proxy have identical code.</li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h5>✗ Don't</h5>
+    <ul>
+      <li>Apply a pattern because you just learned it.</li>
+      <li>Use Singleton for anything with mutable state — inject it instead.</li>
+      <li>Build a Factory for a class with one implementation.</li>
+      <li>Memorise all 23 — six well-understood beats twenty-three recited.</li>
+      <li>Add indirection "for flexibility" you have no evidence you'll need.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note">
+  <strong>How modern Java changed the picture</strong>
+  <p>
+    Several GoF patterns were <strong>workarounds for missing language features</strong>. Lambdas
+    made Strategy and Command nearly disappear into a one-liner. Records made small Builders
+    unnecessary. <code>sealed</code> + pattern matching replaces a lot of Visitor. Default methods
+    cover much of Template Method. A pattern-shaped hole in 1994 Java may be a language feature
+    today — which is exactly why you learn the <em>problem</em>, not the boilerplate.
+  </p>
+</div>
+
+<h2 id="gotchas"><span class="num">08.</span> Gotchas</h2>
+
+<div class="qa">
+  <p class="q">1. Double-checked locking without <code>volatile</code> is broken.</p>
+  <p class="a">
+    The constructor and the reference assignment can be reordered, so another thread can see a
+    non-null reference to a half-built object. The bug is rare, non-deterministic and essentially
+    undebuggable. Use the static holder idiom or an enum and sidestep it entirely.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. Reflection and serialization both break a normal Singleton.</p>
+  <p class="a">
+    <code>setAccessible(true)</code> lets anyone call your private constructor; deserialization
+    creates a brand-new object every time (unless you implement <code>readResolve()</code>). Only
+    the <strong>enum</strong> singleton is immune to both, for free.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. Observer leaks memory if you never unsubscribe.</p>
+  <p class="a">
+    The subject holds a strong reference to every listener, so a listener that forgets to
+    unsubscribe
+    <strong>can never be garbage collected</strong> — the classic "lapsed listener" leak. Always
+    provide and call <code>unsubscribe</code>, or hold listeners weakly.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. Observer's notification order is not defined — don't rely on it.</p>
+  <p class="a">
+    If listener B depends on listener A having run first, you don't have an Observer problem, you
+    have a design problem. Also: one listener throwing can abort the notification loop, so later
+    listeners never fire. Catch per-listener.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Calling <code>notifyObservers</code> while holding a lock invites deadlock.</p>
+  <p class="a">
+    You're calling <strong>unknown code</strong> (an "alien method") with a lock held — you have no
+    idea what locks it will try to take. Copy the listener list under the lock, then notify
+    <em>outside</em> it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. A Builder that forgets a required field fails at runtime, not compile time.</p>
+  <p class="a">
+    That's Builder's one real weakness versus a constructor. Mitigate it by putting
+    <strong>required</strong> fields in the <em>Builder's constructor</em> (as in the pizza example)
+    and validating the rest in <code>build()</code> — never after the object exists.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">7. Decorators make stack traces and debugging genuinely worse.</p>
+  <p class="a">
+    Five layers of wrapping means five frames of delegation before the real work, and
+    <code>toString()</code>/<code>equals()</code> often don't survive the wrapping. It's the price
+    of the flexibility — worth it for <code>java.io</code>, overkill for two options that never
+    change.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">8. Singleton makes tests share state.</p>
+  <p class="a">
+    A static instance persists <strong>across test methods</strong>, so tests pass alone and fail in
+    a suite — or pass in one order and fail in another. There's no clean fix beyond a reset hook you
+    shouldn't need. This alone is why DI won.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">09.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: What's the best way to implement a Singleton, and why?</p>
+  <p class="a">
+    An <strong>enum</strong> — thread-safe, lazy, and the only form immune to reflection and
+    serialization attacks, with no code. If it must be a class, use the
+    <strong>static holder idiom</strong>, which gets laziness and thread safety from the JVM's own
+    class-initialisation guarantee, with no locking. And mention that in a real app you'd usually
+    prefer DI.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why does double-checked locking need <code>volatile</code>?</p>
+  <p class="a">
+    Because <code>new</code> is allocate → construct → assign, and the JIT may reorder the
+    assignment before construction completes. A second thread could then see a non-null, half-built
+    object. <code>volatile</code> forbids the reordering (and gives visibility).
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Factory Method vs Abstract Factory?</p>
+  <p class="a">
+    Factory Method uses <strong>inheritance</strong> — a subclass overrides one method to decide
+    <strong>one</strong> product's type. Abstract Factory uses <strong>composition</strong> — an
+    object whose methods produce a <strong>family</strong> of related products guaranteed to match.
+    One method vs one object with several methods.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When would you use a Builder?</p>
+  <p class="a">
+    Many constructor parameters (say 4+), especially optional ones, or when parameters of the same
+    type are easy to swap by accident. It gives named arguments, an immutable result, and a single
+    place to validate cross-field invariants. For 2–3 fields, use a record instead.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Strategy vs inheritance?</p>
+  <p class="a">
+    Inheritance fixes behaviour at compile time and burns your one superclass. Strategy makes
+    behaviour a <strong>field</strong>, so it's swappable at runtime, independently testable, and
+    composable. It's "favour composition over inheritance" in pattern form — and in modern Java the
+    strategy is usually just a lambda.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Decorator vs inheritance?</p>
+  <p class="a">
+    Inheritance needs a class per <em>combination</em> — 2<sup>n</sup> classes for n features.
+    Decorator needs one class per <em>feature</em> and composes them at runtime, in any order.
+    That's exactly why <code>java.io</code> is built from wrappers.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Decorator vs Proxy — the code looks the same. What's the difference?</p>
+  <p class="a">
+    <strong>Intent.</strong> Decorator <em>adds</em> behaviour the caller wants; Proxy
+    <em>controls access</em> to the subject (lazy init, caching, security, remoting). A decorator's
+    target always exists; a proxy often creates or hides it. Structurally identical, semantically
+    different.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Where is Observer used in the JDK?</p>
+  <p class="a">
+    Swing listeners, <code>PropertyChangeSupport</code>, the Java 9 <code>Flow</code> API (Reactive
+    Streams), Spring's application events. Note <code>java.util.Observable</code> is
+    <strong>deprecated since Java 9</strong> — it's a class, not thread-safe, and not serialisable.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Are design patterns still relevant?</p>
+  <p class="a">
+    The <strong>problems</strong> are; some of the <strong>boilerplate</strong> isn't. Lambdas
+    collapsed Strategy and Command into one line, records replace small Builders, sealed types +
+    pattern matching cover much of Visitor. The vocabulary remains extremely valuable — but a
+    pattern-shaped hole from 1994 is often a language feature in 2026.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Which pattern do you dislike, and why?</p>
+  <p class="a">
+    A great answer is <strong>Singleton</strong>: it's global mutable state, it hides dependencies
+    (the signature doesn't reveal them), it makes tests share state and fail by ordering, and it
+    couples callers to a concrete class. DI gives you one instance without any of that. Showing you
+    know <em>when not to</em> use a pattern is the point of the question.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">10.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Categories:</strong> Creational (how objects are made) · Structural (how they're
+    composed) · Behavioural (how they interact).
+  </li>
+  <li>
+    <strong>Two principles behind them all:</strong> program to an interface · favour composition
+    over inheritance.
+  </li>
+  <li>
+    <strong>Singleton:</strong> one instance. Best = <strong>enum</strong> (reflection- &amp;
+    serialization-proof); classic = <strong>static holder</strong>. DCL <em>needs</em>
+    <code>volatile</code>. Really: use DI.
+  </li>
+  <li>
+    <strong>Factory:</strong> hide the concrete class. Simple (switch) · Factory Method
+    (inheritance, one product) · Abstract Factory (composition, a family).
+  </li>
+  <li>
+    <strong>Builder:</strong> kills telescoping constructors. Named args · immutable · validate in
+    <code>build()</code> · required fields in the Builder's ctor. Records beat it when small.
+  </li>
+  <li>
+    <strong>Strategy:</strong> interchangeable algorithms as objects → kills the growing
+    <code>if/else</code>, gives Open/Closed. Today: a lambda (<code>Comparator</code>,
+    <code>Predicate</code>).
+  </li>
+  <li>
+    <strong>Observer:</strong> one-to-many auto-notify; subject knows nothing about listeners.
+    <strong>Unsubscribe or leak.</strong> <code>java.util.Observable</code> is deprecated.
+  </li>
+  <li>
+    <strong>Decorator:</strong> same interface + holds one → wrap to add behaviour at runtime. n
+    features = n classes, not 2<sup>n</sup>. See <code>java.io</code>.
+  </li>
+  <li>
+    <strong>Confusables:</strong> Decorator <em>adds</em> · Proxy <em>controls access</em> · Adapter
+    <em>converts</em> · Facade <em>simplifies</em>.
+  </li>
+  <li>
+    <strong>Rule:</strong> write the simple thing first. The pattern earns its place the third time
+    the simple thing hurts.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

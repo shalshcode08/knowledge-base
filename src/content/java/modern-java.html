@@ -1,0 +1,1733 @@
+<h1>Modern Java (8 → 21) — Complete Notes</h1>
+<p class="subtitle">
+  Lambdas, functional interfaces, method references and Streams; then records, sealed types, pattern
+  matching and text blocks. This is the difference between code that looks current and code that
+  looks like 2012.
+</p>
+
+<h2 id="intro"><span class="num">00.</span> What changed, and why</h2>
+<p class="lead">
+  Java 8 (2014) was the biggest change in the language's history: it added
+  <strong>functions as values</strong>. Java 9–21 then spent a decade removing ceremony — less
+  boilerplate, more of the compiler doing the boring work for you.
+</p>
+
+<p>Two separate revolutions are bundled into "modern Java", and it helps to keep them apart:</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Era</th>
+        <th>Big idea</th>
+        <th>Features</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Java 8</strong></td>
+        <td>Behaviour can be passed around as data</td>
+        <td>Lambdas, functional interfaces, method refs, Streams, <code>Optional</code></td>
+      </tr>
+      <tr>
+        <td><strong>Java 9–21</strong></td>
+        <td>Say what you mean, in fewer words</td>
+        <td>
+          <code>var</code>, <code>record</code>, <code>sealed</code>, pattern matching, text blocks,
+          switch expressions
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Which versions matter</strong>
+  <p>
+    <strong>LTS</strong> (Long-Term Support) releases are what companies actually run:
+    <strong>8</strong>, <strong>11</strong>, <strong>17</strong>, <strong>21</strong>. Everything in
+    between ships features that later land in an LTS. If someone says "we're on 17", they have
+    records, sealed types and text blocks — but not virtual threads or pattern matching for
+    <code>switch</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The same job, 2012 vs today</b></figcaption>
+  <pre><code>// Java 7 — 9 lines of scaffolding to say "sort by name"
+Collections.sort(people, new Comparator&lt;Person&gt;() {
+    @Override
+    public int compare(Person a, Person b) {
+        return a.getName().compareTo(b.getName());
+    }
+});
+
+// Java 8+ — the same instruction, and nothing else
+people.sort(Comparator.comparing(Person::getName));</code></pre>
+</figure>
+
+<h2 id="lambdas"><span class="num">01.</span> Lambdas</h2>
+<p class="lead">
+  A <em class="term">lambda</em> is a function you can store in a variable and pass to a method. It
+  is Java's answer to "I want to give you <strong>behaviour</strong>, not an object."
+</p>
+
+<figure class="code">
+  <figcaption><b>The syntax, from longest to shortest</b></figcaption>
+  <pre><code>(String a, String b) -&gt; { return a.length() - b.length(); }   // full: types + braces + return
+(a, b) -&gt; { return a.length() - b.length(); }                 // types inferred
+(a, b) -&gt; a.length() - b.length()                             // single expression: braces+return implicit
+x -&gt; x * 2                                                    // ONE param: parens optional
+() -&gt; System.out.println("hi")                                // ZERO params: parens required
+() -&gt; { }                                                     // do nothing</code></pre>
+</figure>
+
+<div class="key">
+  <strong>What a lambda really is</strong>
+  <p>
+    A lambda is <strong>not</strong> a new kind of thing in the type system. It is an
+    <strong>instance of a functional interface</strong> — an interface with exactly one abstract
+    method. <code>x -&gt; x * 2</code> has no type by itself; it only means something once the
+    compiler knows which interface you're assigning it to. That's why it's called a
+    <em class="term">target type</em>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The same lambda text, two different types</b></figcaption>
+  <pre><code>interface Doubler   { int apply(int x); }
+interface Describer { String apply(int x); }
+
+Doubler d = x -&gt; x * 2;          // here the lambda IS a Doubler
+Function&lt;Integer,Integer&gt; f = x -&gt; x * 2;   // here the identical text IS a Function
+
+// var v = x -&gt; x * 2;           // COMPILE ERROR — no target type, compiler can't tell what it is</code></pre>
+</figure>
+
+<h3>Capturing — lambdas and effectively final</h3>
+<p>
+  A lambda can use variables from around it. But local variables it captures must be
+  <em class="term">effectively final</em> — assigned once and never changed.
+</p>
+
+<figure class="code">
+  <figcaption><b>What you may and may not capture</b></figcaption>
+  <pre><code>int factor = 2;
+Function&lt;Integer,Integer&gt; f = x -&gt; x * factor;   // OK — factor is effectively final
+// factor = 3;                                    // COMPILE ERROR: adding this line breaks the lambda above
+
+int count = 0;
+list.forEach(x -&gt; count++);      // COMPILE ERROR — can't mutate a captured local
+
+// Fields are fine — only LOCALS have the restriction
+class Counter {
+    int count = 0;
+    void run(List&lt;Integer&gt; list) { list.forEach(x -&gt; count++); }   // OK (but not thread-safe!)
+}</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Why the restriction exists</strong>
+  <p>
+    Local variables live on the <strong>stack</strong>, which dies when the method returns — but the
+    lambda may outlive it (stored in a field, handed to another thread). So Java
+    <strong>copies</strong> the value into the lambda. If the original could still change, you'd
+    have two values silently disagreeing. Forcing "effectively final" makes the copy safe and
+    unambiguous.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Lambdas are not anonymous classes</strong>
+  <p>
+    Inside a lambda, <code>this</code> refers to the <strong>enclosing instance</strong>. Inside an
+    anonymous inner class, <code>this</code> refers to the <strong>anonymous object itself</strong>.
+    Lambdas also don't create a new scope for names — you can't shadow a local variable in a lambda
+    parameter. And lambdas are compiled with <code>invokedynamic</code>, not into a
+    <code>Foo$1.class</code> file.
+  </p>
+</div>
+
+<h2 id="functional-interfaces"><span class="num">02.</span> Functional interfaces</h2>
+<p class="lead">
+  A <em class="term">functional interface</em> has <strong>exactly one abstract method</strong> (a
+  "SAM" — Single Abstract Method). That's the only requirement, and it's what makes a lambda
+  possible.
+</p>
+
+<figure class="code">
+  <figcaption><b>Declaring one</b></figcaption>
+  <pre><code>@FunctionalInterface              // optional, but ALWAYS use it
+interface Validator {
+    boolean validate(String s);   // exactly one abstract method
+
+    // These do NOT count against the limit:
+    default Validator negate() { return s -&gt; !validate(s); }   // default methods are fine
+    static Validator alwaysTrue() { return s -&gt; true; }        // static methods are fine
+}
+
+Validator notEmpty = s -&gt; !s.isEmpty();
+System.out.println(notEmpty.validate("hi"));   // true</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why <code>@FunctionalInterface</code> is worth typing</strong>
+  <p>
+    It's not required — the compiler infers "functional" from the shape. But the annotation makes it
+    a <strong>compile error</strong> for anyone to add a second abstract method later. Without it,
+    someone adds a method, and the breakage shows up as a confusing error at every lambda
+    <em>call site</em> instead of at the interface.
+  </p>
+</div>
+
+<div class="note">
+  <strong>The <code>Object</code> methods don't count</strong>
+  <p>
+    An interface can redeclare <code>equals</code>, <code>hashCode</code> or <code>toString</code>
+    as abstract and still be functional — every object already inherits them from
+    <code>Object</code>, so they don't need implementing. This is exactly why
+    <code>Comparator&lt;T&gt;</code> is functional despite declaring both <code>compare</code> and
+    <code>equals</code>.
+  </p>
+</div>
+
+<h3>The built-in zoo — you rarely need your own</h3>
+<p>
+  <code>java.util.function</code> has ~43 interfaces, but they're all variations on
+  <strong>six</strong>. Learn these and you can read any modern Java API.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Interface</th>
+        <th>Method</th>
+        <th>Takes → Returns</th>
+        <th>Use it for</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Supplier&lt;T&gt;</code></td>
+        <td><code>get()</code></td>
+        <td>nothing → <code>T</code></td>
+        <td>Lazily produce a value</td>
+      </tr>
+      <tr>
+        <td><code>Consumer&lt;T&gt;</code></td>
+        <td><code>accept(T)</code></td>
+        <td><code>T</code> → nothing</td>
+        <td>Do something with it (side effect)</td>
+      </tr>
+      <tr>
+        <td><code>Function&lt;T,R&gt;</code></td>
+        <td><code>apply(T)</code></td>
+        <td><code>T</code> → <code>R</code></td>
+        <td>Transform</td>
+      </tr>
+      <tr>
+        <td><code>Predicate&lt;T&gt;</code></td>
+        <td><code>test(T)</code></td>
+        <td><code>T</code> → <code>boolean</code></td>
+        <td>Ask a yes/no question</td>
+      </tr>
+      <tr>
+        <td><code>UnaryOperator&lt;T&gt;</code></td>
+        <td><code>apply(T)</code></td>
+        <td><code>T</code> → <code>T</code></td>
+        <td>Transform to the same type</td>
+      </tr>
+      <tr>
+        <td><code>BinaryOperator&lt;T&gt;</code></td>
+        <td><code>apply(T,T)</code></td>
+        <td><code>T,T</code> → <code>T</code></td>
+        <td>Combine two into one</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>All six in action</b></figcaption>
+  <pre><code>Supplier&lt;String&gt;          now      = () -&gt; LocalDate.now().toString();
+Consumer&lt;String&gt;          print    = s -&gt; System.out.println(s);
+Function&lt;String,Integer&gt;  length   = s -&gt; s.length();
+Predicate&lt;String&gt;         isEmpty  = s -&gt; s.isEmpty();
+UnaryOperator&lt;String&gt;     shout    = s -&gt; s.toUpperCase();
+BinaryOperator&lt;Integer&gt;   sum      = (a, b) -&gt; a + b;
+
+print.accept(now.get());              // 2026-07-16
+System.out.println(length.apply("hello"));   // 5
+System.out.println(sum.apply(2, 3));         // 5</code></pre>
+</figure>
+
+<h3>The variations</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Means</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Bi*</code></td>
+        <td>Takes two arguments</td>
+        <td><code>BiFunction&lt;T,U,R&gt;</code>, <code>BiConsumer&lt;T,U&gt;</code></td>
+      </tr>
+      <tr>
+        <td><code>Int/Long/Double*</code></td>
+        <td>Primitive version — no boxing</td>
+        <td><code>IntPredicate</code>, <code>IntFunction&lt;R&gt;</code></td>
+      </tr>
+      <tr>
+        <td><code>ToInt/ToLong/ToDouble*</code></td>
+        <td>Returns a primitive</td>
+        <td><code>ToIntFunction&lt;T&gt;</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Why the primitive variants exist</strong>
+  <p>
+    <code>Function&lt;Integer,Integer&gt;</code> boxes every single value into an
+    <code>Integer</code> object — allocation and pointer-chasing on every call.
+    <code>IntUnaryOperator</code> works on raw <code>int</code>. In a hot loop over millions of
+    elements this is a large, measurable difference. It's the same reason
+    <code>IntStream</code> exists.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Composing them — the default methods are the real payoff</b></figcaption>
+  <pre><code>Predicate&lt;String&gt; notNull  = s -&gt; s != null;
+Predicate&lt;String&gt; notBlank = s -&gt; !s.isBlank();
+Predicate&lt;String&gt; valid    = notNull.and(notBlank);       // and / or / negate
+System.out.println(valid.test("  "));    // false
+
+Function&lt;Integer,Integer&gt; times2 = x -&gt; x * 2;
+Function&lt;Integer,Integer&gt; plus3  = x -&gt; x + 3;
+System.out.println(times2.andThen(plus3).apply(5));   // 13  -&gt; (5*2)+3   [times2 FIRST]
+System.out.println(times2.compose(plus3).apply(5));   // 16  -&gt; (5+3)*2   [plus3 FIRST]
+
+Consumer&lt;String&gt; logIt = s -&gt; log.info(s);
+Consumer&lt;String&gt; both  = logIt.andThen(System.out::println);   // run both, in order</code></pre>
+</figure>
+
+<h2 id="method-refs"><span class="num">03.</span> Method references</h2>
+<p class="lead">
+  A <em class="term">method reference</em> is shorthand for a lambda that does nothing but call one
+  existing method. If your lambda is just "call this thing", <code>::</code> says it with less
+  noise.
+</p>
+
+<figure class="code">
+  <figcaption><b>The same thing, twice</b></figcaption>
+  <pre><code>list.forEach(s -&gt; System.out.println(s));   // lambda
+list.forEach(System.out::println);          // method reference — identical behaviour</code></pre>
+</figure>
+
+<h3>The four kinds</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Kind</th>
+        <th>Syntax</th>
+        <th>Equivalent lambda</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1. Static method</td>
+        <td><code>Integer::parseInt</code></td>
+        <td><code>s -&gt; Integer.parseInt(s)</code></td>
+      </tr>
+      <tr>
+        <td>2. Instance method of a <em>specific</em> object</td>
+        <td><code>System.out::println</code></td>
+        <td><code>s -&gt; System.out.println(s)</code></td>
+      </tr>
+      <tr>
+        <td>3. Instance method of an <em>arbitrary</em> object</td>
+        <td><code>String::toUpperCase</code></td>
+        <td><code>s -&gt; s.toUpperCase()</code></td>
+      </tr>
+      <tr>
+        <td>4. Constructor</td>
+        <td><code>ArrayList::new</code></td>
+        <td><code>() -&gt; new ArrayList&lt;&gt;()</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Kind 2 vs kind 3 — the only confusing part</strong>
+  <p>
+    Both look like <code>Thing::method</code>. The difference is what's on the left. If it's an
+    <strong>object</strong> (<code>System.out</code>), that object receives the call and the lambda
+    argument becomes the <em>parameter</em>. If it's a <strong>class</strong> (<code>String</code>),
+    the lambda's <strong>first argument becomes the receiver</strong> — the thing the method is
+    called <em>on</em>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Bound vs unbound, side by side</b></figcaption>
+  <pre><code>// KIND 2 (bound) — the receiver is fixed: always System.out
+Consumer&lt;String&gt; c = System.out::println;
+c.accept("hi");             // System.out.println("hi")   — arg is the PARAMETER
+
+// KIND 3 (unbound) — the receiver is whatever gets passed in
+Function&lt;String,String&gt; f = String::toUpperCase;
+f.apply("hi");              // "hi".toUpperCase()         — arg is the RECEIVER
+
+// Kind 3 with extra args: first arg is the receiver, the rest are parameters
+BiFunction&lt;String,String,Boolean&gt; starts = String::startsWith;
+starts.apply("hello", "he");   // "hello".startsWith("he")  -&gt; true</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Constructor refs are how you plug factories into APIs</b></figcaption>
+  <pre><code>Supplier&lt;List&lt;String&gt;&gt;   maker  = ArrayList::new;      // () -&gt; new ArrayList&lt;&gt;()
+Function&lt;String,Integer&gt;  parser = Integer::new;        // x -&gt; new Integer(x)
+IntFunction&lt;String[]&gt;     array  = String[]::new;       // n -&gt; new String[n]
+
+// The classic use — telling collect() what container to build
+List&lt;String&gt; names = stream.collect(Collectors.toCollection(ArrayList::new));
+String[] arr = stream.toArray(String[]::new);</code></pre>
+</figure>
+
+<h2 id="streams"><span class="num">04.</span> Streams — the mental model</h2>
+<p class="lead">
+  A <em class="term">Stream</em> is <strong>not</strong> a collection. It is a
+  <strong>pipeline</strong> — a recipe for processing elements, which does nothing at all until you
+  ask for a result.
+</p>
+
+<figure class="code">
+  <figcaption><b>Loop vs stream — the shift from "how" to "what"</b></figcaption>
+  <pre><code>// Imperative — you manage the loop, the temp list, the conditions
+List&lt;String&gt; result = new ArrayList&lt;&gt;();
+for (Person p : people) {
+    if (p.getAge() &gt;= 18) {
+        result.add(p.getName().toUpperCase());
+    }
+}
+result.sort(Comparator.naturalOrder());
+
+// Declarative — you describe the outcome
+List&lt;String&gt; result = people.stream()
+    .filter(p -&gt; p.getAge() &gt;= 18)
+    .map(p -&gt; p.getName().toUpperCase())
+    .sorted()
+    .toList();</code></pre>
+</figure>
+
+<h3>The three parts of every pipeline</h3>
+<figure class="code">
+  <figcaption><b>Source → intermediate ops → terminal op</b></figcaption>
+  <pre><code>people.stream()                         // 1. SOURCE       — creates the stream
+      .filter(p -&gt; p.getAge() &gt;= 18)    // 2. INTERMEDIATE — lazy, returns a Stream
+      .map(Person::getName)             // 2. INTERMEDIATE — lazy, returns a Stream
+      .toList();                        // 3. TERMINAL     — triggers everything, returns a result</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Laziness is the whole design</strong>
+  <p>
+    Intermediate operations <strong>build up a plan and return immediately</strong> — they don't
+    touch a single element. Nothing runs until a terminal operation asks for a value. This lets Java
+    fuse the whole pipeline into <strong>one pass</strong> and stop early when it can.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Proof: no terminal op = no work at all</b></figcaption>
+  <pre><code>Stream&lt;String&gt; s = list.stream().map(x -&gt; {
+    System.out.println("mapping " + x);
+    return x.toUpperCase();
+});
+System.out.println("nothing printed yet!");   // ...and indeed nothing was.
+// The map() lambda has never run. Add .toList() and it all fires.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Element-at-a-time, not stage-at-a-time — this surprises everyone</b></figcaption>
+  <pre><code>Stream.of("a", "b", "c")
+    .filter(s -&gt; { System.out.println("filter " + s); return true; })
+    .map(s   -&gt; { System.out.println("map " + s);    return s; })
+    .toList();
+
+// Output — each element goes ALL the way through before the next one starts:
+// filter a
+// map a
+// filter b
+// map b
+// filter c
+// map c
+// NOT: filter a, filter b, filter c, map a, map b, map c</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Short-circuiting — laziness saves real work</b></figcaption>
+  <pre><code>// An INFINITE stream, and yet this terminates instantly:
+Stream.iterate(1, x -&gt; x + 1)     // 1, 2, 3, 4, ... forever
+      .map(x -&gt; x * x)
+      .filter(x -&gt; x % 2 == 1)
+      .limit(3)                   // stop as soon as we have 3
+      .forEach(System.out::println);   // 1  9  25
+
+// Only ~5 elements were ever generated. An eager implementation would hang forever.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>A stream is single-use</strong>
+  <p>
+    Once a terminal operation runs, the stream is consumed. Touching it again throws
+    <code>IllegalStateException: stream has already been operated upon or closed</code>. If you need
+    two results, either collect once and reuse the collection, or build the stream twice from the
+    source.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The single-use trap</b></figcaption>
+  <pre><code>Stream&lt;String&gt; s = list.stream();
+s.forEach(System.out::println);   // fine
+long n = s.count();               // IllegalStateException!
+
+// Fix: make a new stream each time
+list.stream().forEach(System.out::println);
+long n = list.stream().count();</code></pre>
+</figure>
+
+<div class="analogy">
+  <p>
+    A <code>List</code> is a <strong>warehouse of boxes</strong> — the goods exist, sitting there. A
+    <code>Stream</code> is a <strong>conveyor belt with instructions posted along it</strong>
+    ("inspect here", "relabel there"). Posting instructions costs nothing. Only when someone at the
+    end says "fill this crate" does the belt start moving — and each box travels the entire belt
+    before the next one is released. Once the belt has run, it's done; you can't rewind it.
+  </p>
+</div>
+
+<h3>Creating streams</h3>
+<figure class="code">
+  <figcaption><b>Every source you'll actually use</b></figcaption>
+  <pre><code>list.stream()                             // from any Collection
+Arrays.stream(arr)                        // from an array
+Stream.of("a", "b", "c")                  // from explicit values
+Stream.empty()                            // zero elements
+Stream.iterate(1, x -&gt; x + 1)             // infinite: 1, 2, 3...
+Stream.iterate(1, x -&gt; x &lt; 100, x -&gt; x * 2)  // Java 9+: with a built-in stop condition
+Stream.generate(Math::random)             // infinite: random values
+IntStream.range(0, 5)                     // 0,1,2,3,4   (upper bound EXCLUSIVE)
+IntStream.rangeClosed(1, 5)               // 1,2,3,4,5   (upper bound INCLUSIVE)
+"a,b,c".chars()                           // IntStream of chars
+Files.lines(path)                         // stream a file lazily (close it!)
+map.entrySet().stream()                   // streaming a Map</code></pre>
+</figure>
+
+<h2 id="stream-ops"><span class="num">05.</span> Stream operations &amp; collectors</h2>
+<p class="lead">
+  Four verbs carry most of the work: <strong>filter</strong> (fewer),
+  <strong>map</strong> (different), <strong>reduce</strong> (one), <strong>collect</strong> (into a
+  container).
+</p>
+
+<h3>Intermediate operations</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Does</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>filter(Predicate)</code></td>
+        <td>Keep elements that match</td>
+      </tr>
+      <tr>
+        <td><code>map(Function)</code></td>
+        <td>Transform each element 1→1</td>
+      </tr>
+      <tr>
+        <td><code>flatMap(Function)</code></td>
+        <td>Transform each element 1→many, then flatten</td>
+      </tr>
+      <tr>
+        <td><code>distinct()</code></td>
+        <td>Remove duplicates (uses <code>equals</code>/<code>hashCode</code>)</td>
+      </tr>
+      <tr>
+        <td><code>sorted()</code> / <code>sorted(Comparator)</code></td>
+        <td>Sort (stateful — must buffer everything)</td>
+      </tr>
+      <tr>
+        <td><code>limit(n)</code> / <code>skip(n)</code></td>
+        <td>First n / drop first n</td>
+      </tr>
+      <tr>
+        <td><code>peek(Consumer)</code></td>
+        <td>Look at each element as it passes — <strong>debugging only</strong></td>
+      </tr>
+      <tr>
+        <td><code>takeWhile</code> / <code>dropWhile</code></td>
+        <td>Java 9+: take/drop while a predicate holds, then stop</td>
+      </tr>
+      <tr>
+        <td><code>mapToInt/Obj/...</code></td>
+        <td>Switch between object and primitive streams</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>flatMap — the one people get stuck on</b></figcaption>
+  <pre><code>List&lt;List&lt;String&gt;&gt; nested = List.of(
+    List.of("a", "b"),
+    List.of("c", "d")
+);
+
+// map gives you a Stream of Lists — still nested, probably not what you want
+Stream&lt;List&lt;String&gt;&gt; wrong = nested.stream().map(x -&gt; x);
+
+// flatMap flattens one level: Stream&lt;List&lt;String&gt;&gt; -&gt; Stream&lt;String&gt;
+List&lt;String&gt; flat = nested.stream()
+    .flatMap(List::stream)         // each list becomes its elements
+    .toList();                     // [a, b, c, d]
+
+// Real use: every order's every item, as one stream
+List&lt;Item&gt; allItems = orders.stream()
+    .flatMap(o -&gt; o.getItems().stream())
+    .toList();</code></pre>
+</figure>
+
+<div class="key">
+  <strong>map vs flatMap in one line</strong>
+  <p>
+    <code>map</code>: one in → <strong>one</strong> out. <code>flatMap</code>: one in →
+    <strong>a stream</strong> out, all of which get spliced into a single flat stream. Use
+    <code>flatMap</code> whenever <code>map</code> would leave you holding a
+    <code>Stream&lt;List&lt;X&gt;&gt;</code> or <code>Stream&lt;Optional&lt;X&gt;&gt;</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>takeWhile vs filter — stop vs skip</b></figcaption>
+  <pre><code>List&lt;Integer&gt; nums = List.of(1, 2, 3, 10, 4, 5);
+
+nums.stream().filter(n -&gt; n &lt; 5).toList();      // [1, 2, 3, 4]  — checks ALL, keeps matches
+nums.stream().takeWhile(n -&gt; n &lt; 5).toList();   // [1, 2, 3]     — STOPS at the first failure (10)
+nums.stream().dropWhile(n -&gt; n &lt; 5).toList();   // [10, 4, 5]    — drops until first failure, keeps rest</code></pre>
+</figure>
+
+<h3>Terminal operations</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Returns</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>toList()</code> (Java 16+)</td>
+        <td>An <strong>unmodifiable</strong> <code>List</code> — the modern default</td>
+      </tr>
+      <tr>
+        <td><code>collect(Collector)</code></td>
+        <td>Anything — see collectors below</td>
+      </tr>
+      <tr>
+        <td><code>forEach(Consumer)</code></td>
+        <td>Nothing — side effects only</td>
+      </tr>
+      <tr>
+        <td><code>reduce(...)</code></td>
+        <td>One combined value</td>
+      </tr>
+      <tr>
+        <td><code>count()</code></td>
+        <td><code>long</code></td>
+      </tr>
+      <tr>
+        <td><code>anyMatch</code>/<code>allMatch</code>/<code>noneMatch</code></td>
+        <td><code>boolean</code> (short-circuits)</td>
+      </tr>
+      <tr>
+        <td><code>findFirst()</code>/<code>findAny()</code></td>
+        <td><code>Optional&lt;T&gt;</code> (short-circuits)</td>
+      </tr>
+      <tr>
+        <td><code>min</code>/<code>max(Comparator)</code></td>
+        <td><code>Optional&lt;T&gt;</code></td>
+      </tr>
+      <tr>
+        <td><code>toArray()</code></td>
+        <td>An array</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>reduce — three forms, increasing power</b></figcaption>
+  <pre><code>List&lt;Integer&gt; nums = List.of(1, 2, 3, 4);
+
+// 1. No identity -&gt; Optional (the stream might be empty!)
+Optional&lt;Integer&gt; sum1 = nums.stream().reduce((a, b) -&gt; a + b);   // Optional[10]
+
+// 2. With identity -&gt; plain value (identity is the answer for an empty stream)
+int sum2 = nums.stream().reduce(0, (a, b) -&gt; a + b);               // 10
+int sum3 = nums.stream().reduce(0, Integer::sum);                  // same, clearer
+
+// 3. With identity + combiner -&gt; for parallel streams / different result type
+int totalChars = words.stream()
+    .reduce(0,
+            (acc, w) -&gt; acc + w.length(),   // accumulator: partial + element
+            Integer::sum);                  // combiner: merges partials (parallel only)
+
+// In practice, prefer the specialised version — clearer and no boxing:
+int sum4 = nums.stream().mapToInt(Integer::intValue).sum();</code></pre>
+</figure>
+
+<div class="note">
+  <strong>The identity must be a true identity</strong>
+  <p>
+    <code>reduce(identity, op)</code> requires <code>op(identity, x) == x</code> for every
+    <code>x</code>. For <code>+</code> that's <code>0</code>; for <code>*</code> it's
+    <code>1</code>; for string concat it's <code>""</code>. Use <code>1</code> for a sum and a
+    parallel stream will quietly give you the wrong answer, because the identity gets applied once
+    per chunk.
+  </p>
+</div>
+
+<h3>Collectors — where results actually get built</h3>
+<figure class="code">
+  <figcaption><b>The ones worth memorising</b></figcaption>
+  <pre><code>import static java.util.stream.Collectors.*;
+
+// --- to containers ---
+.collect(toList())                 // mutable ArrayList (pre-16 default)
+.toList()                          // Java 16+: UNMODIFIABLE — prefer this
+.collect(toSet())
+.collect(toCollection(TreeSet::new))          // pick the exact implementation
+.collect(toMap(Person::getId, Person::getName))   // key fn, value fn
+
+// --- to a String ---
+.collect(joining())                // "abc"
+.collect(joining(", "))            // "a, b, c"
+.collect(joining(", ", "[", "]"))  // "[a, b, c]"   (delimiter, prefix, suffix)
+
+// --- grouping: the most useful one in real code ---
+Map&lt;String, List&lt;Person&gt;&gt; byCity =
+    people.stream().collect(groupingBy(Person::getCity));
+
+Map&lt;String, Long&gt; countByCity =
+    people.stream().collect(groupingBy(Person::getCity, counting()));
+
+Map&lt;String, List&lt;String&gt;&gt; namesByCity =
+    people.stream().collect(groupingBy(Person::getCity, mapping(Person::getName, toList())));
+
+// --- partitioning: groupingBy for a boolean; ALWAYS has both true and false keys ---
+Map&lt;Boolean, List&lt;Person&gt;&gt; adults =
+    people.stream().collect(partitioningBy(p -&gt; p.getAge() &gt;= 18));
+
+// --- numbers ---
+.collect(counting())
+.collect(summingInt(Person::getAge))
+.collect(averagingInt(Person::getAge))
+.collect(summarizingInt(Person::getAge))   // count+sum+min+max+average in one pass</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Two <code>toMap</code> traps</strong>
+  <p>
+    <strong>1. Duplicate keys throw</strong> <code>IllegalStateException</code>. Pass a merge
+    function to decide: <code>toMap(k, v, (a, b) -&gt; a)</code>.
+    <strong>2. Null values throw NPE</strong> — <code>toMap</code> uses
+    <code>Map.merge</code> internally, which forbids nulls, even for a <code>HashMap</code> that
+    would otherwise allow them.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>toMap done safely</b></figcaption>
+  <pre><code>// Throws if two people share a city:
+Map&lt;String,String&gt; m = people.stream().collect(toMap(Person::getCity, Person::getName));
+
+// Explicit about collisions — keep the first:
+Map&lt;String,String&gt; m = people.stream()
+    .collect(toMap(Person::getCity, Person::getName, (first, second) -&gt; first));
+
+// ...or pick the map implementation too:
+Map&lt;String,String&gt; m = people.stream()
+    .collect(toMap(Person::getCity, Person::getName, (a, b) -&gt; a, TreeMap::new));</code></pre>
+</figure>
+
+<h3>Parallel streams — the honest guidance</h3>
+<figure class="code">
+  <figcaption><b>One word, and a lot of caveats</b></figcaption>
+  <pre><code>long count = hugeList.parallelStream()
+    .filter(x -&gt; expensive(x))
+    .count();
+// Splits across the common ForkJoinPool (CPU cores - 1 threads, shared JVM-wide)</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Parallel is usually slower</strong>
+  <p>
+    Splitting, coordinating and merging costs real time. It only pays off with a
+    <strong>large</strong> dataset, a <strong>CPU-bound</strong> per-element cost, and an
+    <strong>easily splittable</strong> source (<code>ArrayList</code>, arrays — not
+    <code>LinkedList</code>). Worse, it uses the <strong>shared common pool</strong>, so one slow
+    parallel stream can stall unrelated code across the JVM. Never use it for blocking I/O.
+    <strong>Measure, don't guess.</strong>
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption>
+    <b>Never do this — the stream contract requires no shared mutable state</b>
+  </figcaption>
+  <pre><code>List&lt;String&gt; results = new ArrayList&lt;&gt;();
+list.parallelStream().forEach(results::add);   // BROKEN — ArrayList isn't thread-safe.
+                                               // Lost updates, or ArrayIndexOutOfBoundsException.
+// Correct — let collect() handle the merging:
+List&lt;String&gt; results = list.parallelStream().toList();</code></pre>
+</figure>
+
+<h2 id="optional"><span class="num">06.</span> Optional</h2>
+<p class="lead">
+  <code>Optional&lt;T&gt;</code> is a box that holds either a value or nothing. Its purpose is to
+  make "there might be no answer" <strong>part of the type</strong>, so the compiler forces the
+  caller to think about it instead of being ambushed by a <code>NullPointerException</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>The problem it solves</b></figcaption>
+  <pre><code>// Returning null: the signature LIES. It says "returns User", so callers trust it.
+User findUser(String id) { return null; }
+findUser("x").getName();      // NullPointerException at runtime
+
+// Returning Optional: the signature is HONEST — "maybe a User"
+Optional&lt;User&gt; findUser(String id) { return Optional.empty(); }
+findUser("x").map(User::getName).orElse("unknown");   // caller cannot forget</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Creating and unwrapping</b></figcaption>
+  <pre><code>// --- create ---
+Optional.of(value)            // value MUST be non-null, else immediate NPE
+Optional.ofNullable(value)    // null becomes empty — use this for legacy APIs
+Optional.empty()
+
+// --- unwrap ---
+opt.orElse("default")                 // eager: the default is ALWAYS evaluated
+opt.orElseGet(() -&gt; compute())        // lazy:  only called if empty  &lt;- prefer this
+opt.orElseThrow()                     // Java 10+: NoSuchElementException if empty
+opt.orElseThrow(() -&gt; new UserNotFound(id))
+opt.ifPresent(v -&gt; use(v))
+opt.ifPresentOrElse(v -&gt; use(v), () -&gt; log.warn("missing"))   // Java 9+
+
+// --- transform, without ever unwrapping ---
+opt.map(User::getName)                     // Optional&lt;User&gt; -&gt; Optional&lt;String&gt;
+opt.filter(u -&gt; u.getAge() &gt;= 18)          // empty if it doesn't match
+opt.flatMap(u -&gt; u.findManager())          // when the fn ITSELF returns an Optional
+opt.or(() -&gt; findInCache(id))              // Java 9+: fallback Optional</code></pre>
+</figure>
+
+<div class="key">
+  <strong><code>orElse</code> vs <code>orElseGet</code> — a real bug, not a style nit</strong>
+  <p>
+    <code>orElse(expensive())</code> evaluates <code>expensive()</code>
+    <strong>every time — even when the Optional has a value</strong>, because it's just a method
+    argument. <code>orElseGet(() -&gt; expensive())</code> only runs it when empty. If the default
+    hits a database, inserts a row, or costs real money, this is a genuine defect.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>See it happen</b></figcaption>
+  <pre><code>String expensive() { System.out.println("called!"); return "default"; }
+
+Optional&lt;String&gt; present = Optional.of("actual");
+present.orElse(expensive());          // prints "called!"  — then returns "actual". Wasted.
+present.orElseGet(() -&gt; expensive()); // prints nothing    — returns "actual".</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Chaining beats nested null checks</b></figcaption>
+  <pre><code>// Before — the arrow of doom
+String city = null;
+if (user != null) {
+    Address a = user.getAddress();
+    if (a != null) {
+        City c = a.getCity();
+        if (c != null) city = c.getName();
+    }
+}
+if (city == null) city = "unknown";
+
+// After — one expression, no way to get it wrong
+String city = Optional.ofNullable(user)
+    .map(User::getAddress)
+    .map(Address::getCity)
+    .map(City::getName)
+    .orElse("unknown");</code></pre>
+</figure>
+
+<div class="dd">
+  <div class="do">
+    <h5>✓ Do</h5>
+    <ul>
+      <li>Use it as a <strong>return type</strong> for "might legitimately find nothing".</li>
+      <li>Chain with <code>map</code>/<code>flatMap</code>/<code>filter</code>.</li>
+      <li>Use <code>orElseGet</code> when the default costs anything.</li>
+      <li>Use <code>orElseThrow</code> when absence really is an error.</li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h5>✗ Don't</h5>
+    <ul>
+      <li>
+        Use it as a <strong>field</strong> — it isn't <code>Serializable</code> and adds a wrapper
+        per object.
+      </li>
+      <li>Use it as a <strong>parameter</strong> — callers must wrap; just overload the method.</li>
+      <li>Return <code>Optional&lt;List&gt;</code> — return an empty list instead.</li>
+      <li>
+        Call <code>get()</code> — deprecated in spirit; <code>orElseThrow()</code> says the same
+        thing honestly.
+      </li>
+      <li>
+        Write <code>if (opt.isPresent()) opt.get()</code> — that's just a null check with extra
+        steps.
+      </li>
+    </ul>
+  </div>
+</div>
+
+<div class="warn">
+  <strong><code>Optional</code> can itself be null</strong>
+  <p>
+    <code>return null;</code> from a method declared <code>Optional&lt;T&gt;</code> compiles fine
+    and is the single worst thing you can do with it — the caller's <code>.map()</code> NPEs on the
+    very thing meant to prevent NPEs. Return <code>Optional.empty()</code>.
+  </p>
+</div>
+
+<h2 id="records"><span class="num">07.</span> Records (Java 16+)</h2>
+<p class="lead">
+  A <em class="term">record</em> is a class whose only job is to hold data. You declare the fields;
+  Java writes the constructor, accessors, <code>equals</code>, <code>hashCode</code> and
+  <code>toString</code> for you.
+</p>
+
+<figure class="code">
+  <figcaption><b>Before — 40 lines to hold two values</b></figcaption>
+  <pre><code>public final class Point {
+    private final int x;
+    private final int y;
+
+    public Point(int x, int y) { this.x = x; this.y = y; }
+
+    public int getX() { return x; }
+    public int getY() { return y; }
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Point)) return false;
+        Point p = (Point) o;
+        return x == p.x &amp;&amp; y == p.y;
+    }
+    @Override public int hashCode() { return Objects.hash(x, y); }
+    @Override public String toString() { return "Point[x=" + x + ", y=" + y + "]"; }
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>After — identical behaviour</b></figcaption>
+  <pre><code>public record Point(int x, int y) { }
+
+Point p = new Point(1, 2);
+p.x();                              // 1        — note: x(), NOT getX()
+System.out.println(p);              // Point[x=1, y=2]
+p.equals(new Point(1, 2));          // true     — value equality, for free</code></pre>
+</figure>
+
+<div class="key">
+  <strong>What you get automatically</strong>
+  <p>
+    A <strong>canonical constructor</strong> · an <strong>accessor per component</strong> named
+    <code>x()</code> not <code>getX()</code> · <strong><code>equals</code></strong> comparing all
+    components · a matching <strong><code>hashCode</code></strong> · a readable
+    <strong><code>toString</code></strong
+    >. The class is <code>final</code> and every field is <code>private final</code>.
+  </p>
+</div>
+
+<h3>Rules and limits</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Can it…</th>
+        <th></th>
+        <th>Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Extend a class</td>
+        <td><span class="no">No</span></td>
+        <td>
+          Implicitly extends <code>java.lang.Record</code>; also implicitly <code>final</code>
+        </td>
+      </tr>
+      <tr>
+        <td>Implement interfaces</td>
+        <td><span class="yes">Yes</span></td>
+        <td>Very common — especially with <code>sealed</code></td>
+      </tr>
+      <tr>
+        <td>Have instance methods</td>
+        <td><span class="yes">Yes</span></td>
+        <td>Add any behaviour you like</td>
+      </tr>
+      <tr>
+        <td>Have static fields/methods</td>
+        <td><span class="yes">Yes</span></td>
+        <td>Factories, constants</td>
+      </tr>
+      <tr>
+        <td>Have extra <em>instance</em> fields</td>
+        <td><span class="no">No</span></td>
+        <td>State is exactly the components — that's the whole promise</td>
+      </tr>
+      <tr>
+        <td>Be mutable</td>
+        <td><span class="no">No</span></td>
+        <td>All components are <code>final</code></td>
+      </tr>
+      <tr>
+        <td>Override the generated members</td>
+        <td><span class="yes">Yes</span></td>
+        <td>Write your own <code>toString</code> etc. if you want</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>The compact constructor — validation and normalisation</b></figcaption>
+  <pre><code>public record Range(int lo, int hi) {
+
+    // Compact form: no parameter list, no assignments. Runs BEFORE the fields are set.
+    public Range {
+        if (lo &gt; hi) throw new IllegalArgumentException("lo &gt; hi: " + lo + " &gt; " + hi);
+        lo = Math.max(lo, 0);      // reassigning the PARAMETER normalises what gets stored
+    }
+
+    // Extra behaviour is fine
+    public int length() { return hi - lo; }
+
+    // Static factory
+    public static Range of(int lo, int hi) { return new Range(lo, hi); }
+}
+
+new Range(5, 3);     // IllegalArgumentException
+new Range(-4, 10);   // stored as Range[lo=0, hi=10]</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Records are shallowly immutable</strong>
+  <p>
+    <code>record Team(String name, List&lt;String&gt; members)</code> — the <code>members</code>
+    <em>reference</em> can't be reassigned, but the list itself can still be mutated by anyone
+    holding it. For true immutability, defensively copy in the compact constructor:
+    <code>members = List.copyOf(members);</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Defensive copying</b></figcaption>
+  <pre><code>public record Team(String name, List&lt;String&gt; members) {
+    public Team {
+        members = List.copyOf(members);   // now genuinely immutable (also rejects nulls)
+    }
+}
+
+List&lt;String&gt; src = new ArrayList&lt;&gt;(List.of("ann"));
+Team t = new Team("A", src);
+src.add("bob");
+System.out.println(t.members());   // [ann] — unaffected. Without the copy: [ann, bob].</code></pre>
+</figure>
+
+<h2 id="sealed"><span class="num">08.</span> Sealed types (Java 17+)</h2>
+<p class="lead">
+  <code>sealed</code> lets a type declare <strong>exactly which types may extend it</strong>. It
+  turns "anyone can subclass this" into a closed, known list — which the compiler can then reason
+  about.
+</p>
+
+<figure class="code">
+  <figcaption><b>Declaring a closed hierarchy</b></figcaption>
+  <pre><code>public sealed interface Shape permits Circle, Square, Triangle { }
+
+public record Circle(double radius)          implements Shape { }
+public record Square(double side)            implements Shape { }
+public record Triangle(double b, double h)   implements Shape { }
+
+// Elsewhere:
+// public class Hexagon implements Shape { }   // COMPILE ERROR — not in the permits list</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Why this is more than access control</strong>
+  <p>
+    <code>final</code> says "nobody may extend me". <code>sealed</code> says "only
+    <strong>these</strong> may". Because the list is closed and known at compile time, the compiler
+    can verify a <code>switch</code> covers <strong>every</strong> case — so you get
+    <strong>exhaustiveness checking</strong>, and no <code>default</code> branch. Add a fourth shape
+    and every switch that forgot it becomes a compile error, not a 3am bug.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Sealed + records + switch — the modern combination</b></figcaption>
+  <pre><code>double area(Shape s) {
+    return switch (s) {                      // no `default` needed — the compiler knows the full list
+        case Circle c   -&gt; Math.PI * c.radius() * c.radius();
+        case Square q   -&gt; q.side() * q.side();
+        case Triangle t -&gt; 0.5 * t.b() * t.h();
+    };
+}
+// Add `record Hexagon(...) implements Shape` to the permits list
+// and THIS METHOD STOPS COMPILING until you handle it. That's the payoff.</code></pre>
+</figure>
+
+<h3>The three choices for every subtype</h3>
+<p>Every permitted subclass must pick one, so the hierarchy can't leak open again:</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Modifier</th>
+        <th>Means</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>final</code></td>
+        <td>The line stops here (records are automatically final)</td>
+      </tr>
+      <tr>
+        <td><code>sealed</code></td>
+        <td>Continue with another closed list</td>
+      </tr>
+      <tr>
+        <td><code>non-sealed</code></td>
+        <td>Deliberately reopen — anyone may extend this branch</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>All three</b></figcaption>
+  <pre><code>public sealed class Vehicle permits Car, Truck, Toy { }
+
+public final class Car extends Vehicle { }                       // closed
+public sealed class Truck extends Vehicle permits Pickup { }     // narrows further
+public non-sealed class Toy extends Vehicle { }                  // reopened — anyone can extend Toy
+public final class Pickup extends Truck { }</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Where the subtypes must live</strong>
+  <p>
+    Permitted subclasses must be in the <strong>same module</strong> (or the same
+    <strong>package</strong> if you're not using modules). You can omit
+    <code>permits</code> entirely if all subtypes are in the <strong>same source file</strong> — the
+    compiler infers the list.
+  </p>
+</div>
+
+<h2 id="pattern-matching"><span class="num">09.</span> Pattern matching</h2>
+<p class="lead">
+  Pattern matching removes the "test, then cast, then assign" ritual that Java made you type for
+  twenty-five years.
+</p>
+
+<h3>Pattern matching for <code>instanceof</code> (Java 16+)</h3>
+<figure class="code">
+  <figcaption><b>The cast disappears</b></figcaption>
+  <pre><code>// Before — say "String" three times
+if (o instanceof String) {
+    String s = (String) o;
+    if (s.length() &gt; 5) { ... }
+}
+
+// After — bind it right in the test
+if (o instanceof String s &amp;&amp; s.length() &gt; 5) { ... }
+// `s` is in scope wherever the check is known to be true. Note &amp;&amp; works because
+// the compiler knows the left side passed.</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Flow scoping — the binding reaches further than you'd expect</b></figcaption>
+  <pre><code>// The guard clause style works too — s is in scope AFTER the if, because
+// the method already returned if the test failed.
+void f(Object o) {
+    if (!(o instanceof String s)) return;
+    System.out.println(s.length());     // fine — we can only be here if o IS a String
+}
+
+// It makes equals() genuinely pleasant:
+@Override public boolean equals(Object o) {
+    return o instanceof Point p &amp;&amp; p.x == x &amp;&amp; p.y == y;
+}</code></pre>
+</figure>
+
+<h3>Pattern matching for <code>switch</code> (Java 21)</h3>
+<figure class="code">
+  <figcaption><b>Switching on type</b></figcaption>
+  <pre><code>String describe(Object o) {
+    return switch (o) {
+        case null        -&gt; "nothing";              // switch can handle null explicitly now!
+        case Integer i   -&gt; "int: " + i;
+        case String s    -&gt; "string of length " + s.length();
+        case int[] arr   -&gt; "int array of " + arr.length;
+        default          -&gt; "something else";
+    };
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Order matters — and the compiler enforces it</strong>
+  <p>
+    Cases are tried top to bottom, so a broader pattern before a narrower one makes the narrower
+    unreachable. Unlike the old <code>switch</code>, this is a <strong>compile error</strong>
+    ("label is dominated by a preceding case label"), not a silent bug.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption>
+    <b>Guards with <code>when</code></b>
+  </figcaption>
+  <pre><code>String classify(Object o) {
+    return switch (o) {
+        case Integer i when i &lt; 0   -&gt; "negative";     // guard: type AND condition
+        case Integer i when i == 0  -&gt; "zero";
+        case Integer i              -&gt; "positive";      // the catch-all for Integer
+        case String s when s.isBlank() -&gt; "blank string";
+        case String s               -&gt; "string: " + s;
+        default                     -&gt; "other";
+    };
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Record patterns (Java 21) — destructuring</b></figcaption>
+  <pre><code>record Point(int x, int y) { }
+record Line(Point start, Point end) { }
+
+String describe(Object o) {
+    return switch (o) {
+        // pull the components straight out — no accessor calls
+        case Point(int x, int y) when x == y -&gt; "diagonal point at " + x;
+        case Point(int x, int y)             -&gt; "point " + x + "," + y;
+
+        // and it NESTS
+        case Line(Point(var x1, var y1), Point(var x2, var y2)) -&gt;
+            "line from " + x1 + "," + y1 + " to " + x2 + "," + y2;
+
+        default -&gt; "unknown";
+    };
+}</code></pre>
+</figure>
+
+<div class="note">
+  <strong>The null rule changed</strong>
+  <p>
+    Old <code>switch</code> threw <code>NullPointerException</code> on a null selector. A
+    <code>switch</code> with patterns still throws NPE <strong>unless</strong> you write
+    <code>case null</code>. Adding <code>case null, default -&gt; ...</code> lets one branch handle
+    both.
+  </p>
+</div>
+
+<h3>Switch expressions (Java 14+) — the foundation for all of the above</h3>
+<figure class="code">
+  <figcaption><b>Arrow labels: no fall-through, and it returns a value</b></figcaption>
+  <pre><code>// Old statement switch — break-or-bug, and `result` must be declared outside
+int numLetters;
+switch (day) {
+    case MONDAY:
+    case FRIDAY:
+        numLetters = 6;
+        break;            // forget this and you fall through. Silently.
+    default:
+        numLetters = 0;
+}
+
+// New expression switch — no break, no fall-through, assigns directly
+int numLetters = switch (day) {
+    case MONDAY, FRIDAY -&gt; 6;         // multiple labels, comma-separated
+    case TUESDAY        -&gt; 7;
+    default             -&gt; 0;
+};
+
+// Need multiple statements? Use a block and `yield` to produce the value.
+int n = switch (day) {
+    case MONDAY -&gt; {
+        log.info("start of week");
+        yield 6;
+    }
+    default -&gt; 0;
+};</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Expression switch is exhaustive by construction</strong>
+  <p>
+    Because it must produce a value, the compiler requires every input be covered — via
+    <code>default</code>, or by covering every constant of an <code>enum</code> or every permitted
+    subtype of a <code>sealed</code> type. That's why sealed + switch is such a strong pairing.
+  </p>
+</div>
+
+<h2 id="text-blocks"><span class="num">10.</span> Text blocks (Java 15+)</h2>
+<p class="lead">
+  A <em class="term">text block</em> is a multi-line string literal. It exists so that embedded
+  JSON, SQL and HTML stop looking like a ransom note of <code>\n</code> and <code>\"</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Before and after</b></figcaption>
+  <pre><code>// Before
+String json = "{\n" +
+              "  \"name\": \"Ann\",\n" +
+              "  \"age\": 30\n" +
+              "}";
+
+// After — what you see is what you get
+String json = """
+    {
+      "name": "Ann",
+      "age": 30
+    }""";</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Incidental whitespace is stripped automatically</strong>
+  <p>
+    Java finds the <strong>least-indented non-blank line</strong> (the closing <code>"""</code>
+    counts too) and removes that much indentation from every line. So you can indent the block to
+    match your code without that indentation ending up in the string.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The closing delimiter controls the indentation</b></figcaption>
+  <pre><code>String a = """
+        hello
+        world""";          // closing quotes on the last line -&gt; no trailing newline
+// "hello\nworld"
+
+String b = """
+        hello
+        world
+        """;               // closing quotes on their OWN line -&gt; trailing newline kept
+// "hello\nworld\n"
+
+String c = """
+        hello
+        world
+    """;                   // closing quotes indented LESS -&gt; 4 extra spaces on every line
+// "    hello\n    world\n"</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>The two escapes that only exist here</b></figcaption>
+  <pre><code>// \  at end of line — join lines (suppress the newline). Good for long single-line text.
+String s = """
+    This is one very long line \
+    that I wrote across two lines.""";
+// "This is one very long line that I wrote across two lines."
+
+// \s — a literal space that also protects trailing whitespace from being stripped
+String t = """
+    trailing   \s
+    """;
+
+// Quotes need no escaping at all:
+String sql = """
+    SELECT * FROM "users" WHERE name = 'Ann'
+    """;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Text blocks are just <code>String</code></strong>
+  <p>
+    No new type, no runtime cost — it's compile-time syntax. Constants are still interned, and
+    <code>.formatted(...)</code> pairs nicely: <code>"""...%s...""".formatted(name)</code>. Note
+    that the opening <code>"""</code> <strong>must</strong> be followed by a line break; text can't
+    start on the same line.
+  </p>
+</div>
+
+<h2 id="misc"><span class="num">11.</span> The rest worth knowing</h2>
+<p class="lead">A grab bag of smaller things that show up constantly in modern code.</p>
+
+<h3><code>var</code> (Java 10)</h3>
+<figure class="code">
+  <figcaption><b>Inferred local types</b></figcaption>
+  <pre><code>var list = new ArrayList&lt;String&gt;();     // ArrayList&lt;String&gt;
+var map  = new HashMap&lt;String, List&lt;Integer&gt;&gt;();   // saves a genuinely painful line
+for (var entry : map.entrySet()) { ... }
+
+// var is NOT dynamic typing — the type is fixed at compile time:
+var s = "hello";
+// s = 42;        // COMPILE ERROR — s is a String, permanently
+
+// Where var is NOT allowed:
+// var x;                  // no initialiser -&gt; nothing to infer
+// var y = null;           // null has no useful type
+// var f = () -&gt; 1;        // lambdas need a target type
+// class C { var field; }  // locals only: no fields, no params, no return types</code></pre>
+</figure>
+
+<div class="dd">
+  <div class="do">
+    <h5>✓ Use var when</h5>
+    <ul>
+      <li>The type is obvious from the right-hand side: <code>var user = new User();</code></li>
+      <li>The type is long and noisy: <code>Map&lt;String, List&lt;Order&gt;&gt;</code></li>
+      <li>In a <code>for</code> loop over an obvious collection.</li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h5>✗ Avoid var when</h5>
+    <ul>
+      <li>
+        The right side is a method call: <code>var x = process();</code> — what is <code>x</code>?
+      </li>
+      <li>It hides an important distinction (e.g. <code>List</code> vs <code>ArrayList</code>).</li>
+      <li>Readers would have to hover in an IDE to follow the code.</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Collection factories (Java 9)</h3>
+<figure class="code">
+  <figcaption><b>Immutable collections in one line</b></figcaption>
+  <pre><code>List&lt;String&gt;        l = List.of("a", "b", "c");
+Set&lt;String&gt;         s = Set.of("a", "b");
+Map&lt;String,Integer&gt; m = Map.of("a", 1, "b", 2);
+Map&lt;String,Integer&gt; big = Map.ofEntries(Map.entry("a", 1), Map.entry("b", 2));
+
+// Genuinely IMMUTABLE — not a view, not a wrapper:
+l.add("d");        // UnsupportedOperationException
+
+// And they reject nulls outright:
+List.of("a", null);   // NullPointerException
+
+// Copy an existing one:
+List&lt;String&gt; copy = List.copyOf(existingList);</code></pre>
+</figure>
+
+<div class="warn">
+  <strong><code>List.of()</code> vs <code>Arrays.asList()</code></strong>
+  <p>
+    <code>Arrays.asList</code> returns a <strong>fixed-size view backed by the array</strong>: you
+    can't add, but you <em>can</em> <code>set</code>, and writes pass through to the original array.
+    <code>List.of</code> is fully immutable and rejects nulls. They are not interchangeable.
+  </p>
+</div>
+
+<h3>Useful String methods (Java 11+)</h3>
+<figure class="code">
+  <figcaption><b>Small, constantly used</b></figcaption>
+  <pre><code>"  ".isBlank();              // true  — isEmpty() only checks length == 0
+"  hi  ".strip();            // "hi"  — Unicode-aware; trim() only handles ASCII spaces
+"ab".repeat(3);              // "ababab"
+"a\nb".lines();              // Stream&lt;String&gt; of lines
+"Hi %s".formatted("Ann");    // "Hi Ann"  — instance-method form of String.format</code></pre>
+</figure>
+
+<h3>Where Java 21 goes next</h3>
+<div class="note">
+  <strong>Virtual threads &amp; sequenced collections</strong>
+  <p>
+    Java 21's headline feature is <strong>virtual threads</strong> — millions of cheap threads,
+    covered in the <a href="concurrency.html">Concurrency</a> notes. It also added
+    <strong>sequenced collections</strong>: <code>SequencedCollection</code> gives any ordered
+    collection <code>getFirst()</code>, <code>getLast()</code>, <code>addFirst()</code>,
+    <code>addLast()</code> and <code>reversed()</code> — so <code>list.getFirst()</code> finally
+    replaces <code>list.get(0)</code>.
+  </p>
+</div>
+
+<h2 id="gotchas"><span class="num">12.</span> Gotchas — where Java surprises you</h2>
+
+<div class="qa">
+  <p class="q">1. Streams do nothing without a terminal operation.</p>
+  <p class="a">
+    <code>list.stream().map(this::save);</code> saves nothing at all. No terminal op means the
+    pipeline never runs — and there's no warning. If you only want side effects, use
+    <code>forEach</code>, or better, a plain loop.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. <code>peek</code> is for debugging, not for work.</p>
+  <p class="a">
+    The JDK explicitly says so. Worse, it can be <strong>skipped entirely</strong>: since Java 9 the
+    stream may elide operations it can prove unnecessary, so
+    <code>.peek(this::save).count()</code> may never call <code>save</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. <code>Collectors.toList()</code> and <code>.toList()</code> are different.</p>
+  <p class="a">
+    <code>collect(Collectors.toList())</code> returns a <strong>mutable</strong>
+    <code>ArrayList</code> (unspecified, but that's the implementation).
+    <code>stream.toList()</code> (Java 16+) returns an <strong>unmodifiable</strong> list — and,
+    unlike <code>List.of</code>, it <strong>allows nulls</strong>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. <code>orElse</code> always evaluates its argument.</p>
+  <p class="a">
+    Even when the <code>Optional</code> is present. It's an ordinary method argument, so it's
+    computed before the call. Use <code>orElseGet</code> for anything with a cost or a side effect.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. <code>Optional</code> is not <code>Serializable</code>.</p>
+  <p class="a">
+    Which is a deliberate signal that it was never designed to be a field or a parameter. It was
+    designed for one thing: return types. Using it elsewhere works but fights the design.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. Lambdas can't throw checked exceptions.</p>
+  <p class="a">
+    <code>Function.apply</code> declares none, so
+    <code>paths.stream().map(Files::readString)</code> won't compile. Catch inside the lambda and
+    wrap in an unchecked exception, or drop back to a <code>for</code> loop. There's no elegant
+    built-in answer — this is a genuine rough edge.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">7. <code>groupingBy</code> can't have null keys.</p>
+  <p class="a">
+    If the classifier returns <code>null</code> you get an NPE, even though
+    <code>HashMap</code> happily stores a null key. Same for <code>toMap</code> with null
+    <em>values</em>. Filter or default the nulls first.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">8. Records aren't a substitute for every class.</p>
+  <p class="a">
+    A record's API <strong>is</strong> its state — the components are public forever. That's perfect
+    for DTOs, value objects and API responses. It's wrong when you want to hide representation,
+    validate mutable state over time, or evolve fields freely.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">9. Parallel streams share one pool with the whole JVM.</p>
+  <p class="a">
+    <code>parallelStream()</code> uses the <strong>common ForkJoinPool</strong>. One long blocking
+    task can starve every other parallel stream in the process — including your framework's. If you
+    must, submit to your own <code>ForkJoinPool</code>.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">13.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: What is a functional interface?</p>
+  <p class="a">
+    An interface with exactly one abstract method, so a lambda or method reference can implement it.
+    Default and static methods don't count, and neither do redeclared <code>Object</code> methods
+    (which is why <code>Comparator</code> qualifies). <code>@FunctionalInterface</code> makes the
+    compiler enforce it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why must captured local variables be effectively final?</p>
+  <p class="a">
+    Locals live on the stack and vanish when the method returns, but the lambda can outlive it, so
+    the value is <strong>copied</strong> into the lambda. If the original could still change you'd
+    have two divergent copies. Fields don't have this restriction because they live on the heap and
+    are accessed through <code>this</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Is a lambda just syntax sugar for an anonymous inner class?</p>
+  <p class="a">
+    No. Different <code>this</code> (enclosing instance vs the anonymous object), no separate
+    <code>.class</code> file, no new scope for names, and it's compiled to
+    <code>invokedynamic</code> — the implementation is decided at runtime rather than baked in.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is a Stream, and how is it different from a Collection?</p>
+  <p class="a">
+    A collection <strong>stores</strong> elements; a stream <strong>describes a computation</strong>
+    over them. Streams have no storage, don't modify the source, are lazy (nothing runs until a
+    terminal op), can be infinite, and are single-use.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Intermediate vs terminal operations?</p>
+  <p class="a">
+    Intermediate ops (<code>filter</code>, <code>map</code>, <code>sorted</code>) return a
+    <code>Stream</code> and are lazy. Terminal ops (<code>collect</code>, <code>forEach</code>,
+    <code>reduce</code>, <code>count</code>) produce a result and trigger execution. Exactly one
+    terminal op per stream, and it consumes it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: map vs flatMap?</p>
+  <p class="a">
+    <code>map</code> is one-to-one. <code>flatMap</code> is one-to-many: the function returns a
+    stream per element, and all of them are flattened into one. Use it when <code>map</code> would
+    leave you with a stream of collections.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: <code>orElse</code> vs <code>orElseGet</code>?</p>
+  <p class="a">
+    <code>orElse</code> takes a value — always evaluated, even when present.
+    <code>orElseGet</code> takes a <code>Supplier</code> — only invoked when empty. Identical
+    results, very different cost and side effects.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does a record give you, and what are its limits?</p>
+  <p class="a">
+    Canonical constructor, accessors, <code>equals</code>, <code>hashCode</code>,
+    <code>toString</code> — and it's implicitly final with final fields. It can't extend a class or
+    add instance fields, and it's only <em>shallowly</em> immutable, so copy mutable components in
+    the compact constructor.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What problem do sealed types solve?</p>
+  <p class="a">
+    They close a hierarchy to a known list, which gives the compiler
+    <strong>exhaustiveness checking</strong> in <code>switch</code> — no
+    <code>default</code> needed, and adding a subtype turns every unhandled switch into a compile
+    error. It's how you model a closed set of alternatives (a sum type) in Java.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When should you use a parallel stream?</p>
+  <p class="a">
+    Rarely. Only when the data is large, the per-element work is CPU-bound and independent, the
+    source splits cheaply (array/<code>ArrayList</code>), and you've <strong>measured</strong> a
+    win. Never for I/O, and never with shared mutable state. It shares the common ForkJoinPool with
+    the entire JVM.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">14.</span> Cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Lambda:</strong> an instance of a functional interface (exactly one abstract method).
+    Needs a target type. Captures must be effectively final.
+  </li>
+  <li>
+    <strong>The six:</strong> <code>Supplier</code> (→T) · <code>Consumer</code> (T→) ·
+    <code>Function</code> (T→R) · <code>Predicate</code> (T→boolean) ·
+    <code>UnaryOperator</code> (T→T) · <code>BinaryOperator</code> (T,T→T).
+  </li>
+  <li>
+    <strong>Method refs:</strong> <code>Class::staticM</code> · <code>obj::instanceM</code> (bound)
+    · <code>Class::instanceM</code> (unbound — first arg is the receiver) · <code>Class::new</code>.
+  </li>
+  <li>
+    <strong>Stream:</strong> source → lazy intermediates → terminal. One element at a time, all the
+    way through. Single-use. No terminal op = nothing happens.
+  </li>
+  <li>
+    <strong>map</strong> 1→1 · <strong>flatMap</strong> 1→many+flatten ·
+    <strong>reduce</strong> many→1 · <strong>collect</strong> many→container.
+  </li>
+  <li>
+    <strong>Collectors:</strong> <code>toList</code>/<code>toSet</code>/<code>toMap</code> ·
+    <code>joining</code> · <code>groupingBy</code> · <code>partitioningBy</code> ·
+    <code>counting</code> · <code>summingInt</code>.
+  </li>
+  <li>
+    <strong>Optional:</strong> return type only · <code>orElseGet</code> over <code>orElse</code> ·
+    <code>map</code>/<code>flatMap</code>/<code>filter</code> · never <code>get()</code>, never
+    <code>null</code>.
+  </li>
+  <li>
+    <strong>record:</strong> final, final fields, auto
+    ctor/accessors/<code>equals</code>/<code>hashCode</code>/<code>toString</code>. Accessor is
+    <code>x()</code>. Compact ctor validates. Shallowly immutable — copy collections.
+  </li>
+  <li>
+    <strong>sealed:</strong> <code>sealed … permits A, B</code>; subtypes must be
+    <code>final</code>/<code>sealed</code>/<code>non-sealed</code> → exhaustive switch, no
+    <code>default</code>.
+  </li>
+  <li>
+    <strong>Patterns:</strong> <code>o instanceof String s</code> ·
+    <code>case String s when …</code> · <code>case Point(int x, int y)</code> ·
+    <code>case null</code>.
+  </li>
+  <li>
+    <strong>switch expression:</strong> <code>-&gt;</code> = no fall-through, returns a value,
+    <code>yield</code> from a block, must be exhaustive.
+  </li>
+  <li>
+    <strong>Text block:</strong> <code>"""</code> + newline · common indent stripped · closing
+    quotes set the margin &amp; trailing newline · <code>\</code> joins lines · <code>\s</code>
+    keeps a space.
+  </li>
+  <li>
+    <strong>Versions:</strong> 8 lambdas/streams · 10 <code>var</code> · 11 LTS · 16 records · 17
+    LTS sealed · 21 LTS patterns in switch + virtual threads.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
