@@ -135,6 +135,17 @@
             if (e.target.closest("ol a")) setToc(false);
           });
 
+        document.querySelectorAll(".show-more").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var open = btn.getAttribute("aria-expanded") === "true";
+            btn.setAttribute("aria-expanded", open ? "false" : "true");
+            var group = btn.closest("[data-collapsible]");
+            if (group) group.classList.toggle("expanded", !open);
+            var label = btn.querySelector(".show-more-label");
+            if (label) label.textContent = open ? btn.dataset.more : "Show less";
+          });
+        });
+
         var toTop = document.getElementById("toTop");
         if (toTop) {
           var onScroll = function () {

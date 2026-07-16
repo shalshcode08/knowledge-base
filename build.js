@@ -28,6 +28,28 @@ function rssLinkHtml(prefix) {
   return `<a href="${prefix}rss.xml">${RSS_ICON}<span>RSS feed</span></a>`;
 }
 
+// lucide chevron-down, shared by the Contents toggle and the "show more" toggles.
+function chevronDown(cls, size) {
+  return (
+    `<svg class="${cls}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" ` +
+    `stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ` +
+    `aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`
+  );
+}
+
+// A topic with more than this many notes collapses behind a "show more" toggle.
+const VISIBLE = 5;
+
+function showMoreButton(hidden, expanded) {
+  const label = `Show ${hidden} more`;
+  return (
+    `<button type="button" class="show-more" aria-expanded="${expanded}" data-more="${label}">` +
+    `${chevronDown("more-chevron", 14)}` +
+    `<span class="show-more-label">${expanded ? "Show less" : label}</span>` +
+    `</button>`
+  );
+}
+
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
 const shell = fs.readFileSync(path.join(SRC, "shell.html"), "utf8");
 
@@ -134,18 +156,32 @@ function rootPrefix(pagePath) {
 function buildSidebar(activePath, prefix) {
   return manifest.topics
     .map((topic) => {
+      const collapsible = topic.pages.length > VISIBLE;
+      // Never hide the page you're on — expand the group if it lives in the tail.
+      const activeIdx = topic.pages.findIndex((p) => p.path === activePath);
+      const expanded = collapsible && activeIdx >= VISIBLE;
+
       const items = topic.pages.length
         ? topic.pages
-            .map((p) => {
+            .map((p, i) => {
               const active = p.path === activePath ? ' class="active"' : "";
-              return `          <li><a href="${prefix}${p.path}.html"${active}>${p.title}</a></li>`;
+              const extra = collapsible && i >= VISIBLE ? ' class="extra"' : "";
+              return `          <li${extra}><a href="${prefix}${p.path}.html"${active}>${p.title}</a></li>`;
             })
             .join("\n")
         : `          <li><span class="empty" style="padding:5px 10px;color:var(--faint);font-size:14px;">— soon —</span></li>`;
+
+      const more = collapsible
+        ? `\n        ${showMoreButton(topic.pages.length - VISIBLE, expanded)}`
+        : "";
+      const attrs =
+        `class="nav-group${expanded ? " expanded" : ""}"` +
+        (collapsible ? " data-collapsible" : "");
+
       return (
-        `      <div class="nav-group">\n` +
+        `      <div ${attrs}>\n` +
         `        <p class="label">${topic.name}</p>\n` +
-        `        <ul>\n${items}\n        </ul>\n` +
+        `        <ul>\n${items}\n        </ul>${more}\n` +
         `      </div>`
       );
     })
@@ -172,7 +208,7 @@ function buildContents(html) {
     `      <aside class="toc" aria-label="On this page">\n` +
     `        <button type="button" class="toc-head" aria-expanded="false" aria-controls="tocList">\n` +
     `          <b>Contents</b>\n` +
-    `          <svg class="toc-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>\n` +
+    `          ${chevronDown("toc-chevron", 16)}\n` +
     `        </button>\n` +
     `        <ol id="tocList" start="0">\n${items.join("\n")}\n        </ol>\n` +
     `      </aside>`
@@ -203,9 +239,10 @@ function buildBreadcrumb(pagePath) {
   const parts = pagePath.split("/");
   const out = [];
   parts.forEach((seg, i) => {
-    if (i > 0) out.push(`<span>/</span>`);
-    const cls = i === parts.length - 1 ? ' class="here"' : "";
-    out.push(`<span${cls}>${seg}</span>`);
+    const last = i === parts.length - 1;
+    // Parent crumbs + separators drop away on narrow screens; the current page always stays.
+    if (i > 0) out.push(`<span class="crumb-hide">/</span>`);
+    out.push(`<span class="${last ? "here" : "crumb-hide"}">${seg}</span>`);
   });
   return out.join("");
 }
@@ -228,10 +265,18 @@ function noteMain(pagePath, prefix, contentHtml) {
 function homeMain() {
   const cards = manifest.topics
     .map((t) => {
+      const collapsible = t.pages.length > VISIBLE;
       const list = t.pages.length
-        ? t.pages.map((p) => `<li><a href="${p.path}.html">${p.title}</a></li>`).join("")
+        ? t.pages
+            .map((p, i) => {
+              const extra = collapsible && i >= VISIBLE ? ' class="extra"' : "";
+              return `<li${extra}><a href="${p.path}.html">${p.title}</a></li>`;
+            })
+            .join("")
         : `<li class="empty">nothing here yet</li>`;
-      return `        <div class="topic-card"><h3>${t.name}</h3><ul>${list}</ul></div>`;
+      const more = collapsible ? showMoreButton(t.pages.length - VISIBLE, false) : "";
+      const attrs = `class="topic-card"` + (collapsible ? " data-collapsible" : "");
+      return `        <div ${attrs}><h3>${t.name}</h3><ul>${list}</ul>${more}</div>`;
     })
     .join("\n");
   return (
