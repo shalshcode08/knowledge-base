@@ -122,14 +122,15 @@ test("no orphan content files missing from the manifest", () => {
   assertNoProblems("orphans", problems);
 });
 
-test("build produced index + one file per page + styles.css", () => {
+test("build produced index + 404 + one file per page + styles.css", () => {
   const problems = [];
   if (!fs.existsSync(path.join(DIST, "index.html"))) problems.push("dist/index.html missing");
+  if (!fs.existsSync(path.join(DIST, "404.html"))) problems.push("dist/404.html missing");
   if (!fs.existsSync(path.join(DIST, "styles.css"))) problems.push("dist/styles.css missing");
   for (const p of allPagePaths(MANIFEST)) {
     if (!fs.existsSync(path.join(DIST, p + ".html"))) problems.push(`dist/${p}.html missing`);
   }
-  const expected = allPagePaths(MANIFEST).length + 1;
+  const expected = allPagePaths(MANIFEST).length + 2;
   const got = distHtmlFiles().length;
   if (got !== expected) problems.push(`expected ${expected} html files, built ${got}`);
   assertNoProblems("build output", problems);
@@ -151,9 +152,10 @@ test("every page has the required shell chrome", () => {
     const html = fs.readFileSync(path.join(DIST, f), "utf8");
     if (!/<html lang="[^"]+"/.test(html)) problems.push(`${f}: <html> has no lang`);
     if (!/<title>[^<]+<\/title>/.test(html)) problems.push(`${f}: empty or missing <title>`);
-    if (!html.includes('class="site-header"')) problems.push(`${f}: missing header`);
-    if (f === "index.html") {
-      if (html.includes('class="sidebar"')) problems.push(`${f}: landing must NOT have a sidebar`);
+    if (f !== "404.html" && !html.includes('class="site-header"'))
+      problems.push(`${f}: missing header`);
+    if (f === "index.html" || f === "404.html") {
+      if (html.includes('class="sidebar"')) problems.push(`${f}: must NOT have a sidebar`);
     } else if (!html.includes('class="sidebar"')) {
       problems.push(`${f}: missing sidebar`);
     }
@@ -221,7 +223,9 @@ test("all internal links resolve to real files", () => {
         problems.push(`${f}: empty/hash-only href "${href}"`);
         continue;
       }
-      const resolved = path.resolve(dir, target);
+      const resolved = target.startsWith("/")
+        ? path.join(DIST, target.slice(1))
+        : path.resolve(dir, target);
       if (!fs.existsSync(resolved))
         problems.push(`${f}: link "${href}" → ${path.relative(DIST, resolved)} does not exist`);
     }
@@ -306,6 +310,22 @@ test("landing page is sidebar-free and centered", () => {
   assertNoProblems("landing", problems);
 });
 
+test("404 page is minimal, linked home, and sidebar-free", () => {
+  const html = fs.readFileSync(path.join(DIST, "404.html"), "utf8");
+  const problems = [];
+  if (!html.includes('class="not-found-main"')) problems.push("404.html missing error layout");
+  if (!html.includes('class="not-found-icon"')) problems.push("404.html missing error icon");
+  if (!html.includes("<h1>404 - Page not found</h1>")) problems.push("404.html missing heading");
+  if (!html.includes('href="/"')) problems.push("404.html does not link home");
+  if (!html.includes(">Go to home</a>")) problems.push("404.html has the wrong home-link label");
+  if (!html.includes('href="/styles.css"'))
+    problems.push("404.html stylesheet is not root-relative");
+  if (html.includes('class="site-header"')) problems.push("404.html should not contain the header");
+  if (html.includes('class="sidebar"')) problems.push("404.html should not contain a sidebar");
+  if (html.includes('id="searchModal"')) problems.push("404.html should not contain search UI");
+  assertNoProblems("404 page", problems);
+});
+
 test("search assets are built and wired into every page", () => {
   const problems = [];
   if (!fs.existsSync(path.join(DIST, "search.js"))) problems.push("dist/search.js missing");
@@ -331,6 +351,7 @@ test("search assets are built and wired into every page", () => {
     if (!Array.isArray(e.sections)) problems.push(`search entry "${e.path}" has no sections array`);
   });
   for (const f of distHtmlFiles()) {
+    if (f === "404.html") continue;
     const html = fs.readFileSync(path.join(DIST, f), "utf8");
     if (!/<script src="[^"]*search\.js">/.test(html))
       problems.push(`${f}: does not load search.js`);
@@ -348,7 +369,7 @@ test("logo + icons are present and referenced on every page", () => {
   for (const f of distHtmlFiles()) {
     const html = fs.readFileSync(path.join(DIST, f), "utf8");
     if (!/knowledge_base_logo\.png/.test(html)) problems.push(`${f}: does not reference the logo`);
-    if (!/rel="apple-touch-icon"/.test(html))
+    if (f !== "404.html" && !/rel="apple-touch-icon"/.test(html))
       problems.push(`${f}: missing apple-touch-icon link (iOS shows a letter without it)`);
   }
   assertNoProblems("logo + icons", problems);
@@ -430,6 +451,7 @@ test("robots.txt points at the sitemap and every page links the feed", () => {
       problems.push("robots.txt does not reference the sitemap");
   }
   for (const f of distHtmlFiles()) {
+    if (f === "404.html") continue;
     const html = fs.readFileSync(path.join(DIST, f), "utf8");
     if (!/rel="alternate"[\s\S]*?application\/rss\+xml/.test(html))
       problems.push(`${f}: missing RSS <link rel="alternate">`);

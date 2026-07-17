@@ -312,6 +312,41 @@ function renderIndex() {
   return fill({ root: "", bodyClass: "is-home", title: "Home", breadcrumb: "" }, homeMain());
 }
 
+function notFoundMain() {
+  return (
+    `<main class="not-found-main">\n` +
+    `      <div class="not-found">\n` +
+    `        <div class="not-found-title">\n` +
+    `          <svg class="not-found-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\n` +
+    `            <circle cx="12" cy="12" r="10"/><path d="M16 16s-1.5-2-4-2-4 2-4 2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/>\n` +
+    `          </svg>\n` +
+    `          <h1>404 - Page not found</h1>\n` +
+    `        </div>\n` +
+    `        <a href="/">Go to home</a>\n` +
+    `      </div>\n` +
+    `    </main>`
+  );
+}
+
+function renderNotFound() {
+  return (
+    `<!doctype html>\n` +
+    `<html lang="en">\n` +
+    `  <head>\n` +
+    `    <meta charset="UTF-8" />\n` +
+    `    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n` +
+    `    <meta name="robots" content="noindex" />\n` +
+    `    <title>Page not found · knowledge base</title>\n` +
+    `    <link rel="icon" href="/knowledge_base_logo.png" />\n` +
+    `    <link rel="stylesheet" href="/styles.css" />\n` +
+    `  </head>\n` +
+    `  <body class="is-not-found">\n` +
+    `    ${notFoundMain()}\n` +
+    `  </body>\n` +
+    `</html>\n`
+  );
+}
+
 function copyDir(from, to) {
   if (!fs.existsSync(from)) return;
   fs.cpSync(from, to, { recursive: true });
@@ -370,6 +405,7 @@ function main() {
   });
 
   fs.writeFileSync(path.join(DIST, "index.html"), renderIndex());
+  fs.writeFileSync(path.join(DIST, "404.html"), renderNotFound());
   fs.writeFileSync(path.join(DIST, "search-index.json"), JSON.stringify(searchIndex));
   fs.copyFileSync(path.join(SRC, "styles.css"), path.join(DIST, "styles.css"));
   fs.copyFileSync(path.join(SRC, "search.js"), path.join(DIST, "search.js"));
@@ -380,7 +416,7 @@ function main() {
   fs.writeFileSync(path.join(DIST, "rss.xml"), buildRss(entries));
   fs.writeFileSync(path.join(DIST, "robots.txt"), buildRobots());
 
-  console.log(`\nBuilt ${count} page(s) + index + sitemap.xml + rss.xml → dist/`);
+  console.log(`\nBuilt ${count} page(s) + index + 404 + sitemap.xml + rss.xml → dist/`);
 }
 
 main();

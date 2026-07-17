@@ -699,6 +699,41 @@ footer.doc-footer {
   display: block;
 }
 
+.not-found-main {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 48px 24px;
+}
+.not-found {
+  width: min(520px, 100%);
+  text-align: center;
+}
+.not-found-title {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.not-found-icon {
+  flex: none;
+  color: var(--text);
+}
+.not-found-title h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 400;
+}
+.not-found a {
+  font-size: 14px;
+  font-weight: 400;
+  text-decoration: none;
+}
+.not-found a:hover {
+  text-decoration: underline;
+}
+
 @media (max-width: 1080px) {
   .layout {
     grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
