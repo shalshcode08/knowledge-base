@@ -29,5 +29,5 @@ jobs:
       - name: External link check
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --no-progress "dist/**/*.html"
+          args: --root-dir "$(pwd)/dist" --no-progress "dist/**/*.html"
           fail: true

@@ -1,0 +1,1518 @@
+<h1>PostgreSQL SQL Fundamentals - Complete Notes</h1>
+<p class="subtitle">
+  A ground-up guide to reading and changing relational data safely: SELECT, filtering, sorting,
+  every join type, grouping, aggregates, subqueries, INSERT, UPDATE, DELETE and PostgreSQL's atomic
+  ON CONFLICT upsert.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The relational mental model</h2>
+<p class="lead">
+  SQL is a language for describing the <strong>result you want</strong>. You say which rows and
+  columns should exist in the result; PostgreSQL decides how to find them.
+</p>
+
+<p>
+  A relational database stores data in <em class="term">tables</em>. A table has named
+  <strong>columns</strong> with declared types and zero or more <strong>rows</strong>. Each row is
+  one fact of the kind represented by that table. A query does not normally change its input table.
+  It produces another table-shaped result.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a table as a carefully defined spreadsheet. Columns are the rules for what each field
+    means, rows are the actual records, and a query is a fresh sheet assembled from the original
+    data. Unlike an ordinary spreadsheet, the database enforces types and constraints for every row,
+    even when thousands of users write concurrently.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Meaning</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Relation / table</td>
+        <td>A set of similarly shaped facts</td>
+        <td><code>customers</code></td>
+      </tr>
+      <tr>
+        <td>Tuple / row</td>
+        <td>One fact</td>
+        <td>Customer 42, Asha, Pune</td>
+      </tr>
+      <tr>
+        <td>Attribute / column</td>
+        <td>One named property with a type</td>
+        <td><code>email text</code></td>
+      </tr>
+      <tr>
+        <td>Primary key</td>
+        <td>A stable value that identifies one row</td>
+        <td><code>customer_id</code></td>
+      </tr>
+      <tr>
+        <td>Foreign key</td>
+        <td>A value that points to a row in another table</td>
+        <td><code>orders.customer_id</code></td>
+      </tr>
+      <tr>
+        <td>Result set</td>
+        <td>The rows produced by a statement</td>
+        <td>The output of <code>SELECT</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>SQL works with sets of rows</strong>
+  <p>
+    The central shift is to stop thinking "loop over every customer." Think "the set of customers
+    whose city is Pune." One statement can affect one row, a million rows, or no rows. This is why a
+    missing <code>WHERE</code> on <code>UPDATE</code> or <code>DELETE</code> is so dangerous.
+  </p>
+</div>
+
+<p>Every example in this guide uses this small shop schema:</p>
+
+<figure class="code">
+  <figcaption><b>Reference schema</b></figcaption>
+  <pre><code>CREATE TABLE customers (
+    customer_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       text NOT NULL UNIQUE,
+    full_name   text NOT NULL,
+    city        text,
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE products (
+    product_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       text NOT NULL,
+    category   text NOT NULL,
+    price      numeric(12, 2) NOT NULL CHECK (price &gt;= 0),
+    stock      integer NOT NULL DEFAULT 0 CHECK (stock &gt;= 0)
+);
+
+CREATE TABLE orders (
+    order_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id bigint NOT NULL REFERENCES customers(customer_id),
+    status     text NOT NULL CHECK (status IN ('pending', 'paid', 'shipped', 'cancelled')),
+    ordered_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE order_items (
+    order_id   bigint NOT NULL REFERENCES orders(order_id),
+    product_id bigint NOT NULL REFERENCES products(product_id),
+    quantity   integer NOT NULL CHECK (quantity &gt; 0),
+    unit_price numeric(12, 2) NOT NULL CHECK (unit_price &gt;= 0),
+    PRIMARY KEY (order_id, product_id)
+);</code></pre>
+</figure>
+
+<div class="note">
+  <strong>SQL keywords and names</strong>
+  <p>
+    PostgreSQL keywords are case-insensitive, so <code>select</code> and <code>SELECT</code> mean
+    the same thing. This guide uppercases keywords for readability and uses lowercase
+    <code>snake_case</code> identifiers. Unquoted identifiers are folded to lowercase. Quoted names
+    preserve case and then require quotes forever, so avoid names such as
+    <code>"CustomerName"</code>.
+  </p>
+</div>
+
+<h2 id="select"><span class="num">01.</span> SELECT and the real execution order</h2>
+<p class="lead">
+  <code>SELECT</code> reads data. Its written order is designed for humans, but its logical
+  processing order explains which names exist at each stage and why some queries fail.
+</p>
+
+<figure class="code">
+  <figcaption><b>The basic shape</b></figcaption>
+  <pre><code>SELECT column_or_expression AS output_name
+FROM table_or_source
+WHERE row_condition
+GROUP BY grouping_expression
+HAVING group_condition
+ORDER BY sort_expression
+LIMIT row_count
+OFFSET rows_to_skip;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Logical step</th>
+        <th>Clause</th>
+        <th>What happens</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><code>FROM</code> / <code>JOIN</code></td>
+        <td>Build the input rows</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><code>WHERE</code></td>
+        <td>Remove individual input rows</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><code>GROUP BY</code></td>
+        <td>Form groups from the remaining rows</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><code>HAVING</code></td>
+        <td>Remove whole groups</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><code>SELECT</code></td>
+        <td>Compute output expressions and aliases</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td><code>DISTINCT</code></td>
+        <td>Remove duplicate output rows</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td><code>ORDER BY</code></td>
+        <td>Sort the result</td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td><code>LIMIT</code> / <code>OFFSET</code></td>
+        <td>Return only the requested slice</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Select columns, expressions and aliases</b></figcaption>
+  <pre><code>SELECT
+    product_id,
+    name,
+    price,
+    price * 1.18 AS price_with_tax
+FROM products;
+
+-- A literal and an expression can appear without coming from a table.
+SELECT CURRENT_DATE AS today, 2 * 3 AS answer;
+
+-- Qualify columns when more than one source could contain the same name.
+SELECT p.product_id, p.name
+FROM products AS p;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>A SELECT alias usually does not exist in WHERE</strong>
+  <p>
+    <code>WHERE</code> is logically processed before <code>SELECT</code>, so
+    <code>WHERE price_with_tax &gt; 1000</code> cannot see an alias created in the select list.
+    Repeat the expression, or move the calculation into a subquery. PostgreSQL does allow output
+    aliases in <code>ORDER BY</code> and, with restrictions, <code>GROUP BY</code> because those
+    stages occur after or alongside output processing.
+  </p>
+</div>
+
+<div class="note">
+  <strong>Avoid SELECT * in durable application queries</strong>
+  <p>
+    <code>SELECT *</code> is useful while exploring. In application code, list the columns. It makes
+    the contract visible, avoids transferring unused data, prevents silently changing result shapes
+    when a column is added, and avoids duplicate column names in joined results.
+  </p>
+</div>
+
+<h2 id="filtering"><span class="num">02.</span> WHERE, expressions and NULL</h2>
+<p class="lead">
+  <code>WHERE</code> keeps rows whose condition evaluates to <strong>true</strong>. Both false and
+  unknown are discarded, which makes understanding <code>NULL</code> essential.
+</p>
+
+<figure class="code">
+  <figcaption><b>Comparison and Boolean operators</b></figcaption>
+  <pre><code>SELECT product_id, name, price
+FROM products
+WHERE category = 'book'
+  AND price &gt;= 500
+  AND stock &lt;&gt; 0;
+
+-- Standard comparisons: =  &lt;&gt;  &lt;  &lt;=  &gt;  &gt;=
+-- PostgreSQL also accepts !=, but &lt;&gt; is standard SQL.
+
+SELECT *
+FROM orders
+WHERE status IN ('paid', 'shipped');
+
+SELECT *
+FROM products
+WHERE price BETWEEN 500 AND 1000;  -- inclusive at both ends
+
+SELECT *
+FROM customers
+WHERE city = 'Pune' OR city = 'Mumbai';</code></pre>
+</figure>
+
+<div class="key">
+  <strong>AND binds more tightly than OR</strong>
+  <p>
+    <code>a OR b AND c</code> means <code>a OR (b AND c)</code>. Use parentheses whenever conditions
+    mix <code>AND</code> and <code>OR</code>. Correct SQL that a reader misinterprets is still
+    unsafe SQL.
+  </p>
+</div>
+
+<h3 id="text-matching">Text matching</h3>
+<figure class="code">
+  <figcaption><b>LIKE patterns</b></figcaption>
+  <pre><code>SELECT * FROM customers WHERE full_name LIKE 'A%';   -- starts with A
+SELECT * FROM customers WHERE full_name LIKE '%sha'; -- ends with sha
+SELECT * FROM customers WHERE full_name LIKE '_avi'; -- one character, then avi
+
+-- PostgreSQL extension: case-insensitive LIKE
+SELECT * FROM customers WHERE full_name ILIKE '%asha%';</code></pre>
+</figure>
+
+<p>
+  In a pattern, <code>%</code> matches any sequence of characters and <code>_</code> matches exactly
+  one character. If user input should be treated literally, it must be escaped as pattern text as
+  well as passed as a parameter.
+</p>
+
+<h3 id="null">NULL and three-valued logic</h3>
+<p>
+  <code>NULL</code> means missing or unknown, not zero, an empty string, or a special value. A
+  comparison with an unknown value is normally <strong>unknown</strong>, not true or false.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Expression</th>
+        <th>Result</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>NULL = NULL</code></td>
+        <td>unknown</td>
+        <td>Two unknown values are not known to be equal</td>
+      </tr>
+      <tr>
+        <td><code>NULL &lt;&gt; 5</code></td>
+        <td>unknown</td>
+        <td>The missing value cannot be compared</td>
+      </tr>
+      <tr>
+        <td><code>NULL IS NULL</code></td>
+        <td>true</td>
+        <td><code>IS NULL</code> tests missingness itself</td>
+      </tr>
+      <tr>
+        <td><code>NULL IS DISTINCT FROM NULL</code></td>
+        <td>false</td>
+        <td>Null-safe equality semantics</td>
+      </tr>
+      <tr>
+        <td><code>COALESCE(NULL, 'unknown')</code></td>
+        <td><code>'unknown'</code></td>
+        <td>First non-null argument wins</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Correct NULL handling</b></figcaption>
+  <pre><code>SELECT * FROM customers WHERE city IS NULL;
+SELECT * FROM customers WHERE city IS NOT NULL;
+
+-- Null-safe comparison: true when the values differ, including one-null cases.
+SELECT *
+FROM customers
+WHERE city IS DISTINCT FROM 'Pune';
+
+-- Provide a display fallback without changing stored data.
+SELECT full_name, COALESCE(city, 'City not provided') AS city
+FROM customers;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Never write = NULL or &lt;&gt; NULL</strong>
+  <p>
+    Both evaluate to unknown for every row, so a <code>WHERE</code> clause keeps nothing. Use
+    <code>IS NULL</code>, <code>IS NOT NULL</code>, <code>IS DISTINCT FROM</code>, or
+    <code>IS NOT DISTINCT FROM</code>.
+  </p>
+</div>
+
+<h2 id="sorting"><span class="num">03.</span> ORDER BY, LIMIT and pagination</h2>
+<p class="lead">
+  A table has no inherent row order. Only <code>ORDER BY</code> promises an order in a query result.
+</p>
+
+<figure class="code">
+  <figcaption><b>Deterministic sorting</b></figcaption>
+  <pre><code>SELECT product_id, name, price
+FROM products
+ORDER BY price DESC, product_id ASC;
+
+-- PostgreSQL lets you choose where nulls appear.
+SELECT customer_id, full_name, city
+FROM customers
+ORDER BY city ASC NULLS LAST, customer_id ASC;
+
+SELECT order_id, ordered_at
+FROM orders
+ORDER BY ordered_at DESC, order_id DESC
+LIMIT 20;</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Add a unique tie-breaker</strong>
+  <p>
+    Sorting only by <code>ordered_at</code> is not fully deterministic because several orders can
+    share the same timestamp. Adding the primary key produces a total order. This matters for tests,
+    repeated requests, pagination and any query using <code>LIMIT</code>.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>OFFSET pagination and keyset pagination</b></figcaption>
+  <pre><code>-- Page 6 with 20 rows per page. Simple, but the database must skip 100 rows.
+SELECT order_id, ordered_at
+FROM orders
+ORDER BY ordered_at DESC, order_id DESC
+LIMIT 20 OFFSET 100;
+
+-- Keyset pagination: continue after the final row of the previous page.
+SELECT order_id, ordered_at
+FROM orders
+WHERE (ordered_at, order_id) &lt; (:last_ordered_at, :last_order_id)
+ORDER BY ordered_at DESC, order_id DESC
+LIMIT 20;</code></pre>
+</figure>
+
+<p>
+  <code>OFFSET</code> is convenient for small result sets and page-number interfaces. Large offsets
+  become slower because the skipped rows still have to be found, and concurrent inserts can shift
+  rows between pages. Keyset pagination uses the last seen sort key, stays stable under inserts, and
+  scales better. It requires a deterministic order and is best for next/previous navigation.
+</p>
+
+<h2 id="joins"><span class="num">04.</span> Joins - combining related tables</h2>
+<p class="lead">
+  A join combines rows from two sources according to a relationship. The join type decides what to
+  do with rows that do not find a match.
+</p>
+
+<figure class="code">
+  <figcaption><b>INNER JOIN: matched rows only</b></figcaption>
+  <pre><code>SELECT
+    o.order_id,
+    o.status,
+    c.customer_id,
+    c.full_name
+FROM orders AS o
+INNER JOIN customers AS c
+    ON c.customer_id = o.customer_id;
+
+-- INNER is optional. JOIN means INNER JOIN.
+FROM orders AS o
+JOIN customers AS c ON c.customer_id = o.customer_id</code></pre>
+</figure>
+
+<p>
+  For each order, PostgreSQL looks for customers satisfying the <code>ON</code> condition. A
+  matching pair becomes one result row. If one customer has ten orders, that customer appears ten
+  times. Joins do not automatically remove duplicates because each matched pair is a real result
+  row.
+</p>
+
+<figure class="code">
+  <figcaption><b>LEFT JOIN: every left row, matched right rows when available</b></figcaption>
+  <pre><code>SELECT
+    c.customer_id,
+    c.full_name,
+    o.order_id
+FROM customers AS c
+LEFT JOIN orders AS o
+    ON o.customer_id = c.customer_id
+ORDER BY c.customer_id, o.order_id;</code></pre>
+</figure>
+
+<p>
+  Customers with no orders still appear once. Their <code>o.*</code> columns are filled with
+  <code>NULL</code>. This makes a left join useful for both optional relationships and finding
+  missing relationships.
+</p>
+
+<figure class="code">
+  <figcaption><b>Find customers with no orders: anti-join</b></figcaption>
+  <pre><code>SELECT c.customer_id, c.full_name
+FROM customers AS c
+LEFT JOIN orders AS o
+    ON o.customer_id = c.customer_id
+WHERE o.order_id IS NULL;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>ON and WHERE are not interchangeable for an outer join</strong>
+  <p>
+    A right-table filter in <code>ON</code> controls which rows match while preserving unmatched
+    left rows. The same filter in <code>WHERE</code> runs after the join and rejects the
+    null-extended rows, often turning a left join into an inner join by accident.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The outer-join filter trap</b></figcaption>
+  <pre><code>-- Keep every customer. Attach only paid orders.
+SELECT c.customer_id, o.order_id
+FROM customers AS c
+LEFT JOIN orders AS o
+    ON o.customer_id = c.customer_id
+   AND o.status = 'paid';
+
+-- Keeps only customers that have a paid order. Customers without one disappear.
+SELECT c.customer_id, o.order_id
+FROM customers AS c
+LEFT JOIN orders AS o
+    ON o.customer_id = c.customer_id
+WHERE o.status = 'paid';</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Join</th>
+        <th>Rows preserved</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>INNER JOIN</code></td>
+        <td>Only matching pairs</td>
+        <td>Orders with their customers</td>
+      </tr>
+      <tr>
+        <td><code>LEFT JOIN</code></td>
+        <td>Every left row</td>
+        <td>All customers, optionally with orders</td>
+      </tr>
+      <tr>
+        <td><code>RIGHT JOIN</code></td>
+        <td>Every right row</td>
+        <td>Same power as left join, with sides reversed</td>
+      </tr>
+      <tr>
+        <td><code>FULL OUTER JOIN</code></td>
+        <td>Every row from both sides</td>
+        <td>Reconcile two datasets and find mismatches</td>
+      </tr>
+      <tr>
+        <td><code>CROSS JOIN</code></td>
+        <td>Every possible pair</td>
+        <td>Generate combinations</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>RIGHT, FULL and CROSS joins</b></figcaption>
+  <pre><code>-- RIGHT JOIN preserves every customer. Usually clearer when rewritten as LEFT JOIN.
+SELECT o.order_id, c.customer_id
+FROM orders AS o
+RIGHT JOIN customers AS c ON c.customer_id = o.customer_id;
+
+-- Reconcile imported products with the real catalogue.
+SELECT p.product_id, i.external_product_id
+FROM products AS p
+FULL OUTER JOIN imported_products AS i
+    ON i.sku = p.sku
+WHERE p.product_id IS NULL OR i.external_product_id IS NULL;
+
+-- Every size paired with every colour: 3 sizes x 4 colours = 12 rows.
+SELECT s.size, c.colour
+FROM sizes AS s
+CROSS JOIN colours AS c;</code></pre>
+</figure>
+
+<h3 id="join-using">ON versus USING</h3>
+<figure class="code">
+  <figcaption><b>USING merges an identically named join column</b></figcaption>
+  <pre><code>SELECT order_id, customer_id, full_name
+FROM orders
+JOIN customers USING (customer_id);
+
+-- Equivalent matching condition:
+SELECT o.order_id, o.customer_id, c.full_name
+FROM orders AS o
+JOIN customers AS c ON c.customer_id = o.customer_id;</code></pre>
+</figure>
+
+<p>
+  <code>USING (customer_id)</code> is concise and produces one output
+  <code>customer_id</code> instead of one from each table. Use <code>ON</code> when names differ or
+  the condition is more complex. Never use <code>NATURAL JOIN</code> in durable code: it silently
+  joins on every same-named column, so a future schema change can change the query's meaning without
+  changing its text.
+</p>
+
+<h3 id="self-join">Self joins</h3>
+<figure class="code">
+  <figcaption><b>One table can play two roles</b></figcaption>
+  <pre><code>-- employees.manager_id references employees.employee_id
+SELECT
+    employee.full_name AS employee_name,
+    manager.full_name  AS manager_name
+FROM employees AS employee
+LEFT JOIN employees AS manager
+    ON manager.employee_id = employee.manager_id;</code></pre>
+</figure>
+
+<h2 id="aggregation"><span class="num">05.</span> GROUP BY, HAVING and aggregates</h2>
+<p class="lead">
+  Aggregation turns many input rows into summary values. Without <code>GROUP BY</code>, all selected
+  rows form one group. With it, each distinct grouping key forms a separate group.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Aggregate</th>
+        <th>Meaning</th>
+        <th>NULL behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>COUNT(*)</code></td>
+        <td>Number of input rows</td>
+        <td>Counts rows even when columns contain null</td>
+      </tr>
+      <tr>
+        <td><code>COUNT(column)</code></td>
+        <td>Number of non-null values</td>
+        <td>Skips null</td>
+      </tr>
+      <tr>
+        <td><code>SUM(column)</code></td>
+        <td>Total</td>
+        <td>Skips null; null for no input rows</td>
+      </tr>
+      <tr>
+        <td><code>AVG(column)</code></td>
+        <td>Arithmetic mean</td>
+        <td>Skips null</td>
+      </tr>
+      <tr>
+        <td><code>MIN</code> / <code>MAX</code></td>
+        <td>Smallest / largest non-null value</td>
+        <td>Skips null</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>One summary row for the whole table</b></figcaption>
+  <pre><code>SELECT
+    COUNT(*)          AS product_count,
+    MIN(price)        AS cheapest,
+    MAX(price)        AS most_expensive,
+    AVG(price)        AS average_price,
+    COALESCE(SUM(stock), 0) AS total_units
+FROM products;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>One summary row per category</b></figcaption>
+  <pre><code>SELECT
+    category,
+    COUNT(*)   AS product_count,
+    AVG(price) AS average_price
+FROM products
+WHERE stock &gt; 0
+GROUP BY category
+HAVING COUNT(*) &gt;= 3
+ORDER BY average_price DESC;</code></pre>
+</figure>
+
+<div class="key">
+  <strong>WHERE filters rows; HAVING filters groups</strong>
+  <p>
+    <code>WHERE stock &gt; 0</code> removes products before grouping.
+    <code>HAVING COUNT(*) &gt;= 3</code>
+    removes entire category groups after their counts exist. Put ordinary row conditions in
+    <code>WHERE</code>; reserve <code>HAVING</code> for conditions that depend on groups or
+    aggregates.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>Every selected value must have one value per group</strong>
+  <p>
+    A grouped query may select grouping expressions and aggregate expressions. Selecting an
+    unrelated column is ambiguous because the group can contain many different values for it.
+    PostgreSQL rejects that query instead of choosing an arbitrary row.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Conditional aggregation with FILTER</b></figcaption>
+  <pre><code>SELECT
+    customer_id,
+    COUNT(*) AS all_orders,
+    COUNT(*) FILTER (WHERE status = 'paid')      AS paid_orders,
+    COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_orders
+FROM orders
+GROUP BY customer_id;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Aggregate after a one-to-many join</b></figcaption>
+  <pre><code>SELECT
+    o.order_id,
+    SUM(oi.quantity * oi.unit_price) AS order_total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.order_id
+GROUP BY o.order_id;
+
+-- COUNT DISTINCT protects against repeated customer ids after the join.
+SELECT COUNT(DISTINCT o.customer_id) AS customers_who_ordered
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.order_id;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Ordering inside an aggregate is separate</strong>
+  <p>
+    The order of input to <code>string_agg</code>, <code>array_agg</code> and JSON aggregates is not
+    guaranteed unless the aggregate itself contains <code>ORDER BY</code>:
+    <code>string_agg(name, ', ' ORDER BY name)</code>. An outer <code>ORDER BY</code> sorts result
+    rows, not values being collected inside one result row.
+  </p>
+</div>
+
+<h2 id="distinct"><span class="num">06.</span> DISTINCT and set operations</h2>
+<p class="lead">
+  SQL keeps duplicate rows by default. <code>DISTINCT</code> removes duplicates from the complete
+  selected row, while set operations combine the results of separate queries.
+</p>
+
+<figure class="code">
+  <figcaption><b>DISTINCT applies to the whole output row</b></figcaption>
+  <pre><code>SELECT DISTINCT city
+FROM customers;
+
+SELECT DISTINCT city, active
+FROM customers;
+-- The second query removes duplicate (city, active) PAIRS, not duplicate cities alone.
+
+SELECT COUNT(DISTINCT customer_id)
+FROM orders;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>DISTINCT is not a repair tool for a wrong join</strong>
+  <p>
+    If a join unexpectedly multiplies rows, first check the relationship and join condition. Adding
+    <code>DISTINCT</code> can hide a missing predicate, discard meaningful rows, and perform
+    unnecessary work. Use it when the required result is genuinely a set of unique values.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Result</th>
+        <th>Duplicates</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>UNION</code></td>
+        <td>Rows in either query</td>
+        <td>Removed</td>
+      </tr>
+      <tr>
+        <td><code>UNION ALL</code></td>
+        <td>Rows in either query</td>
+        <td>Preserved</td>
+      </tr>
+      <tr>
+        <td><code>INTERSECT</code></td>
+        <td>Rows in both queries</td>
+        <td>Removed unless <code>ALL</code></td>
+      </tr>
+      <tr>
+        <td><code>EXCEPT</code></td>
+        <td>Rows in the first query but not the second</td>
+        <td>Removed unless <code>ALL</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Combine compatible result sets</b></figcaption>
+  <pre><code>SELECT email FROM customers
+UNION
+SELECT email FROM newsletter_subscribers;
+
+-- Prefer ALL when duplicate removal is not required.
+SELECT customer_id, 'order' AS source FROM orders
+UNION ALL
+SELECT customer_id, 'support' AS source FROM support_tickets;</code></pre>
+</figure>
+
+<p>
+  Each branch must return the same number of columns with compatible types. Output column names come
+  from the first branch. A final <code>ORDER BY</code> sorts the combined result.
+  <code>UNION ALL</code>
+  is usually cheaper because PostgreSQL does not have to identify and remove duplicates.
+</p>
+
+<h2 id="subqueries"><span class="num">07.</span> Subqueries</h2>
+<p class="lead">
+  A subquery is a query nested inside another statement. Its location determines whether it must
+  return one value, one column, or an entire table.
+</p>
+
+<h3 id="scalar-subquery">Scalar subqueries</h3>
+<figure class="code">
+  <figcaption><b>Exactly one row and one column</b></figcaption>
+  <pre><code>SELECT name, price
+FROM products
+WHERE price &gt; (SELECT AVG(price) FROM products);</code></pre>
+</figure>
+
+<p>
+  The inner query produces one average value, so it can be used where an ordinary value is expected.
+  Zero rows become <code>NULL</code>. More than one row causes an error because PostgreSQL cannot
+  choose which value was intended.
+</p>
+
+<h3 id="derived-table">Subqueries in FROM</h3>
+<figure class="code">
+  <figcaption><b>A query result used as a temporary table</b></figcaption>
+  <pre><code>SELECT category_totals.category, category_totals.average_price
+FROM (
+    SELECT category, AVG(price) AS average_price
+    FROM products
+    GROUP BY category
+) AS category_totals
+WHERE category_totals.average_price &gt; 1000;</code></pre>
+</figure>
+
+<p>
+  A subquery in <code>FROM</code> must have an alias. It is useful for creating a clear intermediate
+  result or making a computed alias available to an outer filter.
+</p>
+
+<h3 id="exists">EXISTS and correlated subqueries</h3>
+<figure class="code">
+  <figcaption><b>Customers who have at least one paid order</b></figcaption>
+  <pre><code>SELECT c.customer_id, c.full_name
+FROM customers AS c
+WHERE EXISTS (
+    SELECT 1
+    FROM orders AS o
+    WHERE o.customer_id = c.customer_id
+      AND o.status = 'paid'
+);</code></pre>
+</figure>
+
+<p>
+  The inner query is <em class="term">correlated</em> because it references the current outer
+  customer. <code>EXISTS</code> asks only whether at least one row exists. The selected value is
+  irrelevant, so <code>SELECT 1</code> communicates intent. PostgreSQL may stop after the first
+  match.
+</p>
+
+<figure class="code">
+  <figcaption><b>Customers with no orders: NOT EXISTS</b></figcaption>
+  <pre><code>SELECT c.customer_id, c.full_name
+FROM customers AS c
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM orders AS o
+    WHERE o.customer_id = c.customer_id
+);</code></pre>
+</figure>
+
+<h3 id="in-any-all">IN, ANY and ALL</h3>
+<figure class="code">
+  <figcaption><b>Compare with a one-column result</b></figcaption>
+  <pre><code>SELECT *
+FROM customers
+WHERE customer_id IN (
+    SELECT customer_id
+    FROM orders
+    WHERE status = 'paid'
+);
+
+-- More expensive than at least one product price.
+SELECT * FROM products
+WHERE price &gt; ANY (SELECT price FROM products WHERE category = 'book');
+
+-- More expensive than every product price in that category.
+SELECT * FROM products
+WHERE price &gt; ALL (SELECT price FROM products WHERE category = 'book');</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>NOT IN has a NULL trap</strong>
+  <p>
+    If the subquery returns even one <code>NULL</code>, and no equality match is found,
+    <code>x NOT IN (...)</code> becomes unknown rather than true. That can make the query return no
+    rows. Prefer a correctly correlated <code>NOT EXISTS</code>, or prove the subquery column cannot
+    be null.
+  </p>
+</div>
+
+<h2 id="insert"><span class="num">08.</span> INSERT - creating rows</h2>
+<p class="lead">
+  <code>INSERT</code> adds rows. Always name the target columns so the statement remains readable
+  and safe when the table definition evolves.
+</p>
+
+<figure class="code">
+  <figcaption><b>Single-row, multi-row and default inserts</b></figcaption>
+  <pre><code>INSERT INTO customers (email, full_name, city)
+VALUES ('asha@example.com', 'Asha Rao', 'Pune');
+
+INSERT INTO products (name, category, price, stock)
+VALUES
+    ('SQL Handbook', 'book', 799.00, 20),
+    ('Mechanical Keyboard', 'electronics', 5999.00, 5),
+    ('Notebook', 'stationery', 120.00, 100);
+
+-- All columns use their declared default or NULL when allowed.
+INSERT INTO audit_heartbeat DEFAULT VALUES;</code></pre>
+</figure>
+
+<p>
+  Omitted columns receive their declared default. If no default exists, they receive
+  <code>NULL</code>, which fails if the column is <code>NOT NULL</code>. Explicitly writing
+  <code>DEFAULT</code> asks PostgreSQL to use the column default for that value.
+</p>
+
+<figure class="code">
+  <figcaption><b>RETURNING avoids a second query</b></figcaption>
+  <pre><code>INSERT INTO customers (email, full_name, city)
+VALUES (:email, :full_name, :city)
+RETURNING customer_id, email, created_at;</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Use RETURNING for database-generated values</strong>
+  <p>
+    PostgreSQL can return the row after defaults, identity generation and triggers have run. This is
+    safer than inserting and then querying by email or asking for a sequence's current value in a
+    separate statement.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>INSERT from a query</b></figcaption>
+  <pre><code>INSERT INTO archived_customers (customer_id, email, full_name, archived_at)
+SELECT customer_id, email, full_name, CURRENT_TIMESTAMP
+FROM customers
+WHERE active = false
+RETURNING customer_id;</code></pre>
+</figure>
+
+<h2 id="update"><span class="num">09.</span> UPDATE - changing existing rows</h2>
+<p class="lead">
+  <code>UPDATE</code> changes every row that satisfies its <code>WHERE</code> condition. Without
+  <code>WHERE</code>, it changes every row in the table.
+</p>
+
+<figure class="code">
+  <figcaption><b>Update with expressions and RETURNING</b></figcaption>
+  <pre><code>UPDATE products
+SET
+    price = price * 1.05,
+    stock = stock + 10
+WHERE category = 'book'
+RETURNING product_id, name, price, stock;</code></pre>
+</figure>
+
+<p>
+  Right-hand expressions read the row's old values. Assignments are conceptually simultaneous, so
+  one assignment does not read another assignment's new value. The command count includes matched
+  rows even when a new value equals the old value.
+</p>
+
+<figure class="code">
+  <figcaption><b>UPDATE FROM joins another source</b></figcaption>
+  <pre><code>UPDATE products AS p
+SET price = change.new_price
+FROM price_changes AS change
+WHERE change.product_id = p.product_id
+RETURNING p.product_id, p.price;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Make UPDATE FROM one-to-one</strong>
+  <p>
+    If the join produces several source rows for one target row, PostgreSQL uses one of them, but
+    which one is not predictable. Enforce uniqueness in the source or reduce it to one row per
+    target before updating.
+  </p>
+</div>
+
+<div class="key">
+  <strong>Preview the target set first</strong>
+  <p>
+    Before a broad update, run a <code>SELECT</code> with the same <code>FROM</code> and
+    <code>WHERE</code>. Check both the rows and the count. Then run the update in a transaction and
+    inspect <code>RETURNING</code> before committing.
+  </p>
+</div>
+
+<h2 id="delete"><span class="num">10.</span> DELETE - removing rows</h2>
+<p class="lead">
+  <code>DELETE</code> removes selected rows and can return their old values. It is a data operation,
+  so constraints, triggers and transaction rollback still apply.
+</p>
+
+<figure class="code">
+  <figcaption><b>Delete selected rows</b></figcaption>
+  <pre><code>DELETE FROM orders
+WHERE status = 'cancelled'
+  AND ordered_at &lt; CURRENT_DATE - INTERVAL '1 year'
+RETURNING order_id, customer_id, ordered_at;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>DELETE USING joins another source</b></figcaption>
+  <pre><code>DELETE FROM products AS p
+USING discontinued_products AS d
+WHERE d.product_id = p.product_id
+RETURNING p.product_id, p.name;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Foreign keys may reject a delete</strong>
+  <p>
+    Deleting a customer that still has orders normally fails because those orders would point to a
+    row that no longer exists. The foreign key's configured action decides whether PostgreSQL
+    rejects, cascades, nulls, or replaces the reference. Do not delete child rows blindly just to
+    silence the error; understand the ownership rule first.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Command</th>
+        <th>Purpose</th>
+        <th>Can filter rows?</th>
+        <th>Rollback normally?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>DELETE</code></td>
+        <td>Remove selected rows</td>
+        <td>Yes</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td><code>TRUNCATE</code></td>
+        <td>Remove all rows efficiently</td>
+        <td>No</td>
+        <td>Yes in PostgreSQL, subject to transaction rules</td>
+      </tr>
+      <tr>
+        <td><code>DROP TABLE</code></td>
+        <td>Remove the table object itself</td>
+        <td>Not applicable</td>
+        <td>Yes in a normal PostgreSQL transaction</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="upsert"><span class="num">11.</span> UPSERT with INSERT ON CONFLICT</h2>
+<p class="lead">
+  An <em class="term">upsert</em> means "insert this row, but if its unique identity already exists,
+  take an alternative action." PostgreSQL implements it atomically with
+  <code>INSERT ... ON CONFLICT</code>.
+</p>
+
+<div class="key">
+  <strong>Why SELECT-then-INSERT is broken</strong>
+  <p>
+    Two requests can both check that an email is absent, then both try to insert it. The unique
+    constraint prevents duplicate data, but one request fails. <code>ON CONFLICT</code> combines the
+    decision and write into one concurrency-safe statement.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Ignore a duplicate</b></figcaption>
+  <pre><code>INSERT INTO customers (email, full_name, city)
+VALUES (:email, :full_name, :city)
+ON CONFLICT (email) DO NOTHING
+RETURNING customer_id;</code></pre>
+</figure>
+
+<p>
+  The conflict target identifies the unique rule that arbitrates the conflict. If the email already
+  exists, PostgreSQL inserts nothing. In that case <code>RETURNING</code> returns no row because no
+  row was inserted or updated.
+</p>
+
+<figure class="code">
+  <figcaption><b>Insert or update using EXCLUDED</b></figcaption>
+  <pre><code>INSERT INTO customers AS existing (email, full_name, city)
+VALUES (:email, :full_name, :city)
+ON CONFLICT (email) DO UPDATE
+SET
+    full_name = EXCLUDED.full_name,
+    city      = EXCLUDED.city,
+    active    = true
+RETURNING existing.customer_id, existing.email, existing.full_name;</code></pre>
+</figure>
+
+<p>
+  <code>EXCLUDED</code> represents the row that was proposed for insertion. The target table row is
+  the existing conflicting row. An explicit target alias such as <code>existing</code> makes that
+  distinction readable.
+</p>
+
+<figure class="code">
+  <figcaption><b>Update only when the incoming value is newer</b></figcaption>
+  <pre><code>INSERT INTO inventory_snapshots AS current
+    (product_id, quantity, observed_at)
+VALUES
+    (:product_id, :quantity, :observed_at)
+ON CONFLICT (product_id) DO UPDATE
+SET
+    quantity    = EXCLUDED.quantity,
+    observed_at = EXCLUDED.observed_at
+WHERE EXCLUDED.observed_at &gt; current.observed_at
+RETURNING product_id, quantity, observed_at;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>The DO UPDATE WHERE clause is not the conflict detector</strong>
+  <p>
+    The conflict target first finds and locks the conflicting row. The trailing <code>WHERE</code>
+    then decides whether that locked row should actually be updated. If the condition is false, the
+    statement returns no row for it.
+  </p>
+</div>
+
+<div class="warn">
+  <strong>An upsert needs a real unique rule</strong>
+  <p>
+    <code>ON CONFLICT</code> is backed by a unique or exclusion constraint/index. It is not a
+    general "if any WHERE condition matches" feature. Decide the row's identity, enforce that
+    identity in the schema, and target it explicitly.
+  </p>
+</div>
+
+<h2 id="safe-writes"><span class="num">12.</span> Safe writes and application boundaries</h2>
+<p class="lead">
+  Correct syntax is only half the job. Production SQL must also be safe under bad input, broad
+  predicates, partial failure and concurrent requests.
+</p>
+
+<h3 id="parameters">Use parameters, never string concatenation</h3>
+<figure class="code">
+  <figcaption><b>Values belong in parameters</b></figcaption>
+  <pre><code>-- Conceptual prepared statement. Placeholder syntax depends on the client library.
+SELECT customer_id, email
+FROM customers
+WHERE email = :email;
+
+-- Never build SQL like this in application code:
+-- "SELECT ... WHERE email = '" + userInput + "'"</code></pre>
+</figure>
+
+<p>
+  Parameters keep the SQL program separate from data, preventing SQL injection and handling quoting
+  and types correctly. Parameters represent values, not identifiers or keywords. If a user can
+  choose a sort column, map an allowed input such as <code>"price"</code> to a fixed SQL fragment
+  rather than injecting the raw text.
+</p>
+
+<h3 id="transaction-preview">Preview destructive work in a transaction</h3>
+<figure class="code">
+  <figcaption><b>A safe manual workflow</b></figcaption>
+  <pre><code>BEGIN;
+
+SELECT order_id, status
+FROM orders
+WHERE status = 'cancelled'
+  AND ordered_at &lt; CURRENT_DATE - INTERVAL '1 year';
+
+DELETE FROM orders
+WHERE status = 'cancelled'
+  AND ordered_at &lt; CURRENT_DATE - INTERVAL '1 year'
+RETURNING order_id;
+
+-- If the returned rows are correct:
+COMMIT;
+
+-- If anything is wrong, use this instead of COMMIT:
+-- ROLLBACK;</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>Verify the target set with <code>SELECT</code>.</li>
+  <li>Use the exact same predicate in the write.</li>
+  <li>Check the affected-row count or <code>RETURNING</code> output.</li>
+  <li>Set an expected maximum in application logic when a write should affect few rows.</li>
+  <li>Keep the transaction short so locks are not held while a person goes for lunch.</li>
+</ul>
+
+<h3 id="time-ranges">Use half-open time ranges</h3>
+<figure class="code">
+  <figcaption><b>Include the start, exclude the next start</b></figcaption>
+  <pre><code>SELECT *
+FROM orders
+WHERE ordered_at &gt;= TIMESTAMPTZ '2026-07-01 00:00:00+05:30'
+  AND ordered_at &lt;  TIMESTAMPTZ '2026-08-01 00:00:00+05:30';</code></pre>
+</figure>
+
+<p>
+  Avoid an end condition such as <code>&lt;= '2026-07-31 23:59:59'</code>. Timestamps can contain
+  fractional seconds, so that boundary can miss valid rows. A half-open interval composes cleanly
+  with the next period and has no precision gap.
+</p>
+
+<h2 id="gotchas"><span class="num">13.</span> Gotchas that cause real bugs</h2>
+
+<div class="qa">
+  <p class="q">1. No ORDER BY means no promised order.</p>
+  <p class="a">
+    A primary key, insertion order, current query plan or previous output does not create a result
+    ordering guarantee. Add <code>ORDER BY</code>, including a unique tie-breaker when pagination or
+    deterministic output matters.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. A LEFT JOIN can accidentally become an INNER JOIN.</p>
+  <p class="a">
+    A right-side condition in <code>WHERE</code> rejects the null-extended unmatched rows. Put the
+    condition in <code>ON</code> when it should control matching while preserving every left row.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. COUNT(*) and COUNT(column) answer different questions.</p>
+  <p class="a">
+    <code>COUNT(*)</code> counts rows. <code>COUNT(city)</code> counts rows whose city is not null.
+    The difference is intentional and often useful.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. SUM of no rows is NULL, not zero.</p>
+  <p class="a">
+    Except for <code>COUNT</code>, ordinary aggregates normally return null when no input rows
+    exist. Use <code>COALESCE(SUM(amount), 0)</code> when the domain requires zero.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. NOT IN can be poisoned by one NULL.</p>
+  <p class="a">
+    SQL cannot prove that a value differs from an unknown value, so the result becomes unknown.
+    Prefer <code>NOT EXISTS</code> for anti-joins.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. BETWEEN is inclusive.</p>
+  <p class="a">
+    <code>x BETWEEN 10 AND 20</code> includes both 10 and 20. For timestamps, half-open ranges are
+    usually safer than <code>BETWEEN</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">7. A join can multiply rows without being wrong.</p>
+  <p class="a">
+    Joining a customer to ten orders produces ten result rows. Understand the relationship's
+    cardinality before reaching for <code>DISTINCT</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">8. UPDATE and DELETE without WHERE affect the whole table.</p>
+  <p class="a">
+    PostgreSQL treats that as valid SQL. Preview, use a transaction, check the affected-row count,
+    and make intentional whole-table operations visually obvious.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">9. RETURNING reports rows changed by that statement.</p>
+  <p class="a">
+    It avoids a race-prone follow-up query and returns values after defaults and triggers. For
+    <code>ON CONFLICT DO NOTHING</code>, a conflicting row is not returned because nothing changed.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">10. SQL injection is a code/data boundary failure.</p>
+  <p class="a">
+    Escaping by hand is fragile. Bind values as parameters and allow-list any dynamic identifier or
+    direction that cannot be parameterized.
+  </p>
+</div>
+
+<h2 id="practice"><span class="num">14.</span> Practice scenarios with answers</h2>
+<p class="lead">
+  Try to write each query before reading the answer. Producing SQL is what turns recognition into a
+  usable skill.
+</p>
+
+<div class="qa">
+  <p class="q">1. Return the five most expensive in-stock products, deterministically.</p>
+  <p class="a">
+    <code
+      >SELECT product_id, name, price FROM products WHERE stock &gt; 0 ORDER BY price DESC,
+      product_id ASC LIMIT 5;</code
+    >
+    The primary key breaks price ties.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. Return every customer and the number of orders they have, including zero.</p>
+  <p class="a">
+    Use <code>customers LEFT JOIN orders</code>, group by the customer, and
+    <code>COUNT(o.order_id)</code>. Do not use <code>COUNT(*)</code>: the null-extended left-join
+    row would make a customer with no orders appear to have one.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Answer 2</b></figcaption>
+  <pre><code>SELECT
+    c.customer_id,
+    c.full_name,
+    COUNT(o.order_id) AS order_count
+FROM customers AS c
+LEFT JOIN orders AS o ON o.customer_id = c.customer_id
+GROUP BY c.customer_id, c.full_name
+ORDER BY c.customer_id;</code></pre>
+</figure>
+
+<div class="qa">
+  <p class="q">3. Find customers who have never placed an order.</p>
+  <p class="a">
+    Use <code>NOT EXISTS</code> correlated on <code>customer_id</code>. A left anti-join is also
+    valid, but <code>NOT EXISTS</code> states the requirement directly and avoids the
+    <code>NOT IN</code>
+    null trap.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. Calculate each order total.</p>
+  <p class="a">
+    Join <code>orders</code> to <code>order_items</code>, group by <code>order_id</code>, and sum
+    <code>quantity * unit_price</code>. Use the stored item price rather than the product's current
+    price because an order records the price at purchase time.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Register a customer, updating their name and city if the email already exists.</p>
+  <p class="a">
+    Insert the proposed values, target the unique <code>email</code> constraint with
+    <code>ON CONFLICT (email) DO UPDATE</code>, read incoming values from <code>EXCLUDED</code>, and
+    use <code>RETURNING</code> to obtain the id in either case.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. Why is WHERE COUNT(*) &gt; 5 invalid?</p>
+  <p class="a">
+    <code>WHERE</code> runs before groups and their counts exist. Use
+    <code>GROUP BY ... HAVING COUNT(*) &gt; 5</code>.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">15.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: What is the logical execution order of a SELECT query?</p>
+  <p class="a">
+    <code>FROM/JOIN</code>, <code>WHERE</code>, <code>GROUP BY</code>, <code>HAVING</code>,
+    <code>SELECT</code>, <code>DISTINCT</code>, <code>ORDER BY</code>, then
+    <code>LIMIT/OFFSET</code>. It explains why a select-list alias is unavailable in
+    <code>WHERE</code> but usable in <code>ORDER BY</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: WHERE versus HAVING?</p>
+  <p class="a">
+    <code>WHERE</code> filters individual rows before grouping. <code>HAVING</code> filters complete
+    groups after aggregates exist. Use <code>WHERE</code> for ordinary row predicates whenever
+    possible.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: INNER JOIN versus LEFT JOIN?</p>
+  <p class="a">
+    Inner join returns only matching pairs. Left join returns every left row and fills right-side
+    columns with null when no match exists. Right-side filtering in <code>WHERE</code> can discard
+    those unmatched rows.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: UNION versus UNION ALL?</p>
+  <p class="a">
+    Both append compatible result sets. <code>UNION</code> removes duplicate rows;
+    <code>UNION ALL</code> preserves them and avoids duplicate-elimination work. Prefer
+    <code>UNION ALL</code> unless uniqueness is required.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: EXISTS versus IN?</p>
+  <p class="a">
+    <code>EXISTS</code> asks whether a correlated query returns any row. <code>IN</code> compares a
+    value with a one-column set. Both can express many positive membership checks; use the form that
+    communicates intent. For negative membership, <code>NOT EXISTS</code> avoids the
+    <code>NOT IN</code> null trap.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does NULL mean and why is NULL = NULL not true?</p>
+  <p class="a">
+    Null represents missing or unknown information. Two unknown values are not known to be equal, so
+    the comparison is unknown. Use <code>IS NULL</code> for missingness and
+    <code>IS NOT DISTINCT FROM</code> for null-safe equality.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can a join create duplicates?</p>
+  <p class="a">
+    A join emits one result row for every matching pair. One-to-many and many-to-many relationships
+    naturally repeat values from one side. That is row multiplication, not necessarily accidental
+    duplication.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is an upsert and why not SELECT before INSERT?</p>
+  <p class="a">
+    An upsert inserts or takes an alternative action on a uniqueness conflict. A separate check and
+    insert races under concurrency. PostgreSQL's <code>INSERT ... ON CONFLICT</code> makes the
+    decision and write atomic.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is the purpose of RETURNING?</p>
+  <p class="a">
+    It returns expressions from rows changed by <code>INSERT</code>, <code>UPDATE</code> or
+    <code>DELETE</code>. It obtains generated ids, defaults, trigger-modified values and deleted-row
+    data without a second query.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you make an UPDATE or DELETE safer?</p>
+  <p class="a">
+    Preview the same predicate with <code>SELECT</code>, run the write in a short transaction, use
+    <code>RETURNING</code>, verify the affected-row count, and commit only when the target set is
+    correct. Application code should reject unexpectedly broad writes.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">16.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Model:</strong> SQL describes a set of result rows; PostgreSQL chooses the execution
+    plan.
+  </li>
+  <li>
+    <strong>Order:</strong> <code>FROM/JOIN</code> - <code>WHERE</code> - <code>GROUP BY</code> -
+    <code>HAVING</code> - <code>SELECT</code> - <code>DISTINCT</code> - <code>ORDER BY</code> -
+    <code>LIMIT</code>.
+  </li>
+  <li><strong>NULL:</strong> use <code>IS NULL</code>, never <code>= NULL</code>.</li>
+  <li>
+    <strong>Order:</strong> no <code>ORDER BY</code> means no guarantee; add a unique tie-breaker.
+  </li>
+  <li>
+    <strong>Joins:</strong> inner = matches; left/right = preserve one side; full = preserve both;
+    cross = every pair.
+  </li>
+  <li>
+    <strong>Outer join:</strong> right-side predicate in <code>ON</code> preserves unmatched left
+    rows; in <code>WHERE</code> it usually removes them.
+  </li>
+  <li>
+    <strong>Aggregation:</strong> <code>WHERE</code> filters rows; <code>HAVING</code> filters
+    groups; <code>COUNT(*)</code> counts rows; <code>COUNT(column)</code> skips nulls.
+  </li>
+  <li>
+    <strong>Duplicates:</strong> <code>DISTINCT</code> applies to the complete selected row;
+    <code>UNION ALL</code> preserves duplicates.
+  </li>
+  <li>
+    <strong>Subqueries:</strong> scalar = one value; <code>EXISTS</code> = at least one matching
+    row; prefer <code>NOT EXISTS</code> over nullable <code>NOT IN</code>.
+  </li>
+  <li>
+    <strong>Writes:</strong> always name inserted columns; never forget that an omitted
+    <code>WHERE</code> affects every row.
+  </li>
+  <li>
+    <strong>PostgreSQL:</strong> use <code>RETURNING</code> for changed rows and generated values.
+  </li>
+  <li>
+    <strong>Upsert:</strong> <code>ON CONFLICT (unique_key) DO NOTHING/UPDATE</code>;
+    <code>EXCLUDED</code> is the proposed row.
+  </li>
+  <li>
+    <strong>Safety:</strong> bind values as parameters; allow-list dynamic identifiers; preview
+    writes; check affected rows; use short transactions.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
