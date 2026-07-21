@@ -12,6 +12,10 @@
         { "title": "JVM Internals", "path": "java/jvm" },
         { "title": "Design Patterns", "path": "java/design-patterns" }
       ]
+    },
+    {
+      "name": "PostgreSQL",
+      "pages": [{ "title": "SQL Fundamentals", "path": "postgresql/sql-fundamentals" }]
     }
   ]
 }
