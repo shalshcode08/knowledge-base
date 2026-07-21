@@ -15,7 +15,10 @@
     },
     {
       "name": "PostgreSQL",
-      "pages": [{ "title": "SQL Fundamentals", "path": "postgresql/sql-fundamentals" }]
+      "pages": [
+        { "title": "SQL Fundamentals", "path": "postgresql/sql-fundamentals" },
+        { "title": "Advanced Querying", "path": "postgresql/advanced-querying" }
+      ]
     }
   ]
 }

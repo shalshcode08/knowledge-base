@@ -1,0 +1,1250 @@
+<h1>PostgreSQL Advanced Querying - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to composing complex queries with CTEs, recursion, window
+  functions, DISTINCT ON, LATERAL joins and conditional expressions.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The advanced-query mental model</h2>
+<p class="lead">
+  An advanced query is usually not one clever trick. It is a sequence of small relational steps:
+  define the correct rows, enrich them, calculate across related rows, and finally shape the output.
+</p>
+
+<p>
+  Start with the logical processing model from
+  <a href="sql-fundamentals.html#select">SQL Fundamentals</a>. <code>FROM</code> and
+  <code>JOIN</code> build rows, <code>WHERE</code> filters them, grouping creates summaries, and the
+  select list shapes the result. The tools in this chapter let a query express additional stages
+  without moving the work into application loops.
+</p>
+
+<div class="analogy">
+  <p>
+    Imagine a workshop. A CTE labels an intermediate workbench. A recursive CTE repeatedly feeds
+    yesterday's output into today's work. A window function looks sideways at related rows without
+    packing them into one row. A LATERAL join lets the right-side workbench use the current item
+    from the left. CASE chooses a value for each row.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>Best starting tool</th>
+        <th>Core idea</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Explain a multi-stage query</td>
+        <td><code>WITH</code></td>
+        <td>Name each result set</td>
+      </tr>
+      <tr>
+        <td>Walk a hierarchy or graph</td>
+        <td><code>WITH RECURSIVE</code></td>
+        <td>Repeat until no new rows appear</td>
+      </tr>
+      <tr>
+        <td>Rank or compare related rows</td>
+        <td>Window function</td>
+        <td>Keep every detail row</td>
+      </tr>
+      <tr>
+        <td>Pick one row per group</td>
+        <td><code>DISTINCT ON</code></td>
+        <td>Sort, then keep each group's first row</td>
+      </tr>
+      <tr>
+        <td>Run a correlated row-producing query</td>
+        <td><code>LATERAL</code></td>
+        <td>The right side can see the left row</td>
+      </tr>
+      <tr>
+        <td>Choose a value conditionally</td>
+        <td><code>CASE</code></td>
+        <td>SQL's expression-level if/else</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Examples reuse the shop schema from SQL Fundamentals:</p>
+
+<figure class="code">
+  <figcaption><b>Reference relationships</b></figcaption>
+  <pre><code>customers(customer_id, email, full_name, city, active, created_at)
+orders(order_id, customer_id, status, ordered_at)
+order_items(order_id, product_id, quantity, unit_price)
+products(product_id, name, category, price, stock)</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Correctness before compactness</strong>
+  <p>
+    Write the query in inspectable stages. Verify row counts, keys and nullability after each stage.
+    Only then simplify it. A short query that silently multiplies rows or chooses arbitrary ties is
+    not advanced.
+  </p>
+</div>
+
+<h2 id="ctes"><span class="num">01.</span> Common table expressions (CTEs)</h2>
+<p class="lead">
+  A common table expression is a named result available to one statement. It can make a long query
+  read from top to bottom like a data pipeline.
+</p>
+
+<figure class="code">
+  <figcaption><b>Basic CTE and explicit output columns</b></figcaption>
+  <pre><code>WITH paid_order_totals (order_id, customer_id, ordered_at, total) AS (
+    SELECT
+        o.order_id,
+        o.customer_id,
+        o.ordered_at,
+        SUM(oi.quantity * oi.unit_price)
+    FROM orders AS o
+    JOIN order_items AS oi USING (order_id)
+    WHERE o.status = 'paid'
+    GROUP BY o.order_id, o.customer_id, o.ordered_at
+)
+SELECT customer_id, COUNT(*) AS paid_orders, SUM(total) AS lifetime_value
+FROM paid_order_totals
+GROUP BY customer_id
+ORDER BY lifetime_value DESC, customer_id;</code></pre>
+</figure>
+
+<p>
+  The name <code>paid_order_totals</code> exists only inside this statement. The optional column
+  list defines a stable interface for the CTE. Without it, output names come from the inner query.
+  Multiple CTEs are comma-separated, and a later CTE can read an earlier one.
+</p>
+
+<figure class="code">
+  <figcaption><b>Chaining stages</b></figcaption>
+  <pre><code>WITH order_totals AS (
+    SELECT o.order_id, o.customer_id,
+           SUM(oi.quantity * oi.unit_price) AS total
+    FROM orders AS o
+    JOIN order_items AS oi USING (order_id)
+    WHERE o.status IN ('paid', 'shipped')
+    GROUP BY o.order_id, o.customer_id
+),
+customer_totals AS (
+    SELECT customer_id, COUNT(*) AS order_count, SUM(total) AS spent
+    FROM order_totals
+    GROUP BY customer_id
+),
+qualified AS (
+    SELECT *
+    FROM customer_totals
+    WHERE order_count &gt;= 3 AND spent &gt;= 10000
+)
+SELECT c.customer_id, c.full_name, q.order_count, q.spent
+FROM qualified AS q
+JOIN customers AS c USING (customer_id)
+ORDER BY q.spent DESC, c.customer_id;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>CTE, derived table or view?</strong>
+  <p>
+    Use a CTE to name a statement-local stage, a derived table for a small one-use inline stage, and
+    a view for a reusable database interface. These choices mainly express scope and intent. Do not
+    assume a CTE automatically makes a query faster.
+  </p>
+</div>
+
+<h3 id="cte-materialization">Inlining, materialization and optimizer behavior</h3>
+<p>
+  PostgreSQL can fold a non-recursive, side-effect-free CTE into its parent query. Folding lets the
+  optimizer push parent filters into the CTE and choose one plan across both levels. By default, a
+  qualifying CTE referenced once is normally folded. A CTE referenced more than once is normally
+  materialized: PostgreSQL calculates it once and stores the intermediate result for reuse.
+</p>
+
+<figure class="code">
+  <figcaption><b>Control the optimization boundary</b></figcaption>
+  <pre><code>-- Force a separately calculated intermediate result.
+WITH expensive AS MATERIALIZED (
+    SELECT product_id, category, expensive_score(product_id) AS score
+    FROM products
+)
+SELECT * FROM expensive WHERE category = 'books';
+
+-- Invite parent predicates to reach the underlying table.
+WITH products_stage AS NOT MATERIALIZED (
+    SELECT * FROM products
+)
+SELECT *
+FROM products_stage
+WHERE product_id = 42;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Potential benefit</th>
+        <th>Potential cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Folded / <code>NOT MATERIALIZED</code></td>
+        <td>Predicate pushdown and index use</td>
+        <td>Repeated references can repeat work</td>
+      </tr>
+      <tr>
+        <td><code>MATERIALIZED</code></td>
+        <td>Evaluate once and preserve a boundary</td>
+        <td>May compute and store unnecessary rows</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Treat these keywords as measured tuning tools. First confirm semantics, inspect the plan with
+  <code>EXPLAIN (ANALYZE, BUFFERS)</code>, and then compare alternatives with representative data.
+  Volatile functions and data-modifying CTEs have additional semantic reasons not to inline.
+</p>
+
+<h3 id="modifying-ctes">Data-modifying CTEs</h3>
+<p>
+  A top-level <code>WITH</code> can contain <code>INSERT</code>, <code>UPDATE</code> or
+  <code>DELETE</code>. Its <code>RETURNING</code> result, not the target table, becomes the CTE's
+  rows. This supports atomic move-and-log patterns.
+</p>
+
+<figure class="code">
+  <figcaption><b>Archive and delete in one statement</b></figcaption>
+  <pre><code>WITH removed AS (
+    DELETE FROM orders
+    WHERE status = 'cancelled'
+      AND ordered_at &lt; CURRENT_DATE - INTERVAL '1 year'
+    RETURNING *
+)
+INSERT INTO archived_orders
+SELECT * FROM removed;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Sibling write order is not a sequencing mechanism</strong>
+  <p>
+    Data-modifying CTEs and the main statement share one snapshot and execute concurrently in an
+    unpredictable order. Communicate through <code>RETURNING</code>, not by expecting one sibling to
+    see another sibling's table changes. Do not try to modify the same row twice in one statement;
+    which modification wins is unpredictable.
+  </p>
+</div>
+
+<h2 id="recursive-ctes"><span class="num">02.</span> Recursive CTEs</h2>
+<p class="lead">
+  A recursive CTE grows a result from starting rows. It is the standard SQL tool for trees, graph
+  reachability, dependency chains, ancestor paths and generated sequences.
+</p>
+
+<figure class="code">
+  <figcaption><b>The required shape</b></figcaption>
+  <pre><code>WITH RECURSIVE cte_name (columns...) AS (
+    anchor_query
+  UNION ALL
+    recursive_query_that_references_cte_name
+)
+SELECT * FROM cte_name;</code></pre>
+</figure>
+
+<ol class="clean">
+  <li>The anchor produces the initial working rows.</li>
+  <li>The recursive term runs using the current working rows.</li>
+  <li>New rows become the next working set and are also added to the result.</li>
+  <li>Execution stops when an iteration produces no rows.</li>
+</ol>
+
+<p>
+  PostgreSQL implements this process iteratively even though SQL calls it recursive. A termination
+  condition is essential. <code>UNION ALL</code> preserves all generated rows and is usually faster.
+  Plain <code>UNION</code> removes duplicates at each stage and can sometimes stop a cycle, but it
+  can also hide legitimate duplicate paths and does not solve every graph cycle.
+</p>
+
+<figure class="code">
+  <figcaption><b>Generate a bounded numeric sequence</b></figcaption>
+  <pre><code>WITH RECURSIVE numbers(n) AS (
+    VALUES (1)
+  UNION ALL
+    SELECT n + 1
+    FROM numbers
+    WHERE n &lt; 10
+)
+SELECT n FROM numbers ORDER BY n;</code></pre>
+</figure>
+
+<h3 id="hierarchies">Walking a hierarchy</h3>
+<p>Assume a separate employee hierarchy for the next examples:</p>
+
+<figure class="code">
+  <figcaption><b>Hierarchy table</b></figcaption>
+  <pre><code>CREATE TABLE employees (
+    employee_id bigint PRIMARY KEY,
+    manager_id  bigint REFERENCES employees(employee_id),
+    full_name   text NOT NULL
+);</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>All reports below one manager, including depth and path</b></figcaption>
+  <pre><code>WITH RECURSIVE organization AS (
+    SELECT
+        employee_id,
+        manager_id,
+        full_name,
+        0 AS depth,
+        ARRAY[employee_id] AS path
+    FROM employees
+    WHERE employee_id = 10
+
+  UNION ALL
+
+    SELECT
+        e.employee_id,
+        e.manager_id,
+        e.full_name,
+        o.depth + 1,
+        o.path || e.employee_id
+    FROM employees AS e
+    JOIN organization AS o ON e.manager_id = o.employee_id
+    WHERE NOT e.employee_id = ANY(o.path)
+)
+SELECT employee_id, manager_id, full_name, depth, path
+FROM organization
+ORDER BY path;</code></pre>
+</figure>
+
+<p>
+  The anchor chooses manager 10. The recursive term finds direct reports of the previous level. The
+  path array serves two purposes: ordering by it displays a depth-first traversal, and rejecting an
+  id already in the path prevents a bad cycle from looping forever. A depth limit can provide an
+  additional guard when business rules define a maximum hierarchy depth.
+</p>
+
+<h3 id="search-cycle">SEARCH and CYCLE</h3>
+<p>
+  PostgreSQL supports SQL-standard clauses that generate ordering and cycle-tracking columns. The
+  traversal's internal visitation order is not a presentation guarantee; use the generated column in
+  the outer <code>ORDER BY</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Depth-first display and declarative cycle detection</b></figcaption>
+  <pre><code>WITH RECURSIVE organization(employee_id, manager_id, full_name) AS (
+    SELECT employee_id, manager_id, full_name
+    FROM employees
+    WHERE employee_id = 10
+  UNION ALL
+    SELECT e.employee_id, e.manager_id, e.full_name
+    FROM employees AS e
+    JOIN organization AS o ON e.manager_id = o.employee_id
+)
+SEARCH DEPTH FIRST BY employee_id SET traversal_order
+CYCLE employee_id SET is_cycle USING traversal_path
+SELECT employee_id, manager_id, full_name, is_cycle, traversal_path
+FROM organization
+WHERE NOT is_cycle
+ORDER BY traversal_order;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Never rely on an outer LIMIT as production cycle protection</strong>
+  <p>
+    A small outer <code>LIMIT</code> can help test a possibly looping query, but sorting, joining or
+    another database implementation may demand the complete recursive result first. Encode a real
+    stopping rule and explicit cycle detection.
+  </p>
+</div>
+
+<h2 id="windows"><span class="num">03.</span> Window functions</h2>
+<p class="lead">
+  A window function calculates across rows related to the current row while keeping every input row.
+  This is the key difference from <code>GROUP BY</code>, which combines a group into one row.
+</p>
+
+<figure class="code">
+  <figcaption><b>Anatomy of OVER</b></figcaption>
+  <pre><code>function_or_aggregate(arguments) OVER (
+    PARTITION BY grouping_expressions
+    ORDER BY sequencing_expressions
+    ROWS BETWEEN frame_start AND frame_end
+)</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Concept</th>
+        <th>Question it answers</th>
+        <th>Scope</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Partition</td>
+        <td>Which rows belong to the same independent group?</td>
+        <td>All rows sharing partition values</td>
+      </tr>
+      <tr>
+        <td>Window order</td>
+        <td>In what sequence is the calculation defined?</td>
+        <td>Order inside each partition</td>
+      </tr>
+      <tr>
+        <td>Frame</td>
+        <td>Which nearby rows apply for this current row?</td>
+        <td>A changing subset of the partition</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Omitting <code>PARTITION BY</code> creates one partition for the entire input. Window
+  <code>ORDER BY</code> controls the calculation but does not guarantee final display order, so use
+  a separate outer <code>ORDER BY</code>. The rows visible to windows are the virtual table
+  remaining after <code>FROM</code>, <code>WHERE</code>, <code>GROUP BY</code> and
+  <code>HAVING</code>.
+</p>
+
+<h3 id="ranking">ROW_NUMBER, RANK and DENSE_RANK</h3>
+
+<figure class="code">
+  <figcaption><b>Rank orders within each customer</b></figcaption>
+  <pre><code>SELECT
+    o.customer_id,
+    o.order_id,
+    o.ordered_at,
+    ROW_NUMBER() OVER (
+        PARTITION BY o.customer_id
+        ORDER BY o.ordered_at DESC, o.order_id DESC
+    ) AS row_number,
+    RANK() OVER (
+        PARTITION BY o.customer_id
+        ORDER BY o.ordered_at DESC
+    ) AS rank,
+    DENSE_RANK() OVER (
+        PARTITION BY o.customer_id
+        ORDER BY o.ordered_at DESC
+    ) AS dense_rank
+FROM orders AS o;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Function</th>
+        <th>Tie behavior</th>
+        <th>Example scores 100, 100, 90</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ROW_NUMBER()</code></td>
+        <td>Always assigns different sequential numbers</td>
+        <td>1, 2, 3</td>
+      </tr>
+      <tr>
+        <td><code>RANK()</code></td>
+        <td>Peers share rank; later ranks have gaps</td>
+        <td>1, 1, 3</td>
+      </tr>
+      <tr>
+        <td><code>DENSE_RANK()</code></td>
+        <td>Peers share rank; no gaps</td>
+        <td>1, 1, 2</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Rows tied on all window ordering expressions are peers. If the requirement is exactly one stable
+  row, add a unique tie-breaker such as <code>order_id</code>. If the requirement includes all rows
+  tied for third place, use <code>RANK() &lt;= 3</code> or
+  <code>DENSE_RANK() &lt;= 3</code> according to the desired gap semantics. PostgreSQL also supplies
+  <code>PERCENT_RANK</code>, <code>CUME_DIST</code> and <code>NTILE(n)</code> for relative position
+  and buckets.
+</p>
+
+<h3 id="top-n">Top N per group and window filtering</h3>
+<p>
+  Window functions logically run after <code>WHERE</code>, and PostgreSQL permits window calls only
+  in the select list and <code>ORDER BY</code>. Calculate first in a subquery or CTE, then filter at
+  the outer level.
+</p>
+
+<figure class="code">
+  <figcaption><b>Latest three orders per customer</b></figcaption>
+  <pre><code>WITH ranked_orders AS (
+    SELECT
+        o.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY ordered_at DESC, order_id DESC
+        ) AS position
+    FROM orders AS o
+)
+SELECT *
+FROM ranked_orders
+WHERE position &lt;= 3
+ORDER BY customer_id, position;</code></pre>
+</figure>
+
+<h3 id="lag-lead">LAG and LEAD</h3>
+<p>
+  <code>LAG(value, offset, default)</code> reads an earlier row in window order;
+  <code>LEAD</code> reads a later row. The offset defaults to 1 and the missing-row result defaults
+  to null. They avoid a self-join for previous/next comparisons.
+</p>
+
+<figure class="code">
+  <figcaption><b>Time since the customer's previous order</b></figcaption>
+  <pre><code>SELECT
+    customer_id,
+    order_id,
+    ordered_at,
+    LAG(ordered_at) OVER (
+        PARTITION BY customer_id
+        ORDER BY ordered_at, order_id
+    ) AS previous_order_at,
+    ordered_at - LAG(ordered_at) OVER (
+        PARTITION BY customer_id
+        ORDER BY ordered_at, order_id
+    ) AS time_since_previous
+FROM orders
+ORDER BY customer_id, ordered_at, order_id;</code></pre>
+</figure>
+
+<h3 id="frames">Window frames: ROWS, RANGE and GROUPS</h3>
+<p>
+  Ranking and offset functions mainly use the partition and ordering. Aggregate windows and
+  <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, and <code>NTH_VALUE</code> are frame-sensitive.
+  With window ordering, the default is effectively
+  <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>, where current row includes its
+  ordering peers. Duplicate ordering values can therefore move together.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>An offset counts</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ROWS</code></td>
+        <td>Physical rows in window order</td>
+        <td>Last 7 observations</td>
+      </tr>
+      <tr>
+        <td><code>RANGE</code></td>
+        <td>Distance in the ordering value</td>
+        <td>Previous 7 calendar days</td>
+      </tr>
+      <tr>
+        <td><code>GROUPS</code></td>
+        <td>Peer groups with equal ordering values</td>
+        <td>Previous 3 distinct price levels</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Running total with deterministic row semantics</b></figcaption>
+  <pre><code>WITH order_totals AS (
+    SELECT o.customer_id, o.order_id, o.ordered_at,
+           SUM(oi.quantity * oi.unit_price) AS total
+    FROM orders AS o
+    JOIN order_items AS oi USING (order_id)
+    GROUP BY o.customer_id, o.order_id, o.ordered_at
+)
+SELECT
+    customer_id,
+    order_id,
+    ordered_at,
+    total,
+    SUM(total) OVER (
+        PARTITION BY customer_id
+        ORDER BY ordered_at, order_id
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_spend
+FROM order_totals
+ORDER BY customer_id, ordered_at, order_id;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Rolling observations versus rolling time</b></figcaption>
+  <pre><code>-- Current order and previous six orders, even if months apart.
+AVG(total) OVER (
+    PARTITION BY customer_id
+    ORDER BY ordered_at, order_id
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+)
+
+-- All orders in the previous seven calendar days.
+SUM(total) OVER (
+    PARTITION BY customer_id
+    ORDER BY ordered_at
+    RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW
+)</code></pre>
+</figure>
+
+<p>
+  Bounds include <code>UNBOUNDED PRECEDING</code>, <code>n PRECEDING</code>,
+  <code>CURRENT ROW</code>, <code>n FOLLOWING</code> and <code>UNBOUNDED FOLLOWING</code> in valid
+  order. PostgreSQL can also exclude the current row, its peer group, or peer ties with an
+  <code>EXCLUDE</code> clause. Use that when a calculation needs neighbors but must omit the current
+  observation.
+</p>
+
+<div class="warn">
+  <strong>The LAST_VALUE trap</strong>
+  <p>
+    With the default ordered frame, <code>LAST_VALUE(x)</code> usually returns the current row or
+    its last peer, not the partition's final row. For the final value of the full partition, specify
+    <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING</code>. The same frame awareness
+    matters for <code>FIRST_VALUE</code> and <code>NTH_VALUE</code>.
+  </p>
+</div>
+
+<h3 id="aggregate-windows">Grouped aggregate versus aggregate window</h3>
+
+<figure class="code">
+  <figcaption><b>One row per customer versus one row per order</b></figcaption>
+  <pre><code>-- Collapses orders into one row per customer.
+SELECT customer_id, COUNT(*) AS order_count
+FROM orders
+GROUP BY customer_id;
+
+-- Keeps each order and repeats its customer's count for context.
+SELECT order_id, customer_id,
+       COUNT(*) OVER (PARTITION BY customer_id) AS customer_order_count
+FROM orders;</code></pre>
+</figure>
+
+<p>
+  Ordinary aggregates execute before windows. Therefore a window can process grouped results. For
+  example, after producing one row per day with <code>SUM(total)</code>, an outer window can
+  calculate a running total across those daily rows.
+</p>
+
+<h3 id="named-windows">Named windows</h3>
+
+<figure class="code">
+  <figcaption><b>Reuse one window definition</b></figcaption>
+  <pre><code>SELECT
+    customer_id,
+    order_id,
+    ordered_at,
+    LAG(ordered_at) OVER customer_timeline AS previous_order_at,
+    ROW_NUMBER() OVER customer_timeline AS sequence_number
+FROM orders
+WINDOW customer_timeline AS (
+    PARTITION BY customer_id
+    ORDER BY ordered_at, order_id
+)
+ORDER BY customer_id, ordered_at, order_id;</code></pre>
+</figure>
+
+<p>
+  A named window prevents subtle differences across repeated <code>OVER</code> clauses. Multiple
+  window functions with compatible definitions may also share sorting work, but verify actual plans
+  rather than promising it.
+</p>
+
+<h2 id="distinct-on"><span class="num">04.</span> PostgreSQL DISTINCT ON</h2>
+<p class="lead">
+  <code>DISTINCT ON (expressions)</code> keeps the first row from each equal group after sorting. It
+  is a concise PostgreSQL-specific solution for top one per group.
+</p>
+
+<figure class="code">
+  <figcaption><b>Latest order per customer</b></figcaption>
+  <pre><code>SELECT DISTINCT ON (customer_id)
+    customer_id,
+    order_id,
+    status,
+    ordered_at
+FROM orders
+ORDER BY customer_id, ordered_at DESC, order_id DESC;</code></pre>
+</figure>
+
+<p>
+  The <code>DISTINCT ON</code> expressions must match the leftmost
+  <code>ORDER BY</code> expressions. Later ordering expressions decide which row wins inside each
+  group. Here <code>order_id DESC</code> deterministically resolves identical timestamps. Without
+  suitable ordering, the chosen row is unpredictable.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>Strength</th>
+        <th>Use when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>DISTINCT ON</code></td>
+        <td>Compact PostgreSQL syntax</td>
+        <td>Exactly one first row per group</td>
+      </tr>
+      <tr>
+        <td><code>ROW_NUMBER</code></td>
+        <td>Portable pattern and exposes position</td>
+        <td>Top N, or later ranking logic</td>
+      </tr>
+      <tr>
+        <td><code>RANK</code></td>
+        <td>Preserves ties</td>
+        <td>All rows tied at a boundary must remain</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  If final presentation must be ordered by newest order globally rather than by customer, wrap the
+  <code>DISTINCT ON</code> query and apply a new outer <code>ORDER BY ordered_at DESC</code>.
+</p>
+
+<h2 id="lateral"><span class="num">05.</span> LATERAL joins</h2>
+<p class="lead">
+  A <code>LATERAL</code> item in <code>FROM</code> can reference columns from earlier items in the
+  same <code>FROM</code> list. Conceptually, PostgreSQL evaluates it for each left-side row.
+</p>
+
+<figure class="code">
+  <figcaption><b>Latest two orders for every customer</b></figcaption>
+  <pre><code>SELECT
+    c.customer_id,
+    c.full_name,
+    recent.order_id,
+    recent.status,
+    recent.ordered_at
+FROM customers AS c
+LEFT JOIN LATERAL (
+    SELECT o.order_id, o.status, o.ordered_at
+    FROM orders AS o
+    WHERE o.customer_id = c.customer_id
+    ORDER BY o.ordered_at DESC, o.order_id DESC
+    LIMIT 2
+) AS recent ON true
+ORDER BY c.customer_id, recent.ordered_at DESC, recent.order_id DESC;</code></pre>
+</figure>
+
+<p>
+  The subquery can use <code>c.customer_id</code> because it is lateral.
+  <code>LEFT JOIN LATERAL</code> preserves customers with no orders, filling
+  <code>recent</code> columns with null. <code>ON true</code> means correlation is already handled
+  inside the subquery. Use <code>CROSS JOIN LATERAL</code> when left rows with no right result
+  should disappear.
+</p>
+
+<figure class="code">
+  <figcaption><b>Expand values returned by a set-returning function</b></figcaption>
+  <pre><code>SELECT p.product_id, tag
+FROM product_documents AS p
+CROSS JOIN LATERAL jsonb_array_elements_text(p.document -&gt; 'tags') AS tag;</code></pre>
+</figure>
+
+<p>
+  Table functions in <code>FROM</code> can reference preceding items even when the word
+  <code>LATERAL</code> is omitted, but writing it can clarify intent. LATERAL is especially useful
+  for top N per parent, set-returning functions, and calculations that produce multiple columns.
+</p>
+
+<div class="note">
+  <strong>Performance reasoning</strong>
+  <p>
+    The per-left-row model can be efficient when each correlated lookup uses an index, such as an
+    index on <code>orders(customer_id, ordered_at DESC, order_id DESC)</code>. It can be expensive
+    for a large left input if every lookup scans many rows. If a normal set-based join states the
+    same requirement clearly, prefer the simpler form and compare plans with real data.
+  </p>
+</div>
+
+<h2 id="case"><span class="num">06.</span> CASE and conditional expressions</h2>
+<p class="lead">
+  <code>CASE</code> is an expression, not a control-flow statement. It returns one value, so it can
+  appear anywhere a compatible value is allowed: SELECT, WHERE, ORDER BY, aggregates and updates.
+</p>
+
+<h3 id="case-forms">Searched and simple CASE</h3>
+
+<figure class="code">
+  <figcaption><b>Two forms</b></figcaption>
+  <pre><code>-- Searched CASE: each WHEN is an independent condition.
+CASE
+    WHEN total &gt;= 10000 THEN 'platinum'
+    WHEN total &gt;= 5000  THEN 'gold'
+    WHEN total &gt;= 1000  THEN 'silver'
+    ELSE 'standard'
+END
+
+-- Simple CASE: compare one expression for equality.
+CASE status
+    WHEN 'paid' THEN 'payment complete'
+    WHEN 'shipped' THEN 'on the way'
+    WHEN 'cancelled' THEN 'closed'
+    ELSE 'open'
+END</code></pre>
+</figure>
+
+<p>
+  PostgreSQL checks <code>WHEN</code> arms from top to bottom and returns the first matching result.
+  Put narrow or high-priority conditions before broad ones. If no arm matches and <code>ELSE</code>
+  is absent, the result is null. All possible result arms must resolve to a compatible common type.
+</p>
+
+<div class="warn">
+  <strong>Short-circuiting has planning caveats</strong>
+  <p>
+    CASE generally avoids unnecessary result arms, but it is not a universal shield against every
+    error. A constant expression such as <code>1 / 0</code> may fail during planning even inside an
+    unreachable arm, and aggregate expressions are calculated before select-list CASE logic.
+  </p>
+</div>
+
+<h3 id="conditional-aggregation">Conditional aggregation</h3>
+
+<figure class="code">
+  <figcaption><b>Several metrics in one grouped scan</b></figcaption>
+  <pre><code>SELECT
+    customer_id,
+    COUNT(*) AS all_orders,
+    COUNT(*) FILTER (WHERE status = 'paid') AS paid_orders,
+    SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_orders,
+    MAX(ordered_at) FILTER (WHERE status = 'shipped') AS last_shipped_at
+FROM orders
+GROUP BY customer_id;</code></pre>
+</figure>
+
+<p>
+  The CASE pattern is widely portable. PostgreSQL's aggregate <code>FILTER</code> syntax is often
+  clearer because it separates the aggregate from its input condition. Remember that
+  <code>SUM(CASE WHEN condition THEN 1 END)</code> returns null when nothing matches; adding
+  <code>ELSE 0</code> returns zero. <code>COUNT(CASE WHEN condition THEN 1 END)</code> works because
+  <code>COUNT(expression)</code> ignores nulls.
+</p>
+
+<h3 id="case-sort">Custom sorting</h3>
+
+<figure class="code">
+  <figcaption><b>Business priority instead of alphabetic order</b></figcaption>
+  <pre><code>SELECT order_id, status, ordered_at
+FROM orders
+ORDER BY
+    CASE status
+        WHEN 'pending' THEN 1
+        WHEN 'paid' THEN 2
+        WHEN 'shipped' THEN 3
+        WHEN 'cancelled' THEN 4
+        ELSE 5
+    END,
+    ordered_at,
+    order_id;</code></pre>
+</figure>
+
+<h3 id="null-tools">COALESCE, NULLIF, GREATEST and LEAST</h3>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Expression</th>
+        <th>Meaning</th>
+        <th>Useful example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>COALESCE(a, b, c)</code></td>
+        <td>First non-null argument</td>
+        <td>Display fallback</td>
+      </tr>
+      <tr>
+        <td><code>NULLIF(a, b)</code></td>
+        <td>Null when values equal, otherwise a</td>
+        <td>Avoid zero divisor</td>
+      </tr>
+      <tr>
+        <td><code>GREATEST(a, b)</code></td>
+        <td>Largest argument</td>
+        <td>Clamp a lower bound</td>
+      </tr>
+      <tr>
+        <td><code>LEAST(a, b)</code></td>
+        <td>Smallest argument</td>
+        <td>Clamp an upper bound</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Common null-safe calculations</b></figcaption>
+  <pre><code>SELECT
+    COALESCE(city, 'Unknown') AS display_city,
+    revenue / NULLIF(order_count, 0) AS average_order_value,
+    GREATEST(stock, 0) AS nonnegative_stock,
+    LEAST(discount_percent, 100) AS capped_discount
+FROM customer_metrics;</code></pre>
+</figure>
+
+<p>
+  Arguments must resolve to suitable common or comparable types. PostgreSQL ignores null arguments
+  in <code>GREATEST</code> and <code>LEAST</code>, returning null only when all arguments are null.
+  That null behavior differs from some databases, so do not assume it is portable.
+</p>
+
+<h2 id="composition"><span class="num">07.</span> Composing the tools</h2>
+<p class="lead">
+  Real reports often combine these features. Keep each stage responsible for one grain and name that
+  grain explicitly.
+</p>
+
+<figure class="code">
+  <figcaption><b>Customer report with totals, previous value, rank and segment</b></figcaption>
+  <pre><code>WITH order_totals AS (
+    SELECT
+        o.order_id,
+        o.customer_id,
+        o.ordered_at,
+        SUM(oi.quantity * oi.unit_price) AS total
+    FROM orders AS o
+    JOIN order_items AS oi USING (order_id)
+    WHERE o.status IN ('paid', 'shipped')
+    GROUP BY o.order_id, o.customer_id, o.ordered_at
+),
+order_analysis AS (
+    SELECT
+        order_totals.*,
+        LAG(total) OVER customer_orders AS previous_total,
+        SUM(total) OVER (
+            PARTITION BY customer_id
+            ORDER BY ordered_at, order_id
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_spend,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY ordered_at DESC, order_id DESC
+        ) AS recency
+    FROM order_totals
+    WINDOW customer_orders AS (
+        PARTITION BY customer_id
+        ORDER BY ordered_at, order_id
+    )
+)
+SELECT
+    c.customer_id,
+    c.full_name,
+    a.order_id AS latest_order_id,
+    a.total AS latest_total,
+    a.total - a.previous_total AS change_from_previous,
+    a.running_spend,
+    CASE
+        WHEN a.running_spend &gt;= 10000 THEN 'high value'
+        WHEN a.running_spend &gt;= 5000 THEN 'growing'
+        ELSE 'new'
+    END AS segment
+FROM order_analysis AS a
+JOIN customers AS c USING (customer_id)
+WHERE a.recency = 1
+ORDER BY a.running_spend DESC, c.customer_id;</code></pre>
+</figure>
+
+<p>
+  Check the grain at every boundary: <code>order_totals</code> has one row per order;
+  <code>order_analysis</code> still has one row per order; the final filter keeps one row per
+  customer. Stating grain makes accidental multiplication visible before it becomes a wrong total.
+</p>
+
+<h2 id="gotchas"><span class="num">08.</span> Common mistakes and debugging</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely cause</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CTE query became slower</td>
+        <td>Unwanted materialization or repeated work</td>
+        <td>Inspect plan; test default, MATERIALIZED and NOT MATERIALIZED</td>
+      </tr>
+      <tr>
+        <td>Recursive query never ends</td>
+        <td>No termination or cycle guard</td>
+        <td>Add business bound and path/CYCLE detection</td>
+      </tr>
+      <tr>
+        <td>Top row changes between runs</td>
+        <td>Ties lack a unique ordering key</td>
+        <td>Add a deterministic tie-breaker</td>
+      </tr>
+      <tr>
+        <td>Running sum jumps across duplicate dates</td>
+        <td>Default RANGE frame includes peers</td>
+        <td>Specify ROWS and a deterministic order</td>
+      </tr>
+      <tr>
+        <td>LAST_VALUE equals current value</td>
+        <td>Default frame ends at current peer</td>
+        <td>Use UNBOUNDED FOLLOWING for full partition</td>
+      </tr>
+      <tr>
+        <td>Window function rejected in WHERE</td>
+        <td>Window executes after WHERE</td>
+        <td>Calculate in subquery/CTE, filter outside</td>
+      </tr>
+      <tr>
+        <td>DISTINCT ON chooses wrong row</td>
+        <td>Incorrect or incomplete ORDER BY</td>
+        <td>Group keys first, winner keys next</td>
+      </tr>
+      <tr>
+        <td>Customers without orders disappear</td>
+        <td>CROSS/inner LATERAL behavior</td>
+        <td>Use LEFT JOIN LATERAL ... ON true</td>
+      </tr>
+      <tr>
+        <td>CASE result has a type error</td>
+        <td>Arms lack a common type</td>
+        <td>Use compatible values or explicit casts</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ol class="clean">
+  <li>Run each CTE body alone and inspect sample rows plus <code>COUNT(*)</code>.</li>
+  <li>Write down the expected key and grain for each stage.</li>
+  <li>Test empty input, nulls, duplicates, tied timestamps and customers with no children.</li>
+  <li>Add explicit ordering whenever first, latest, previous or running has meaning.</li>
+  <li>Use <code>EXPLAIN (ANALYZE, BUFFERS)</code> only after correctness is established.</li>
+  <li>Compare plans and timing using production-shaped volumes and distributions.</li>
+</ol>
+
+<h2 id="practice"><span class="num">09.</span> Practice problems</h2>
+
+<div class="qa">
+  <p class="q">1. Return each customer's latest order, including customers with no orders.</p>
+  <p class="a">
+    Start from customers and use <code>LEFT JOIN LATERAL</code>. Inside, correlate on customer id,
+    order by timestamp and order id descending, and limit to one.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. Return the two highest-value orders per customer, preserving ties.</p>
+  <p class="a">
+    First aggregate items to one row per order. Apply <code>RANK()</code> partitioned by customer
+    and ordered by total descending. Filter rank at most 2 outside the window stage. Decide whether
+    gaps or dense positions match the phrase "two highest values."
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. Display every employee below a manager and reject hierarchy cycles.</p>
+  <p class="a">
+    Use the manager as the recursive anchor, join employees on manager id in the recursive term, and
+    track visited ids in a path array or use PostgreSQL's <code>CYCLE</code> clause.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    4. Calculate the difference between each order total and the previous order total.
+  </p>
+  <p class="a">
+    Build one row per order, then subtract <code>LAG(total)</code> over customer partitions ordered
+    by timestamp plus order id. The first order has no predecessor, so its difference is null unless
+    a business-approved default is supplied.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Produce paid, shipped and cancelled counts per customer in one row.</p>
+  <p class="a">
+    Group by customer and use one aggregate with <code>FILTER (WHERE ...)</code> for each status.
+    Conditional CASE aggregates are an alternative.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">10.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: Does a CTE always materialize in PostgreSQL?</p>
+  <p class="a">
+    No. PostgreSQL can fold a side-effect-free non-recursive CTE into its parent, commonly when it
+    is referenced once. Multiple references commonly favor materialization. MATERIALIZED and NOT
+    MATERIALIZED can control the choice where permitted, with a tradeoff between reuse and
+    optimization across the boundary.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What are the two parts of a recursive CTE?</p>
+  <p class="a">
+    The anchor creates initial rows. The recursive term references the CTE and creates the next
+    working rows. Iteration ends when no new rows appear. Production queries need an intentional
+    termination rule and cycle handling where cycles are possible.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: GROUP BY versus window function?</p>
+  <p class="a">
+    GROUP BY collapses input rows into one row per group. A window function preserves each row and
+    adds a calculation based on its partition, ordering and possibly frame.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: ROW_NUMBER versus RANK versus DENSE_RANK?</p>
+  <p class="a">
+    ROW_NUMBER always assigns unique consecutive numbers. RANK gives peers the same position and
+    leaves gaps. DENSE_RANK gives peers the same position without gaps. Add a unique ordering key
+    when a single deterministic winner is required.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What are partition and frame?</p>
+  <p class="a">
+    A partition is the complete independent group available to a window calculation. A frame is a
+    row-dependent subset within that partition. Aggregate windows and first/last/nth value are
+    frame-sensitive.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can LAST_VALUE surprise you?</p>
+  <p class="a">
+    With ordered windows, the default frame ends at the current row's last peer, so LAST_VALUE does
+    not normally see the partition's final row. Use a frame ending at UNBOUNDED FOLLOWING when that
+    is the requirement.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you filter a window result?</p>
+  <p class="a">
+    Calculate it in a subquery or CTE and filter in the outer query. Window functions execute after
+    WHERE and are not permitted directly in that clause.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does DISTINCT ON do?</p>
+  <p class="a">
+    It is a PostgreSQL extension that keeps the first sorted row for each distinct expression set.
+    Those expressions must match the leftmost ORDER BY expressions, and later keys choose a
+    deterministic winner.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What problem does LATERAL solve?</p>
+  <p class="a">
+    It lets a FROM item reference columns from items to its left. This is useful for correlated
+    row-producing calculations such as top N children per parent. LEFT JOIN LATERAL preserves a
+    parent when the lateral item returns no row.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: CASE versus aggregate FILTER?</p>
+  <p class="a">
+    CASE conditionally produces a value and works in many expressions. FILTER decides which rows
+    enter one aggregate and is often clearer for PostgreSQL conditional aggregation. CASE is more
+    portable and supports value transformation beyond aggregate input filtering.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">11.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li><strong>CTE:</strong> a statement-local named result; use it to expose pipeline stages.</li>
+  <li><strong>Optimization:</strong> a CTE is not automatically a performance improvement.</li>
+  <li><strong>Recursive CTE:</strong> anchor + UNION ALL + recursive term + termination.</li>
+  <li><strong>Cycles:</strong> track a visited path or use CYCLE; do not trust outer LIMIT.</li>
+  <li><strong>Window:</strong> preserve detail rows while calculating across related rows.</li>
+  <li>
+    <strong>Partition:</strong> independent group; <strong>frame:</strong> current row's subset.
+  </li>
+  <li><strong>Ranking:</strong> ROW_NUMBER separates ties, RANK gaps, DENSE_RANK does not.</li>
+  <li><strong>Determinism:</strong> latest and first need a unique tie-breaker.</li>
+  <li>
+    <strong>Running total:</strong> use explicit ROWS from unbounded preceding to current row.
+  </li>
+  <li><strong>Filter window:</strong> calculate inside, filter outside.</li>
+  <li><strong>DISTINCT ON:</strong> group expressions must lead ORDER BY.</li>
+  <li><strong>LATERAL:</strong> the right FROM item can use the current left row.</li>
+  <li><strong>CASE:</strong> first matching arm wins; compatible result types are required.</li>
+  <li><strong>Null tools:</strong> COALESCE defaults; NULLIF can turn a zero divisor into null.</li>
+</ul>
+
+<h2 id="references"><span class="num">12.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/queries-with.html"
+      >WITH and recursive queries</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/tutorial-window.html"
+      >Window function tutorial</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-window.html"
+      >Window function reference</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-expressions.html"
+      >Window frame syntax and value expressions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-select.html">SELECT and DISTINCT ON</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/queries-table-expressions.html"
+      >Table expressions and LATERAL</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-conditional.html"
+      >Conditional expressions</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
