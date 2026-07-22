@@ -1,0 +1,1861 @@
+<h1>PostgreSQL Schema Design &amp; Data Modeling - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to relational modeling, normalization, keys, constraints,
+  PostgreSQL data types, deliberate denormalization, arrays, enums and JSONB design.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The schema-design mental model</h2>
+<p class="lead">
+  A schema is an executable description of what the business believes is true. Good design makes
+  valid states easy to store, invalid states hard to store, and important questions easy to ask.
+</p>
+
+<p>
+  Tables are not application objects copied into a database. A relational model starts with facts,
+  identity and relationships. Each row states one fact at a declared grain. Each key explains how
+  that fact is identified. Each constraint states a rule that must remain true regardless of which
+  application, script or administrator writes the data.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a schema as the rules of a board game. Tables are the board, rows are the current game
+    state, and constraints are rules enforced by the referee. If rules exist only in one player's
+    application code, another player can accidentally create an impossible game state.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Design question</th>
+        <th>Relational answer</th>
+        <th>Failure when omitted</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>What does one row mean?</td>
+        <td>Declare its grain</td>
+        <td>Duplicates and incorrect aggregates</td>
+      </tr>
+      <tr>
+        <td>How is one fact identified?</td>
+        <td>Primary or candidate key</td>
+        <td>Ambiguous updates and references</td>
+      </tr>
+      <tr>
+        <td>Which facts depend on others?</td>
+        <td>Foreign keys and relationship tables</td>
+        <td>Orphans and contradictory copies</td>
+      </tr>
+      <tr>
+        <td>Which values are legal?</td>
+        <td>Types, NOT NULL, CHECK and UNIQUE</td>
+        <td>Invalid data discovered too late</td>
+      </tr>
+      <tr>
+        <td>Where should a fact live?</td>
+        <td>Normalize around dependencies</td>
+        <td>Update, insert and delete anomalies</td>
+      </tr>
+      <tr>
+        <td>What is flexible by nature?</td>
+        <td>Carefully bounded JSONB or arrays</td>
+        <td>Either rigid churn or an ungoverned blob</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Begin every design with grain</strong>
+  <p>
+    Finish the sentence "one row represents..." for every table. For example, one
+    <code>orders</code> row represents one accepted order, while one <code>order_items</code> row
+    represents one product line inside one order. If the sentence uses "and" to combine independent
+    facts, the table may contain more than one grain.
+  </p>
+</div>
+
+<h2 id="modeling"><span class="num">01.</span> From requirements to a relational model</h2>
+<p class="lead">
+  Model stable business facts first. Table names and columns should describe the domain, not the
+  current screen layout or one API response.
+</p>
+
+<ol class="clean">
+  <li>
+    <strong>Collect business rules.</strong> Ask what must be unique, what is optional, what may
+    change, what must be retained, and what should happen when related data is deleted.
+  </li>
+  <li>
+    <strong>Find entities.</strong> Customers, products and orders usually have independent identity
+    and life cycles, so they are strong table candidates.
+  </li>
+  <li><strong>State the grain.</strong> Write the meaning of one row before choosing columns.</li>
+  <li>
+    <strong>Find candidate keys.</strong> Identify every minimal set of attributes that could
+    uniquely identify the row, then select a primary key.
+  </li>
+  <li><strong>List attributes and dependencies.</strong> Ask which key determines each value.</li>
+  <li><strong>Model relationships.</strong> Decide cardinality, optionality and ownership.</li>
+  <li>
+    <strong>Encode invariants.</strong> Choose types and constraints before adding performance
+    indexes.
+  </li>
+  <li>
+    <strong>Test with operations.</strong> Walk through inserts, corrections, deletes, reporting,
+    concurrent writes and future changes.
+  </li>
+</ol>
+
+<h3 id="relationships">Cardinality and optionality</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Relationship</th>
+        <th>Typical implementation</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One-to-one</td>
+        <td>Foreign key with UNIQUE, often shared primary key</td>
+        <td>User and optional user profile</td>
+      </tr>
+      <tr>
+        <td>One-to-many</td>
+        <td>Foreign key on the many side</td>
+        <td>Customer and orders</td>
+      </tr>
+      <tr>
+        <td>Many-to-many</td>
+        <td>Junction table with two foreign keys</td>
+        <td>Orders and products through order items</td>
+      </tr>
+      <tr>
+        <td>Hierarchy</td>
+        <td>Self-referencing foreign key</td>
+        <td>Category and parent category</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Optionality appears through nullability or through the absence of a related row. A nullable
+  <code>manager_id</code> can mean a top-level employee. A separate optional profile table avoids a
+  wide user row full of nulls. Pick the representation that matches the fact's identity and life
+  cycle, not merely the representation with fewer joins.
+</p>
+
+<figure class="code">
+  <figcaption><b>One-to-one and many-to-many patterns</b></figcaption>
+  <pre><code>CREATE TABLE user_profiles (
+    user_id      bigint PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    display_name text NOT NULL,
+    biography    text
+);
+
+CREATE TABLE order_items (
+    order_id   bigint NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    product_id bigint NOT NULL REFERENCES products(product_id) ON DELETE RESTRICT,
+    quantity   integer NOT NULL CHECK (quantity &gt; 0),
+    unit_price numeric(12, 2) NOT NULL CHECK (unit_price &gt;= 0),
+    PRIMARY KEY (order_id, product_id)
+);</code></pre>
+</figure>
+
+<div class="note">
+  <strong>A junction table is a real domain table</strong>
+  <p>
+    It can contain facts about the relationship, such as quantity, role, joined_at or sort_order. If
+    the same product may appear on multiple lines in one order, use an independent
+    <code>order_item_id</code> or a line number and make the key match that rule. Do not force a
+    composite key that forbids valid business cases.
+  </p>
+</div>
+
+<h2 id="normalization"><span class="num">02.</span> Normalization from 1NF to 3NF</h2>
+<p class="lead">
+  Normalization places each fact where its key determines it. The goal is not to create the maximum
+  number of tables. The goal is to prevent one fact from being represented inconsistently in many
+  places.
+</p>
+
+<h3 id="dependencies">Functional dependencies and keys</h3>
+<p>
+  A functional dependency <code>X -&gt; Y</code> means that one value of X determines exactly one
+  value of Y within the modeled rules. If <code>product_id -&gt; product_name</code>, every row with
+  the same product id must describe the same product name. A candidate key determines every
+  attribute in the row and is minimal, meaning no part can be removed while preserving uniqueness.
+</p>
+
+<p>
+  A superkey also determines the row but may include unnecessary columns. The primary key is one
+  chosen candidate key. Other candidate keys should normally remain protected by
+  <code>UNIQUE</code>. A surrogate id does not erase natural uniqueness. If email is a business
+  identifier, adding <code>customer_id</code> does not make duplicate emails valid.
+</p>
+
+<h3 id="first-normal-form">First normal form (1NF)</h3>
+<p>
+  In practical database design, 1NF means each row follows one table shape, columns contain values
+  from their declared domains, and repeating groups are not encoded as numbered columns. A design
+  with <code>product_1</code>, <code>product_2</code>, and <code>product_3</code> has a hidden list,
+  an arbitrary maximum and awkward queries.
+</p>
+
+<figure class="code">
+  <figcaption><b>Replace repeating columns with rows</b></figcaption>
+  <pre><code>-- Fragile: a fourth product requires a schema change.
+orders(order_id, product_1, product_2, product_3)
+
+-- Relational: any number of items, one declared grain.
+orders(order_id, customer_id, ordered_at)
+order_items(order_id, line_number, product_id, quantity)
+PRIMARY KEY (order_id, line_number)</code></pre>
+</figure>
+
+<p>
+  PostgreSQL arrays are still single typed values, so using an array does not mechanically violate
+  PostgreSQL's type system. The design question is behavioral: if elements need independent keys,
+  foreign keys, attributes, updates or joins, model them as rows. Use arrays when the collection is
+  truly one bounded value, not as a shortcut around a child table.
+</p>
+
+<h3 id="second-normal-form">Second normal form (2NF)</h3>
+<p>
+  A table is in 2NF when it is in 1NF and every non-key attribute depends on the whole candidate
+  key, not only part of a composite key. This issue is visible in a table keyed by
+  <code>(order_id, product_id)</code> that also stores <code>product_name</code>. Product name
+  depends only on product id, so repeating it on every order item causes update anomalies.
+</p>
+
+<figure class="code">
+  <figcaption><b>Remove a partial dependency</b></figcaption>
+  <pre><code>-- Before: product_name depends only on product_id.
+order_items(order_id, product_id, product_name, quantity)
+
+-- After: each fact lives with its determinant.
+products(product_id PRIMARY KEY, product_name)
+order_items(order_id, product_id, quantity,
+            PRIMARY KEY (order_id, product_id),
+            FOREIGN KEY (product_id) REFERENCES products)</code></pre>
+</figure>
+
+<p>
+  A table with a single-column candidate key cannot have a partial dependency on that key, so it is
+  automatically safe from this specific 2NF violation. It can still violate 3NF.
+</p>
+
+<h3 id="third-normal-form">Third normal form (3NF)</h3>
+<p>
+  A table is in 3NF when it is in 2NF and non-key facts do not depend transitively on a key through
+  another non-key fact. If <code>employee_id -&gt; department_id</code> and
+  <code>department_id -&gt; department_name</code>, storing department name in every employee row
+  duplicates a department fact.
+</p>
+
+<figure class="code">
+  <figcaption><b>Remove a transitive dependency</b></figcaption>
+  <pre><code>-- Before: department_name is determined through department_id.
+employees(employee_id, full_name, department_id, department_name)
+
+-- After: department facts have one home.
+departments(department_id PRIMARY KEY, department_name UNIQUE)
+employees(employee_id PRIMARY KEY, full_name,
+          department_id REFERENCES departments)</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Anomaly</th>
+        <th>Duplicated design</th>
+        <th>Normalized design</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Update</td>
+        <td>Rename a department in hundreds of rows</td>
+        <td>Update one department row</td>
+      </tr>
+      <tr>
+        <td>Insert</td>
+        <td>Cannot create a department before its first employee</td>
+        <td>Department has independent existence</td>
+      </tr>
+      <tr>
+        <td>Delete</td>
+        <td>Deleting the last employee loses department facts</td>
+        <td>Department remains until explicitly deleted</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="bcnf">3NF, BCNF and practical judgment</h3>
+<p>
+  Boyce-Codd normal form (BCNF) strengthens the rule: for every non-trivial dependency
+  <code>X -&gt; Y</code>, X must be a superkey. Most everyday transactional models that correctly
+  reach 3NF also satisfy BCNF. Rare overlapping candidate-key cases can satisfy 3NF but not BCNF. In
+  interviews, explain dependencies and anomalies instead of reciting only definitions.
+</p>
+
+<div class="key">
+  <strong>The memorable normalization sentence</strong>
+  <p>
+    Every non-key fact should depend on the key, the whole key, and nothing but the key. Then verify
+    that alternate candidate keys and real business dependencies also obey the rule.
+  </p>
+</div>
+
+<h2 id="denormalization"><span class="num">03.</span> Deliberate denormalization</h2>
+<p class="lead">
+  Denormalization is an intentional duplicate or precomputed representation added for a measured
+  read requirement. It is not the accidental duplication that normalization helps discover.
+</p>
+
+<p>Reasonable examples include:</p>
+<ul class="clean">
+  <li>
+    An immutable order line stores the product name and unit price agreed at purchase time. These
+    are historical snapshot facts, not merely caches of the current product row.
+  </li>
+  <li>A summary table stores daily sales totals for a heavily used analytical dashboard.</li>
+  <li>A materialized view precomputes an expensive, refreshable report.</li>
+  <li>A search document combines text from several tables for specialized indexing.</li>
+  <li>A bounded JSONB payload retains a third-party event exactly enough for audit or replay.</li>
+</ul>
+
+<p>
+  Before denormalizing, state the source of truth, the synchronization mechanism, acceptable
+  staleness, repair procedure and measurable read benefit. Options include updating both copies in
+  one transaction, generated columns for same-row expressions, triggers, asynchronous consumers,
+  scheduled refreshes and rebuildable caches. Each option changes failure modes and operational
+  cost.
+</p>
+
+<div class="warn">
+  <strong>Do not denormalize based on fear of joins</strong>
+  <p>
+    PostgreSQL is designed to join related rows. First create a correct normalized model, add the
+    indexes required by real access paths, inspect query plans and measure production-shaped data.
+    Duplicate facts only when a demonstrated workload justifies the new consistency burden.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Safe answer before denormalizing</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Which copy is authoritative?</td>
+        <td>Exactly one source is named</td>
+      </tr>
+      <tr>
+        <td>How do copies stay aligned?</td>
+        <td>One explicit synchronous or asynchronous mechanism</td>
+      </tr>
+      <tr>
+        <td>Can readers see stale data?</td>
+        <td>A quantified staleness contract</td>
+      </tr>
+      <tr>
+        <td>How is drift detected?</td>
+        <td>Reconciliation query or invariant monitor</td>
+      </tr>
+      <tr>
+        <td>How is it repaired?</td>
+        <td>Idempotent rebuild or backfill procedure</td>
+      </tr>
+      <tr>
+        <td>What does it improve?</td>
+        <td>Measured latency, throughput or resource result</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="keys"><span class="num">04.</span> Keys and identity</h2>
+<p class="lead">
+  Keys are integrity rules before they are performance tools. They define identity, prevent
+  duplicates and give relationships a stable target.
+</p>
+
+<h3 id="natural-surrogate">Natural, surrogate and composite keys</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Key style</th>
+        <th>Strength</th>
+        <th>Risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Natural key</td>
+        <td>Already meaningful and prevents domain duplicates</td>
+        <td>May be wide, mutable or controlled externally</td>
+      </tr>
+      <tr>
+        <td>Surrogate key</td>
+        <td>Narrow, stable and convenient for references</td>
+        <td>Does not protect natural uniqueness by itself</td>
+      </tr>
+      <tr>
+        <td>Composite key</td>
+        <td>Expresses identity made from several facts</td>
+        <td>Widens child foreign keys and indexes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A country code may be a stable natural key in one system. An email address is often a poor primary
+  key because case rules, correction and reassignment complicate its identity. A junction table
+  often has a natural composite key such as <code>(student_id, course_id)</code>, unless the domain
+  permits multiple enrollment attempts and therefore needs another identifying attribute.
+</p>
+
+<figure class="code">
+  <figcaption><b>Surrogate identity plus protected business key</b></figcaption>
+  <pre><code>CREATE TABLE customers (
+    customer_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       text NOT NULL,
+    full_name   text NOT NULL,
+    CONSTRAINT customers_email_unique UNIQUE (email)
+);</code></pre>
+</figure>
+
+<p>
+  <code>GENERATED ALWAYS AS IDENTITY</code> is SQL-standard syntax backed by an implicit sequence.
+  <code>BY DEFAULT</code> permits an explicit inserted value to take precedence, which can help
+  controlled imports but weakens protection against accidental manual ids. Sequence-generated values
+  can have gaps after rollbacks, caching or conflicts. A primary key promises uniqueness, not
+  consecutive numbering.
+</p>
+
+<h3 id="uuid">UUID keys</h3>
+<p>
+  PostgreSQL's native <code>uuid</code> type stores a 128-bit identifier. UUIDs are useful when many
+  independent writers must create identifiers without first coordinating with one database sequence,
+  when public ids should not expose simple counts, or when offline object creation is required.
+</p>
+
+<figure class="code">
+  <figcaption><b>Database-generated UUID key</b></figcaption>
+  <pre><code>CREATE TABLE documents (
+    document_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    title       text NOT NULL
+);</code></pre>
+</figure>
+
+<p>
+  Random UUIDs are wider than bigint keys and have less index locality, so primary and foreign-key
+  indexes consume more space and may perform more random page work. Time-ordered UUID variants can
+  improve locality while keeping distributed generation properties. Current PostgreSQL releases
+  expose native UUID generation functions, but verify the functions available in the exact server
+  version before choosing migration syntax. Never store UUIDs as text merely for convenience: the
+  native type validates input and is more compact.
+</p>
+
+<div class="note">
+  <strong>Internal and public identifiers can differ</strong>
+  <p>
+    A system can use a narrow bigint for internal joins and a separate unique UUID for external URLs
+    or cross-system exchange. This adds one index and one mapping, so use it only when the two
+    identity roles genuinely differ.
+  </p>
+</div>
+
+<h2 id="constraints"><span class="num">05.</span> Constraints as executable rules</h2>
+<p class="lead">
+  Constraints protect data at the shared storage boundary. Application validation improves error
+  messages, while database constraints guarantee that every writer obeys the invariant.
+</p>
+
+<h3 id="not-null">NOT NULL and defaults</h3>
+<p>
+  Use <code>NOT NULL</code> when absence has no valid business meaning. PostgreSQL treats an
+  unmarked column as nullable. A default supplies a value only when an insert omits the column or
+  explicitly asks for <code>DEFAULT</code>; it does not replace an explicit SQL null.
+</p>
+
+<figure class="code">
+  <figcaption><b>Required facts and insert defaults</b></figcaption>
+  <pre><code>CREATE TABLE accounts (
+    account_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    active     boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at  timestamptz,
+    CONSTRAINT accounts_closed_state CHECK (
+        (active AND closed_at IS NULL)
+        OR (NOT active AND closed_at IS NOT NULL)
+    )
+);</code></pre>
+</figure>
+
+<p>
+  Null is not an empty string, zero, false or a magic date. It means unknown or absent according to
+  the model. If several different missing meanings matter, model a status or related entity rather
+  than asking one null to carry hidden categories.
+</p>
+
+<h3 id="check">CHECK constraints</h3>
+<p>
+  A check constraint accepts a row when its expression is true or null. Therefore
+  <code>CHECK (price &gt;= 0)</code> does not reject a null price. Add <code>NOT NULL</code> when
+  the value is required. Name important constraints so errors and migrations explain the violated
+  rule.
+</p>
+
+<figure class="code">
+  <figcaption><b>Single-column and cross-column checks</b></figcaption>
+  <pre><code>CREATE TABLE promotions (
+    promotion_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code         text NOT NULL,
+    starts_at    timestamptz NOT NULL,
+    ends_at      timestamptz NOT NULL,
+    percent_off  numeric(5, 2) NOT NULL,
+    CONSTRAINT promotions_percent_range
+        CHECK (percent_off &gt; 0 AND percent_off &lt;= 100),
+    CONSTRAINT promotions_time_order
+        CHECK (ends_at &gt; starts_at),
+    CONSTRAINT promotions_code_unique UNIQUE (code)
+);</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>CHECK is for the current row</strong>
+  <p>
+    Do not use a CHECK expression that queries other rows or tables. PostgreSQL assumes the result
+    is stable for the same row and does not continuously recheck it after other data changes. Use
+    UNIQUE, FOREIGN KEY, EXCLUDE, a better model, or carefully designed triggers for rules that span
+    rows.
+  </p>
+</div>
+
+<h3 id="unique">UNIQUE and null semantics</h3>
+<p>
+  A unique constraint can cover one or many columns and automatically creates a unique B-tree index.
+  By default, PostgreSQL considers nulls distinct for uniqueness, so multiple null entries are
+  allowed. Use <code>NULLS NOT DISTINCT</code> when the business rule treats null as one shared
+  value.
+</p>
+
+<figure class="code">
+  <figcaption><b>Composite uniqueness and one optional singleton</b></figcaption>
+  <pre><code>CREATE TABLE memberships (
+    organization_id bigint NOT NULL REFERENCES organizations,
+    user_id         bigint NOT NULL REFERENCES users,
+    external_ref    text,
+    role            text NOT NULL,
+    UNIQUE (organization_id, user_id),
+    UNIQUE NULLS NOT DISTINCT (organization_id, external_ref)
+);</code></pre>
+</figure>
+
+<p>
+  A partial unique index can express rules such as one active subscription per customer while
+  retaining historical inactive rows. It is an index-backed rule rather than a SQL unique
+  constraint, and foreign keys cannot generally target a partial unique index.
+</p>
+
+<figure class="code">
+  <figcaption><b>Conditional uniqueness</b></figcaption>
+  <pre><code>CREATE UNIQUE INDEX subscriptions_one_active_per_customer
+    ON subscriptions (customer_id)
+    WHERE ended_at IS NULL;</code></pre>
+</figure>
+
+<h3 id="primary-key">PRIMARY KEY</h3>
+<p>
+  A primary key combines uniqueness and non-nullability, creates a unique B-tree index, documents
+  the table's chosen identity and becomes the default referenced target when a foreign key omits a
+  column list. PostgreSQL allows only one primary key per table but any number of alternate unique
+  constraints.
+</p>
+
+<h3 id="foreign-key">FOREIGN KEY and referential actions</h3>
+<p>
+  A foreign key requires each non-null referencing value to match a row in a referenced primary key
+  or suitable unique key. Column count and compatible types must match. Composite foreign keys
+  preserve multi-column identity, and a self-reference models a hierarchy.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Action</th>
+        <th>Meaning when the parent changes</th>
+        <th>Use when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>NO ACTION</td>
+        <td>Default; violation may be checked later if deferrable</td>
+        <td>Relationship must be repaired or parent change rejected</td>
+      </tr>
+      <tr>
+        <td>RESTRICT</td>
+        <td>Reject immediately; cannot defer this action</td>
+        <td>Independent referenced object must be retained</td>
+      </tr>
+      <tr>
+        <td>CASCADE</td>
+        <td>Propagate delete or referenced-key update</td>
+        <td>Child is an owned component of parent</td>
+      </tr>
+      <tr>
+        <td>SET NULL</td>
+        <td>Clear the reference</td>
+        <td>Relationship is optional after parent removal</td>
+      </tr>
+      <tr>
+        <td>SET DEFAULT</td>
+        <td>Set reference to its default</td>
+        <td>A valid sentinel parent is a real domain rule</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Ownership-aware foreign keys</b></figcaption>
+  <pre><code>CREATE TABLE order_items (
+    order_id   bigint NOT NULL
+        REFERENCES orders(order_id) ON DELETE CASCADE,
+    product_id bigint NOT NULL
+        REFERENCES products(product_id) ON DELETE RESTRICT,
+    line_no    integer NOT NULL CHECK (line_no &gt; 0),
+    PRIMARY KEY (order_id, line_no)
+);
+
+CREATE INDEX order_items_product_id_idx ON order_items (product_id);</code></pre>
+</figure>
+
+<p>
+  PostgreSQL indexes referenced primary or unique keys, but it does not automatically create an
+  index on the referencing columns. Add child-side indexes when parent updates or deletes and joins
+  need to locate referencing rows efficiently. A composite primary key beginning with
+  <code>order_id</code> already supports lookups by order id, but it does not efficiently support a
+  lookup by <code>product_id</code> alone.
+</p>
+
+<div class="warn">
+  <strong>CASCADE expresses ownership, not convenience</strong>
+  <p>
+    Deleting an order should usually delete its component line items. Deleting a product should not
+    normally erase historical orders. Choose actions from domain life cycles and test the full
+    transitive cascade before enabling it.
+  </p>
+</div>
+
+<h3 id="deferred-constraints">Deferrable constraints</h3>
+<p>
+  PostgreSQL can defer eligible UNIQUE, PRIMARY KEY, FOREIGN KEY and EXCLUDE checks until
+  transaction end when declared <code>DEFERRABLE</code>. This helps operations that temporarily
+  violate a rule, such as swapping two unique positions. It does not make invalid committed data
+  legal.
+</p>
+
+<figure class="code">
+  <figcaption><b>Swap positions inside one transaction</b></figcaption>
+  <pre><code>CREATE TABLE queue_items (
+    queue_id bigint NOT NULL,
+    item_id  bigint NOT NULL,
+    position integer NOT NULL,
+    CONSTRAINT queue_position_unique
+        UNIQUE (queue_id, position) DEFERRABLE INITIALLY IMMEDIATE
+);
+
+BEGIN;
+SET CONSTRAINTS queue_position_unique DEFERRED;
+UPDATE queue_items SET position = -1 WHERE item_id = 10;
+UPDATE queue_items SET position = 1  WHERE item_id = 20;
+UPDATE queue_items SET position = 2  WHERE item_id = 10;
+COMMIT;</code></pre>
+</figure>
+
+<h2 id="type-selection"><span class="num">06.</span> Choosing data types deliberately</h2>
+<p class="lead">
+  A type defines representation, valid operations, comparison rules, storage behavior and available
+  indexes. Choose the type that matches meaning, not the format used by one client.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Meaning</th>
+        <th>Strong default</th>
+        <th>Avoid</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Whole count</td>
+        <td>integer or bigint</td>
+        <td>text or floating point</td>
+      </tr>
+      <tr>
+        <td>Exact money-like quantity</td>
+        <td>numeric(p, s), or integer minor units by contract</td>
+        <td>real or double precision</td>
+      </tr>
+      <tr>
+        <td>Measured scientific value</td>
+        <td>double precision</td>
+        <td>numeric when approximation is intended and speed matters</td>
+      </tr>
+      <tr>
+        <td>Human text</td>
+        <td>text, with CHECK if a limit is a rule</td>
+        <td>char(n) padding without a fixed-format requirement</td>
+      </tr>
+      <tr>
+        <td>Yes/no state</td>
+        <td>boolean</td>
+        <td>0/1 text conventions</td>
+      </tr>
+      <tr>
+        <td>Global identifier</td>
+        <td>uuid</td>
+        <td>varchar UUID representation</td>
+      </tr>
+      <tr>
+        <td>Real instant</td>
+        <td>timestamptz</td>
+        <td>local timestamp with an unstated zone</td>
+      </tr>
+      <tr>
+        <td>Local wall-clock value</td>
+        <td>timestamp without time zone</td>
+        <td>invented UTC conversion for a non-instant</td>
+      </tr>
+      <tr>
+        <td>Structured flexible payload</td>
+        <td>jsonb</td>
+        <td>text containing unvalidated JSON</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PostgreSQL's <code>text</code> and <code>varchar</code> have the same general storage and
+  performance characteristics. Use <code>varchar(n)</code> only when length n is a genuine rule, not
+  a guess. <code>char(n)</code> blank-pads values and is rarely a good default. Phone numbers,
+  postal codes and account codes are text even when they contain digits, because arithmetic is not
+  their meaning and leading zeros may matter.
+</p>
+
+<h2 id="timestamps"><span class="num">07.</span> TIMESTAMPTZ versus TIMESTAMP</h2>
+<p class="lead">
+  Choose between an instant on the global timeline and a local calendar or wall-clock value. The
+  type names are confusing, so reason from meaning rather than spelling.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Represents</th>
+        <th>Typical examples</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>timestamptz</code></td>
+        <td>One instant, displayed in the session time zone</td>
+        <td>created_at, paid_at, event occurrence</td>
+      </tr>
+      <tr>
+        <td><code>timestamp</code></td>
+        <td>Date and wall-clock fields without a zone or offset</td>
+        <td>Store opens at local 09:00, floating schedule template</td>
+      </tr>
+      <tr>
+        <td><code>date</code></td>
+        <td>Calendar date without time</td>
+        <td>Birthday, billing date</td>
+      </tr>
+      <tr>
+        <td><code>time</code></td>
+        <td>Time of day without a date</td>
+        <td>Recurring local opening time</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PostgreSQL converts <code>timestamptz</code> input to an internal UTC instant. It does not retain
+  the original zone name. On output, it converts the instant to the session's <code>TimeZone</code>.
+  Therefore the same value can display as different local times in Kolkata and New York while still
+  representing one instant.
+</p>
+
+<figure class="code">
+  <figcaption><b>One instant, two displays</b></figcaption>
+  <pre><code>SET TIME ZONE 'Asia/Kolkata';
+SELECT TIMESTAMPTZ '2026-07-22 10:00:00+05:30';
+
+SET TIME ZONE 'America/New_York';
+SELECT TIMESTAMPTZ '2026-07-22 10:00:00+05:30';
+-- The displayed wall time changes; the instant does not.</code></pre>
+</figure>
+
+<p>
+  Plain <code>timestamp</code> means <code>timestamp without time zone</code>. If input contains an
+  offset but the target type is plain timestamp, PostgreSQL ignores the zone indication rather than
+  converting the value. Use explicit types in literals and parameterized client values to avoid
+  accidental interpretation.
+</p>
+
+<h3 id="scheduling">Future schedules and named zones</h3>
+<p>
+  A future appointment described as "09:00 in Europe/Paris" may need both a local timestamp and an
+  IANA zone name. Storing only the current UTC conversion can lose the user's intended civil time if
+  time-zone rules later change. Conversely, an event that already occurred should normally be stored
+  as an instant. Model the intent.
+</p>
+
+<figure class="code">
+  <figcaption><b>Recurring or future local schedule</b></figcaption>
+  <pre><code>CREATE TABLE appointments (
+    appointment_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    local_starts_at timestamp NOT NULL,
+    time_zone_name  text NOT NULL,
+    CONSTRAINT appointments_zone_known CHECK (
+        time_zone_name = ANY (
+            ARRAY['Asia/Kolkata', 'Europe/Paris', 'America/New_York']
+        )
+    )
+);</code></pre>
+</figure>
+
+<p>
+  A fixed application-managed allow-list check is shown only for a small bounded domain. If zones
+  are configurable, use a referenced table populated from supported policy or validate against
+  <code>pg_timezone_names</code> in controlled application logic. A CHECK constraint should not
+  query a changing catalog.
+</p>
+
+<div class="warn">
+  <strong>A time-zone offset is not a time-zone identity</strong>
+  <p>
+    <code>+01:00</code> does not describe daylight-saving transitions or historical rules. Use an
+    IANA name such as <code>Europe/Paris</code> when future civil-time behavior matters. Avoid
+    <code>time with time zone</code> for ordinary scheduling because a zone rule generally needs a
+    date.
+  </p>
+</div>
+
+<h2 id="numbers"><span class="num">08.</span> NUMERIC versus floating point</h2>
+<p class="lead">
+  Use NUMERIC when decimal exactness is part of correctness. Use floating point when approximation
+  is expected and its range or calculation speed is valuable.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Behavior</th>
+        <th>Good fit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>numeric(p, s)</code></td>
+        <td>Exact decimal arithmetic where possible; declared rounding and range</td>
+        <td>Money, tax rates, contractual quantities</td>
+      </tr>
+      <tr>
+        <td><code>numeric</code></td>
+        <td>Unconstrained precision and scale within implementation limits</td>
+        <td>General arbitrary-precision values with varied scale</td>
+      </tr>
+      <tr>
+        <td><code>real</code></td>
+        <td>Four-byte approximate IEEE 754 value</td>
+        <td>Space-sensitive approximate measurements</td>
+      </tr>
+      <tr>
+        <td><code>double precision</code></td>
+        <td>Eight-byte approximate IEEE 754 value</td>
+        <td>Scientific calculations and measured values</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  In <code>numeric(12, 2)</code>, precision 12 is the total significant decimal digits and scale 2
+  is the fractional digits. PostgreSQL rounds inputs with more fractional digits to the declared
+  scale, then rejects a result whose integer part is too wide. Do not assume excessive fractional
+  input always raises an error.
+</p>
+
+<figure class="code">
+  <figcaption><b>Exact price model</b></figcaption>
+  <pre><code>CREATE TABLE invoice_lines (
+    invoice_id bigint NOT NULL REFERENCES invoices ON DELETE CASCADE,
+    line_no    integer NOT NULL,
+    quantity   numeric(12, 3) NOT NULL CHECK (quantity &gt; 0),
+    unit_price numeric(14, 4) NOT NULL CHECK (unit_price &gt;= 0),
+    PRIMARY KEY (invoice_id, line_no)
+);
+
+SELECT quantity * unit_price AS unrounded_line_total
+FROM invoice_lines;</code></pre>
+</figure>
+
+<p>
+  Define where rounding occurs and which rounding rule the business accepts. Rounding each line and
+  then summing can differ from summing high-precision values and rounding once. Currency also needs
+  a currency code; the number 100 alone does not distinguish INR from USD. For a single-currency,
+  fixed-scale domain, integer minor units can be excellent, but the contract must handle currencies
+  with different minor-unit scales.
+</p>
+
+<div class="warn">
+  <strong>Never compare floats as if every decimal is exact</strong>
+  <p>
+    Many decimal fractions have no exact binary floating-point representation. Equality and
+    accumulated arithmetic can surprise you. Compare within a domain-approved tolerance when using
+    approximate values, and use NUMERIC for financial invariants.
+  </p>
+</div>
+
+<h2 id="arrays-enums"><span class="num">09.</span> Arrays and enums</h2>
+<p class="lead">
+  Arrays and enums are strong PostgreSQL features when their boundaries match the domain. They
+  become costly when used to hide relationships or fast-changing reference data.
+</p>
+
+<h3 id="arrays">Arrays</h3>
+<p>
+  PostgreSQL supports arrays of built-in and user-defined types. They are useful for small, bounded
+  collections that are naturally read and replaced with the parent, such as RGB samples, fixed
+  configuration coordinates or tags in a simple document-like model. Operators include containment
+  <code>@&gt;</code>, contained-by <code>&lt;@</code>, overlap <code>&amp;&amp;</code>,
+  concatenation and <code>= ANY(array)</code>. GIN indexes can accelerate common containment and
+  overlap queries.
+</p>
+
+<figure class="code">
+  <figcaption><b>Bounded array with shape checks</b></figcaption>
+  <pre><code>CREATE TABLE brand_themes (
+    brand_id bigint PRIMARY KEY REFERENCES brands ON DELETE CASCADE,
+    rgb      smallint[] NOT NULL,
+    CONSTRAINT brand_themes_rgb_shape CHECK (
+        array_ndims(rgb) = 1
+        AND cardinality(rgb) = 3
+        AND 0 &lt;= ALL (rgb)
+        AND 255 &gt;= ALL (rgb)
+    )
+);
+
+CREATE INDEX articles_tags_gin ON articles USING GIN (tags);
+SELECT * FROM articles WHERE tags @&gt; ARRAY['postgresql'];</code></pre>
+</figure>
+
+<p>
+  Declared array dimensions and lengths in a column type are documentation only in PostgreSQL; the
+  database does not enforce them. Add explicit checks when shape matters. Array lower bounds can
+  differ from 1, especially after construction or slicing, so use functions such as
+  <code>cardinality</code>, <code>array_length</code> and <code>unnest</code> instead of assuming a
+  bound.
+</p>
+
+<div class="warn">
+  <strong>Prefer a child table when elements are entities</strong>
+  <p>
+    If tags need foreign keys, metadata, unique ownership, individual updates, frequent joins or
+    analytics, use <code>article_tags(article_id, tag_id)</code>. Arrays cannot attach a foreign key
+    to each element, and concurrent updates rewrite the parent row's array value.
+  </p>
+</div>
+
+<h3 id="enums">Enums</h3>
+<p>
+  A PostgreSQL enum is a separate ordered type with a static set of case-sensitive labels. It gives
+  compact storage, type safety and meaningful ordering. It fits a small, stable, shared vocabulary
+  such as compass direction or a truly stable state machine.
+</p>
+
+<figure class="code">
+  <figcaption><b>Enum declaration and use</b></figcaption>
+  <pre><code>CREATE TYPE order_status AS ENUM (
+    'pending',
+    'paid',
+    'shipped',
+    'cancelled'
+);
+
+CREATE TABLE orders (
+    order_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    status   order_status NOT NULL DEFAULT 'pending'
+);
+
+ALTER TYPE order_status ADD VALUE 'refunded' AFTER 'paid';</code></pre>
+</figure>
+
+<p>
+  Existing enum labels can be added or renamed, but cannot be removed and cannot have their sort
+  order rearranged without replacing the type. Each enum type is distinct, even if two types contain
+  identical labels. These migration constraints make enums a poor fit for user-managed categories,
+  translated labels, frequently changing workflows or values with metadata.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>Prefer</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Small, stable, typed vocabulary</td>
+        <td>PostgreSQL enum</td>
+      </tr>
+      <tr>
+        <td>Simple values with easy migrations</td>
+        <td>text plus CHECK</td>
+      </tr>
+      <tr>
+        <td>Values have labels, permissions or active flags</td>
+        <td>Reference table plus foreign key</td>
+      </tr>
+      <tr>
+        <td>Values are tenant-configurable</td>
+        <td>Tenant-scoped reference table</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="jsonb"><span class="num">10.</span> JSONB without abandoning the model</h2>
+<p class="lead">
+  JSONB is a typed, queryable document value inside PostgreSQL. It is best for genuinely flexible or
+  externally shaped data, not as a default replacement for columns, keys and relationships.
+</p>
+
+<h3 id="json-jsonb">JSON versus JSONB</h3>
+<p>
+  <code>json</code> stores an exact copy of input text and reparses it during processing. It
+  preserves insignificant whitespace, key order and duplicate keys. <code>jsonb</code> stores a
+  decomposed binary representation, discards whitespace and object-key order, and keeps only the
+  last duplicate object key. JSONB is normally faster to process and supports indexes, so most
+  application schemas should prefer it. Use <code>json</code> only when preserving the original
+  lexical representation is itself a requirement.
+</p>
+
+<p>
+  SQL null and JSON <code>null</code> are different. A SQL null means the whole column is absent.
+  The JSONB value <code>'null'::jsonb</code> is a present JSON scalar. A missing object key is
+  different again. Define which states are legal before writing extraction logic.
+</p>
+
+<h3 id="columns-vs-jsonb">Column, related table or JSONB?</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Use a typed column or table when</th>
+        <th>JSONB is reasonable when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Is it core identity or a relationship?</td>
+        <td>It needs keys, FKs or joins</td>
+        <td>It is an opaque external reference detail</td>
+      </tr>
+      <tr>
+        <td>Is it frequently filtered or sorted?</td>
+        <td>Stable access path needs typed comparison</td>
+        <td>Queries are varied and containment-oriented</td>
+      </tr>
+      <tr>
+        <td>Must every row obey one rule?</td>
+        <td>NOT NULL, CHECK and type express the rule</td>
+        <td>Shape legitimately varies by source or subtype</td>
+      </tr>
+      <tr>
+        <td>Does it change independently?</td>
+        <td>Separate row avoids whole-document updates</td>
+        <td>Document is one atomic business value</td>
+      </tr>
+      <tr>
+        <td>Is the schema user-defined?</td>
+        <td>Stable platform fields remain columns</td>
+        <td>Bounded custom fields fit JSONB</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A useful hybrid keeps stable searchable facts as columns and flexible attributes in JSONB. For a
+  product catalog, <code>product_id</code>, seller id, name, price, currency and lifecycle status
+  are strong columns. Category-specific attributes such as screen size or fabric weave may fit a
+  bounded JSONB object if their shapes vary substantially.
+</p>
+
+<figure class="code">
+  <figcaption><b>Hybrid relational and document model</b></figcaption>
+  <pre><code>CREATE TABLE products (
+    product_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    seller_id   bigint NOT NULL REFERENCES sellers,
+    sku         text NOT NULL,
+    name        text NOT NULL,
+    price       numeric(12, 2) NOT NULL CHECK (price &gt;= 0),
+    currency    text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    attributes  jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT products_seller_sku_unique UNIQUE (seller_id, sku),
+    CONSTRAINT products_attributes_object CHECK (
+        jsonb_typeof(attributes) = 'object'
+    )
+);</code></pre>
+</figure>
+
+<h3 id="jsonb-operators">Reading and updating JSONB</h3>
+<figure class="code">
+  <figcaption><b>Extraction, containment, existence and update</b></figcaption>
+  <pre><code>-- -&gt; returns JSONB; -&gt;&gt; returns text.
+SELECT
+    attributes -&gt; 'dimensions' AS dimensions_json,
+    attributes -&gt;&gt; 'color' AS color_text
+FROM products;
+
+-- Structure-aware containment.
+SELECT *
+FROM products
+WHERE attributes @&gt; '{"color":"black"}'::jsonb;
+
+-- Top-level key existence.
+SELECT *
+FROM products
+WHERE attributes ? 'warranty_months';
+
+-- Replace or create a nested path and return a new document value.
+UPDATE products
+SET attributes = jsonb_set(
+    attributes,
+    '{dimensions,width_cm}',
+    to_jsonb(42.5::numeric),
+    true
+)
+WHERE product_id = 10;</code></pre>
+</figure>
+
+<p>
+  Extraction operators return null rather than failing when the requested structure is absent, so a
+  typo can look like missing data. Cast extracted text only after accounting for missing, JSON null,
+  empty and malformed values. Parameterize JSON values through the client driver instead of building
+  JSON strings manually.
+</p>
+
+<div class="warn">
+  <strong>A small field update still updates the row</strong>
+  <p>
+    JSONB functions produce a new document value. PostgreSQL's row-level concurrency and MVCC apply
+    to the entire table row, so two transactions changing different keys can still conflict or lose
+    an application-side read-modify-write update. Keep documents at a manageable atomic size and use
+    SQL-side updates plus concurrency controls where necessary.
+  </p>
+</div>
+
+<h2 id="jsonb-indexing"><span class="num">11.</span> Indexing inside JSONB</h2>
+<p class="lead">
+  Match the index expression and operator class to the exact query shapes. A JSONB column is not
+  automatically fast merely because PostgreSQL can query it.
+</p>
+
+<h3 id="gin-jsonb">Whole-document GIN indexes</h3>
+<figure class="code">
+  <figcaption><b>Flexible containment and existence index</b></figcaption>
+  <pre><code>CREATE INDEX products_attributes_gin
+    ON products USING GIN (attributes);
+
+SELECT *
+FROM products
+WHERE attributes @&gt; '{"color":"black"}'::jsonb;
+
+SELECT *
+FROM products
+WHERE attributes ? 'warranty_months';</code></pre>
+</figure>
+
+<p>
+  The default <code>jsonb_ops</code> GIN operator class supports key-existence operators
+  <code>?</code>, <code>?|</code>, <code>?&amp;</code>, containment <code>@&gt;</code>, and JSON
+  path matching with <code>@?</code> and <code>@@</code>. It is flexible because it indexes every
+  key and value, but that flexibility can produce a large index and write overhead.
+</p>
+
+<figure class="code">
+  <figcaption><b>Smaller containment-focused operator class</b></figcaption>
+  <pre><code>CREATE INDEX products_attributes_path_gin
+    ON products USING GIN (attributes jsonb_path_ops);</code></pre>
+</figure>
+
+<p>
+  <code>jsonb_path_ops</code> supports <code>@&gt;</code>, <code>@?</code> and <code>@@</code>, but
+  not the key-existence operators. It is usually smaller and more specific for containment-heavy
+  workloads. It can perform poorly for searches for structures with no values, such as an empty
+  object, because it does not create entries for every key by itself. Choose from observed query
+  operators, not from a generic rule.
+</p>
+
+<h3 id="jsonb-expression-index">Targeted expression indexes</h3>
+<p>
+  A B-tree expression index is often better for equality, range or ordering on one frequently used
+  scalar. The query expression must match the indexed expression, including casts.
+</p>
+
+<figure class="code">
+  <figcaption><b>Typed scalar expression indexes</b></figcaption>
+  <pre><code>CREATE INDEX products_color_idx
+    ON products ((attributes -&gt;&gt; 'color'));
+
+CREATE INDEX products_warranty_months_idx
+    ON products (((attributes -&gt;&gt; 'warranty_months')::integer));
+
+SELECT *
+FROM products
+WHERE (attributes -&gt;&gt; 'warranty_months')::integer &gt;= 24;</code></pre>
+</figure>
+
+<p>
+  If malformed JSON can make the cast fail, the index cannot be built reliably. Validate the field,
+  use a safe immutable extraction function, or promote the value to a real typed column. A targeted
+  GIN expression index can also index one nested collection.
+</p>
+
+<figure class="code">
+  <figcaption><b>Index only a frequently searched nested array</b></figcaption>
+  <pre><code>CREATE INDEX products_compatibility_gin
+    ON products USING GIN ((attributes -&gt; 'compatible_with'));
+
+SELECT *
+FROM products
+WHERE attributes -&gt; 'compatible_with' ? 'device-42';</code></pre>
+</figure>
+
+<h3 id="generated-column">Promoting a stable JSON field</h3>
+<p>
+  When a JSON key becomes required, heavily joined, frequently sorted or governed by a stable type,
+  promote it to a column. During a transition, a stored generated column can expose a typed same-row
+  expression for constraints and ordinary indexes, provided the expression is immutable and all
+  existing documents are valid.
+</p>
+
+<figure class="code">
+  <figcaption><b>Generated typed projection</b></figcaption>
+  <pre><code>ALTER TABLE products
+ADD COLUMN color text
+GENERATED ALWAYS AS (attributes -&gt;&gt; 'color') STORED;
+
+CREATE INDEX products_generated_color_idx ON products (color);</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Indexes have a write and storage budget</strong>
+  <p>
+    Every GIN or expression index consumes disk, WAL, cache and maintenance work on inserts and
+    updates. Start from actual predicates, sort requirements and selectivity. Topic 4 covers index
+    structures and planner decisions in depth.
+  </p>
+</div>
+
+<h2 id="complete-design"><span class="num">12.</span> Complete transactional schema example</h2>
+<p class="lead">
+  This compact shop model combines grain, normalization, keys, historical snapshots, constraints,
+  deliberate types and bounded JSONB.
+</p>
+
+<figure class="code">
+  <figcaption><b>Customers, products, orders and immutable line snapshots</b></figcaption>
+  <pre><code>CREATE TYPE order_status AS ENUM (
+    'pending', 'paid', 'shipped', 'cancelled'
+);
+
+CREATE TABLE customers (
+    customer_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    email       text NOT NULL,
+    full_name   text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT customers_email_unique UNIQUE (email),
+    CONSTRAINT customers_email_nonblank CHECK (btrim(email) &lt;&gt; '')
+);
+
+CREATE TABLE products (
+    product_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku           text NOT NULL UNIQUE,
+    name          text NOT NULL,
+    current_price numeric(12, 2) NOT NULL CHECK (current_price &gt;= 0),
+    attributes    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    active        boolean NOT NULL DEFAULT true,
+    CONSTRAINT products_attributes_object
+        CHECK (jsonb_typeof(attributes) = 'object')
+);
+
+CREATE TABLE orders (
+    order_id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id      uuid NOT NULL REFERENCES customers ON DELETE RESTRICT,
+    status           order_status NOT NULL DEFAULT 'pending',
+    currency         text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    ordered_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    shipping_name    text NOT NULL,
+    shipping_address jsonb NOT NULL,
+    CONSTRAINT orders_shipping_address_object
+        CHECK (jsonb_typeof(shipping_address) = 'object')
+);
+
+CREATE TABLE order_items (
+    order_id          bigint NOT NULL REFERENCES orders ON DELETE CASCADE,
+    line_no           integer NOT NULL CHECK (line_no &gt; 0),
+    product_id        bigint NOT NULL REFERENCES products ON DELETE RESTRICT,
+    product_name      text NOT NULL,
+    quantity          integer NOT NULL CHECK (quantity &gt; 0),
+    agreed_unit_price numeric(12, 2) NOT NULL CHECK (agreed_unit_price &gt;= 0),
+    PRIMARY KEY (order_id, line_no)
+);
+
+CREATE INDEX orders_customer_ordered_idx
+    ON orders (customer_id, ordered_at DESC, order_id DESC);
+CREATE INDEX order_items_product_idx ON order_items (product_id);
+CREATE INDEX products_attributes_gin ON products USING GIN (attributes);</code></pre>
+</figure>
+
+<p>
+  The product's current name and price are normalized in <code>products</code>. The order line also
+  stores the name and price accepted at checkout because these are historical agreement facts. They
+  should not silently change when a catalog editor changes the product. The shipping address is an
+  order-owned snapshot whose structure may vary by country, so bounded JSONB can be reasonable. If
+  the system must query postal code or country heavily, promote those fields to typed columns.
+</p>
+
+<p>
+  The database alone does not make an order immutable after payment. A state transition procedure,
+  permissions or trigger may be needed if only specific transitions are legal. Constraint design and
+  authorization design are related but separate responsibilities.
+</p>
+
+<h2 id="evolution"><span class="num">13.</span> Schema evolution and safe migrations</h2>
+<p class="lead">
+  A production schema is changed while old data and often old application versions still exist. Safe
+  changes separate expansion, backfill, validation and cleanup.
+</p>
+
+<ol class="clean">
+  <li>
+    <strong>Expand.</strong> Add a nullable column, new table or compatible representation without
+    breaking current code.
+  </li>
+  <li>
+    <strong>Write both or translate.</strong> Deploy code that can populate the new representation
+    while still serving the old contract if needed.
+  </li>
+  <li>
+    <strong>Backfill in bounded batches.</strong> Avoid one enormous transaction, monitor locks,
+    WAL, replication lag and application latency.
+  </li>
+  <li>
+    <strong>Validate.</strong> Compare old and new representations, then validate constraints.
+  </li>
+  <li><strong>Switch reads.</strong> Move consumers after data and indexes are ready.</li>
+  <li>
+    <strong>Contract.</strong> Stop old writes, remove obsolete columns or compatibility code in a
+    later release.
+  </li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Add and validate a large-table check in stages</b></figcaption>
+  <pre><code>ALTER TABLE products
+ADD CONSTRAINT products_price_nonnegative
+CHECK (current_price &gt;= 0) NOT VALID;
+
+-- New and changed rows are protected while existing rows can be repaired.
+ALTER TABLE products
+VALIDATE CONSTRAINT products_price_nonnegative;</code></pre>
+</figure>
+
+<p>
+  Adding a foreign key with <code>NOT VALID</code> follows the same broad idea: new writes are
+  checked, and existing rows are scanned later during validation. Lock behavior and version-specific
+  DDL optimizations matter on large tables, so test the exact migration on production-shaped data.
+</p>
+
+<h3 id="jsonb-promotion">Promoting JSONB to a column</h3>
+<ol class="clean">
+  <li>Add the new nullable typed column.</li>
+  <li>Backfill only documents with a valid convertible value.</li>
+  <li>Record and repair exceptions instead of hiding failed casts.</li>
+  <li>Deploy dual-write or make one representation generated from the other.</li>
+  <li>Add indexes and constraints after the values are trustworthy.</li>
+  <li>Switch reads and later remove the old JSON key if duplication is unnecessary.</li>
+</ol>
+
+<div class="warn">
+  <strong>Type changes are data migrations</strong>
+  <p>
+    Changing text to UUID, timestamp or numeric can fail on one bad row and may rewrite a large
+    table. Define explicit <code>USING</code> conversion logic, audit invalid values first, and plan
+    rollback or forward repair. Do not cast blindly during a high-risk deployment.
+  </p>
+</div>
+
+<h2 id="performance"><span class="num">14.</span> Performance implications of modeling choices</h2>
+<p class="lead">
+  Correct grain and constraints often improve performance because they give the optimizer reliable
+  structure and keep rows and indexes focused. Every convenience still has a cost profile.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Read effect</th>
+        <th>Write and storage effect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Narrow surrogate key</td>
+        <td>Compact joins and indexes</td>
+        <td>Needs separate natural UNIQUE rule</td>
+      </tr>
+      <tr>
+        <td>Wide composite key</td>
+        <td>Can satisfy relationship lookup directly</td>
+        <td>Propagates width into child rows and indexes</td>
+      </tr>
+      <tr>
+        <td>UUID key</td>
+        <td>Distributed identity without sequence round trip</td>
+        <td>Wider indexes; random versions reduce locality</td>
+      </tr>
+      <tr>
+        <td>Normalized tables</td>
+        <td>Joins required for combined views</td>
+        <td>Small authoritative updates and fewer anomalies</td>
+      </tr>
+      <tr>
+        <td>Denormalized copies</td>
+        <td>Can reduce expensive repeated computation</td>
+        <td>More bytes, writes and consistency work</td>
+      </tr>
+      <tr>
+        <td>Large JSONB document</td>
+        <td>Flexible retrieval as one value</td>
+        <td>Whole-row locks, row versions and large GIN entries</td>
+      </tr>
+      <tr>
+        <td>Many constraints</td>
+        <td>Reliable assumptions and cleaner data</td>
+        <td>Validation work, normally worth correctness</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Foreign keys perform checks during writes and can acquire locks needed to preserve referential
+  integrity. Missing child-side indexes can make parent deletes and updates scan the child table.
+  Unique constraints add indexes and therefore write amplification. These are not reasons to remove
+  integrity; they are reasons to select intentional keys and indexes.
+</p>
+
+<p>
+  Very wide rows reduce the number of rows that fit on a page. Frequently changed columns can make
+  updates more expensive, and large out-of-line values add TOAST access. Separate a large optional
+  one-to-one payload when its access and update pattern differs from the core row, but do not split
+  tables without measuring the resulting joins and life-cycle complexity.
+</p>
+
+<h2 id="gotchas"><span class="num">15.</span> Common mistakes and diagnostic questions</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely design cause</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Same fact has conflicting values</td>
+        <td>Partial or transitive dependency</td>
+        <td>Give the fact one authoritative table</td>
+      </tr>
+      <tr>
+        <td>Duplicate business entities</td>
+        <td>Surrogate key without natural UNIQUE rule</td>
+        <td>Protect the actual candidate key</td>
+      </tr>
+      <tr>
+        <td>Orphan rows appear</td>
+        <td>Application-only relationship validation</td>
+        <td>Add and validate a foreign key</td>
+      </tr>
+      <tr>
+        <td>CHECK permits null unexpectedly</td>
+        <td>Null makes the expression unknown</td>
+        <td>Add NOT NULL when absence is invalid</td>
+      </tr>
+      <tr>
+        <td>Unique nullable value repeats</td>
+        <td>Nulls are distinct by default</td>
+        <td>Use NULLS NOT DISTINCT if that is the rule</td>
+      </tr>
+      <tr>
+        <td>Parent deletion is slow</td>
+        <td>Unindexed referencing foreign key</td>
+        <td>Add the child-side access index</td>
+      </tr>
+      <tr>
+        <td>Historical order changes with catalog</td>
+        <td>Snapshot fact was not captured</td>
+        <td>Store agreed values on the order line</td>
+      </tr>
+      <tr>
+        <td>Timestamps shift or lose meaning</td>
+        <td>Instant and wall time were confused</td>
+        <td>Choose timestamptz or local timestamp plus zone by meaning</td>
+      </tr>
+      <tr>
+        <td>Financial totals differ by a cent</td>
+        <td>Float or inconsistent rounding stage</td>
+        <td>Use numeric and define rounding contract</td>
+      </tr>
+      <tr>
+        <td>Enum migration becomes painful</td>
+        <td>Vocabulary was not actually static</td>
+        <td>Use text plus CHECK or a reference table</td>
+      </tr>
+      <tr>
+        <td>JSON query misses an index</td>
+        <td>Operator or expression does not match index</td>
+        <td>Match query shape and inspect the plan</td>
+      </tr>
+      <tr>
+        <td>Two JSON key updates conflict</td>
+        <td>Document shares one table row</td>
+        <td>Use atomic SQL update, locking, or split independent facts</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ol class="clean">
+  <li>State the grain and candidate keys for every table.</li>
+  <li>Look for facts repeated across rows and identify their determinant.</li>
+  <li>Test null, empty, duplicate, boundary and invalid relationship inputs.</li>
+  <li>Walk every foreign key's delete and update action in plain business language.</li>
+  <li>Check whether child foreign-key columns have indexes for important access paths.</li>
+  <li>Classify each time value as instant, date, local time or local timestamp plus named zone.</li>
+  <li>Classify each number as exact count, exact decimal or approximate measurement.</li>
+  <li>For every JSON key, ask whether it now deserves a column or related table.</li>
+  <li>For every duplicate, identify source of truth, synchronization and repair.</li>
+  <li>Measure query plans and write cost using production-shaped data.</li>
+</ol>
+
+<h2 id="practice"><span class="num">16.</span> Practice problems</h2>
+
+<div class="qa">
+  <p class="q">1. An order table has product_1, product_2 and product_3 columns. Redesign it.</p>
+  <p class="a">
+    Keep one row per order in orders. Add order_items with one row per line, a foreign key to the
+    order, a foreign key to the product, quantity, agreed price, and a primary key such as
+    (order_id, line_no). This removes the arbitrary three-item limit and permits normal joins and
+    aggregates.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    2. Users have a surrogate id, but duplicate usernames must be impossible within one tenant.
+  </p>
+  <p class="a">
+    Keep the surrogate primary key and add <code>UNIQUE (tenant_id, username)</code>. If username
+    comparison is case-insensitive by policy, encode the same normalization in writes and the unique
+    rule, for example with an appropriate collation, citext extension, or a lower-case expression
+    index chosen deliberately.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">3. A product can have user-defined attributes. Where should they live?</p>
+  <p class="a">
+    Keep identity, ownership, lifecycle and frequently queried stable fields in typed columns.
+    Bounded custom attributes can live in a JSONB object with a shape check. Add targeted indexes
+    for proven access paths, and promote any attribute that becomes required, relational or heavily
+    queried.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. Model one active subscription per customer with retained history.</p>
+  <p class="a">
+    Store each subscription as its own row with start and end instants. Add a partial unique index
+    on customer_id where ended_at is null. Add checks that an end follows the start. Use a
+    transaction and locking appropriate to the creation workflow.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Store a webinar at 09:00 next year in the organizer's location.</p>
+  <p class="a">
+    If the promise is a local civil time, store a timestamp without time zone plus the IANA zone
+    name. Derive an instant for delivery using the applicable time-zone rules. If the instant is
+    contractually fixed regardless of later rule changes, store timestamptz and optionally retain
+    the display zone separately.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">6. A CHECK constraint calls a function that queries another table. What is wrong?</p>
+  <p class="a">
+    PostgreSQL assumes a CHECK result remains stable for the same row and does not recheck it after
+    other-table changes. The database can reach a violating state and dump/restore can fail. Use a
+    foreign key, unique or exclusion constraint, remodeled data, or a carefully maintained trigger.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">17.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: What is normalization and why use it?</p>
+  <p class="a">
+    Normalization organizes facts according to keys and functional dependencies. It reduces
+    duplicated truth and prevents update, insert and delete anomalies. It is a correctness tool, not
+    a requirement to maximize table count.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Explain 1NF, 2NF and 3NF simply.</p>
+  <p class="a">
+    1NF removes repeating groups and gives rows a consistent relational shape. 2NF requires every
+    non-key fact to depend on the whole composite key, not part of it. 3NF removes dependencies of
+    non-key facts on other non-key facts. Always connect these definitions to concrete anomalies.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When is denormalization justified?</p>
+  <p class="a">
+    After a correct normalized design and measured workload show a material read or reporting
+    problem. The design must name the source of truth, update mechanism, allowed staleness, drift
+    detection and rebuild path. Historical snapshots are also legitimate because they represent a
+    different time-specific fact.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Primary key versus unique constraint?</p>
+  <p class="a">
+    Both enforce uniqueness through a unique B-tree index, but a primary key also forces non-null,
+    declares the chosen row identity, and is the default foreign-key target. A table has at most one
+    primary key but can have several alternate unique constraints.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Does a foreign key automatically create an index?</p>
+  <p class="a">
+    PostgreSQL indexes the referenced primary or unique key, but does not automatically index the
+    referencing columns. Add a child-side index when joins and parent changes need to find those
+    rows efficiently, accounting for any existing composite index prefix.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: NO ACTION versus RESTRICT?</p>
+  <p class="a">
+    NO ACTION is the default and can permit a temporary violation until a deferred constraint is
+    checked later. RESTRICT rejects the referenced change immediately and cannot be deferred. Both
+    usually prevent the parent change when references remain.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can CHECK allow a null?</p>
+  <p class="a">
+    A CHECK passes when its expression is true or unknown. Comparisons involving null commonly
+    produce unknown. Add NOT NULL when absence itself is invalid, and use CHECK for the value rule.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: UUID versus bigint primary key?</p>
+  <p class="a">
+    Bigint identity keys are narrow, ordered and efficient inside one database. UUIDs support
+    decentralized generation and opaque globally unique identifiers but use wider indexes, and
+    random variants have weaker locality. Choose from generation topology, exposure and workload,
+    not fashion.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: TIMESTAMPTZ versus TIMESTAMP?</p>
+  <p class="a">
+    Timestamptz represents one instant and displays it in the session zone. Timestamp without time
+    zone stores local date-time fields without identifying an instant. Use timestamptz for occurred
+    events and timestamp plus a named zone when future civil-time intent must be preserved.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: NUMERIC versus DOUBLE PRECISION?</p>
+  <p class="a">
+    Numeric provides exact decimal behavior where possible and is appropriate for money and
+    contractual quantities, at greater CPU and storage cost. Double precision is fast approximate
+    binary floating point for measurements and scientific work. Decimal equality must not be assumed
+    for floats.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Enum, CHECK or reference table?</p>
+  <p class="a">
+    Use enum for a small stable typed set, text plus CHECK for simple values that need easy schema
+    evolution, and a reference table when values have metadata, life cycles, permissions,
+    translations or tenant ownership.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When should a value be a column instead of JSONB?</p>
+  <p class="a">
+    Prefer a column when it is required, stable, relational, frequently filtered or sorted, or needs
+    strong type and constraint semantics. JSONB fits variable, bounded, document-like attributes
+    that form one atomic value. Hybrid models are often strongest.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: jsonb_ops versus jsonb_path_ops?</p>
+  <p class="a">
+    The default jsonb_ops GIN class supports existence, containment and JSON path operators and is
+    flexible. jsonb_path_ops supports containment and JSON path matching but not key-existence; it
+    is usually smaller and more specific for those supported searches. Pick from actual predicates.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">18.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li><strong>Grain:</strong> state exactly what one row represents before choosing columns.</li>
+  <li><strong>Candidate key:</strong> minimal attributes that uniquely identify the row.</li>
+  <li><strong>1NF:</strong> consistent rows and no numbered repeating groups.</li>
+  <li><strong>2NF:</strong> non-key facts depend on the whole composite key.</li>
+  <li><strong>3NF:</strong> non-key facts do not depend on other non-key facts.</li>
+  <li>
+    <strong>Denormalize:</strong> only with source of truth, sync, staleness and repair plans.
+  </li>
+  <li><strong>Surrogate id:</strong> does not replace a business UNIQUE constraint.</li>
+  <li><strong>Primary key:</strong> unique, non-null chosen identity with a B-tree index.</li>
+  <li><strong>Foreign key:</strong> protects relationships; index important child-side lookups.</li>
+  <li><strong>CASCADE:</strong> use for owned components, not independent objects.</li>
+  <li><strong>CHECK:</strong> passes true or null; pair with NOT NULL when required.</li>
+  <li><strong>Unique nulls:</strong> distinct by default; use NULLS NOT DISTINCT when needed.</li>
+  <li><strong>UUID:</strong> distributed identity, wider indexes; use the native type.</li>
+  <li>
+    <strong>TIMESTAMPTZ:</strong> instant; <strong>TIMESTAMP:</strong> local wall-clock fields.
+  </li>
+  <li>
+    <strong>NUMERIC:</strong> exact decimal; <strong>DOUBLE:</strong> approximate measurement.
+  </li>
+  <li><strong>Array:</strong> bounded atomic collection, not a hidden relationship table.</li>
+  <li><strong>Enum:</strong> small stable set; reference table for configurable metadata.</li>
+  <li><strong>JSONB:</strong> flexible atomic data; keep core stable facts as columns.</li>
+  <li><strong>GIN:</strong> broad containment; expression B-tree for typed scalar access.</li>
+  <li><strong>Migrations:</strong> expand, backfill, validate, switch, then contract.</li>
+</ul>
+
+<h2 id="references"><span class="num">19.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-constraints.html"
+      >Constraints, keys and referential actions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-identity-columns.html">Identity columns</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/datatype.html">PostgreSQL data types</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/datatype-uuid.html">UUID type</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/datatype-datetime.html"
+      >Date, time and time-zone behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/datatype-numeric.html">Numeric types</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/arrays.html">Array types</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/datatype-enum.html">Enumerated types</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/datatype-json.html"
+      >JSON and JSONB design and indexing</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-json.html"
+      >JSON functions, operators and SQL/JSON paths</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-generated-columns.html"
+      >Generated columns</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-altertable.html"
+      >ALTER TABLE and constraint validation</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
