@@ -1,0 +1,1641 @@
+<h1>PostgreSQL EXPLAIN ANALYZE &amp; Query Optimization - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to reading query plans, diagnosing wrong estimates,
+  understanding scan and join strategies, controlling memory, and improving slow SQL with evidence.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The query-plan mental model</h2>
+<p class="lead">
+  SQL describes the result you want. PostgreSQL's planner chooses an executable tree of operations
+  that can produce it. Query optimization is the discipline of comparing that prediction with what
+  execution really did, finding the largest mismatch or waste, and fixing its cause.
+</p>
+
+<p>
+  A single SQL statement can be executed in many equivalent ways. PostgreSQL can scan a table
+  directly or through an index, start from either side of a join, and combine rows with a nested
+  loop, hash join or merge join. The planner estimates the cost of possible paths from table
+  statistics, configuration, indexes and query structure. It then chooses the plan with the lowest
+  estimated cost, not the plan with the most indexes or the shortest-looking output.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of route planning. The SQL statement gives a destination. Statistics are the map and
+    traffic model. Cost settings describe how expensive different roads seem. The plan is the chosen
+    route, and <code>EXPLAIN ANALYZE</code> is the trip record. If the map says 10 cars use a road
+    but 100,000 actually appear, the route choice can be reasonable for the estimate and still be
+    terrible in reality.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Plan evidence</th>
+        <th>Typical response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Did PostgreSQL expect the right number of rows?</td>
+        <td>Estimated <code>rows</code> versus actual <code>rows × loops</code></td>
+        <td>Refresh or improve statistics; fix predicates or data modeling</td>
+      </tr>
+      <tr>
+        <td>Where was time spent?</td>
+        <td>Actual node time, loops, I/O timing and execution time</td>
+        <td>Reduce repeated work or expensive input</td>
+      </tr>
+      <tr>
+        <td>Was unnecessary data read?</td>
+        <td>Buffers, rows removed, heap fetches and scan conditions</td>
+        <td>Improve access path, predicate, index or selected columns</td>
+      </tr>
+      <tr>
+        <td>Did an operation spill?</td>
+        <td>Sort Method, Disk, hash Batches and temporary buffers</td>
+        <td>Reduce rows/width or test a scoped memory change</td>
+      </tr>
+      <tr>
+        <td>Was the join strategy suitable?</td>
+        <td>Join node, child sizes, order, loops, sorts and batches</td>
+        <td>Fix estimates and access paths before forcing a method</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The planner is usually rational about the information it has</strong>
+  <p>
+    A bad plan is often a symptom of wrong row estimates, missing access paths, an expression that
+    cannot use an index, inadequate memory, or a query that asks for too much work. Disabling a plan
+    type can hide the symptom without correcting the model.
+  </p>
+</div>
+
+<h2 id="explain-syntax"><span class="num">01.</span> EXPLAIN, EXPLAIN ANALYZE and safe syntax</h2>
+<p class="lead">
+  Plain <code>EXPLAIN</code> shows the planner's prediction without executing the statement.
+  <code>EXPLAIN ANALYZE</code> executes it and adds measurements. That difference is operationally
+  important.
+</p>
+
+<figure class="code">
+  <figcaption><b>Useful starting forms</b></figcaption>
+  <pre><code>-- Prediction only. Safe for inspecting a write because it is not executed.
+EXPLAIN
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Execute and compare estimates with reality.
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- Add I/O timing when track_io_timing is enabled.
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS)
+SELECT customer_id, SUM(total)
+FROM orders
+WHERE ordered_at &gt;= CURRENT_DATE - INTERVAL '90 days'
+GROUP BY customer_id;
+
+-- Machine-readable plan for tooling and stable parsing.
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT * FROM orders WHERE order_id = 1001;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Option</th>
+        <th>What it adds</th>
+        <th>When it helps</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ANALYZE</code></td>
+        <td>Executes the statement; reports actual rows, time and loops</td>
+        <td>Validating estimates and locating execution work</td>
+      </tr>
+      <tr>
+        <td><code>BUFFERS</code></td>
+        <td>Shared, local and temporary block activity</td>
+        <td>Separating CPU work from cache and storage work</td>
+      </tr>
+      <tr>
+        <td><code>WAL</code></td>
+        <td>WAL records, full-page images and bytes</td>
+        <td>Understanding write amplification for modifying statements</td>
+      </tr>
+      <tr>
+        <td><code>SETTINGS</code></td>
+        <td>Plan-relevant settings that differ from built-in defaults</td>
+        <td>Making plan experiments reproducible</td>
+      </tr>
+      <tr>
+        <td><code>VERBOSE</code></td>
+        <td>Output expressions, qualified object names and more detail</td>
+        <td>Tracing columns through complex plans</td>
+      </tr>
+      <tr>
+        <td><code>TIMING OFF</code></td>
+        <td>Disables per-node clock calls but still counts rows</td>
+        <td>Reducing instrumentation overhead on timing-sensitive systems</td>
+      </tr>
+      <tr>
+        <td><code>SUMMARY</code></td>
+        <td>Planning and execution summary</td>
+        <td>Controlling concise output</td>
+      </tr>
+      <tr>
+        <td><code>FORMAT JSON</code></td>
+        <td>Structured output instead of display-oriented text</td>
+        <td>Automation, comparison and plan visualization tools</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>ANALYZE really runs the statement</strong>
+  <p>
+    A data-changing statement will change data, fire triggers, wait for locks and generate WAL.
+    Plain <code>EXPLAIN</code> is prediction-only. To measure a reversible write, use an explicit
+    transaction and <code>ROLLBACK</code>, but remember that external side effects from volatile
+    functions or non-transactional systems might not roll back.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Measure a write without keeping its database changes</b></figcaption>
+  <pre><code>BEGIN;
+
+EXPLAIN (ANALYZE, BUFFERS, WAL)
+UPDATE orders
+SET status = 'archived'
+WHERE status = 'cancelled'
+  AND ordered_at &lt; CURRENT_DATE - INTERVAL '1 year';
+
+ROLLBACK;</code></pre>
+</figure>
+
+<p>
+  Run performance tests with production-like data distribution and row counts. A one-page test table
+  often gets a sequential scan because reading that page directly is cheaper than traversing an
+  index. The same query can get a different plan after the table grows, statistics change, cache
+  state changes, parameters differ, or a PostgreSQL version changes.
+</p>
+
+<h2 id="plan-tree"><span class="num">02.</span> Reading a plan as a tree</h2>
+<p class="lead">
+  A plan is a pull-based tree. Parent nodes request rows from their indented child nodes. Read from
+  the deepest children upward to understand how rows are produced, then use the top node for the
+  statement-level result.
+</p>
+
+<figure class="code">
+  <figcaption><b>Illustrative text plan</b></figcaption>
+  <pre><code>Hash Join  (cost=85.00..960.00 rows=2400 width=48)
+           (actual time=1.200..12.900 rows=2510 loops=1)
+  Hash Cond: (o.customer_id = c.customer_id)
+  -&gt; Seq Scan on orders o
+       (cost=0.00..810.00 rows=2400 width=32)
+       (actual time=0.020..10.100 rows=2510 loops=1)
+       Filter: (status = 'paid')
+       Rows Removed by Filter: 27490
+  -&gt; Hash
+       (cost=60.00..60.00 rows=2000 width=16)
+       (actual time=1.100..1.100 rows=2000 loops=1)
+       Buckets: 2048  Batches: 1  Memory Usage: 110kB
+       -&gt; Seq Scan on customers c
+            (cost=0.00..60.00 rows=2000 width=16)
+            (actual time=0.010..0.650 rows=2000 loops=1)
+Planning Time: 0.400 ms
+Execution Time: 13.200 ms</code></pre>
+</figure>
+
+<ol class="clean">
+  <li>
+    The bottom customer scan supplies 2,000 rows to <code>Hash</code>, which builds an in-memory
+    lookup table.
+  </li>
+  <li>
+    The order scan reads 30,000 rows, removes 27,490 by its filter, and emits 2,510 paid orders.
+  </li>
+  <li>The hash join probes the customer hash with those orders and emits 2,510 joined rows.</li>
+  <li>
+    Estimates are close here, and the hash uses one batch, so the first question is whether reading
+    all 30,000 orders is acceptable for the observed latency and query frequency.
+  </li>
+</ol>
+
+<h3 id="conditions">Index Cond, Recheck Cond, Filter and Join Filter</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Label</th>
+        <th>Meaning</th>
+        <th>Diagnostic clue</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Index Cond</code></td>
+        <td>Condition used to navigate or restrict index entries</td>
+        <td>The index is doing search work, not merely being scanned</td>
+      </tr>
+      <tr>
+        <td><code>Recheck Cond</code></td>
+        <td>Condition verified against heap rows after a bitmap match</td>
+        <td>Expected for bitmap scans; lossy pages can increase rechecks</td>
+      </tr>
+      <tr>
+        <td><code>Filter</code></td>
+        <td>Condition applied after a node obtains candidate rows</td>
+        <td>Large rows removed can expose wasted reads or a missing index condition</td>
+      </tr>
+      <tr>
+        <td><code>Hash Cond</code> or <code>Merge Cond</code></td>
+        <td>Equality condition that drives the join algorithm</td>
+        <td>Defines the keys used to match the two inputs</td>
+      </tr>
+      <tr>
+        <td><code>Join Filter</code></td>
+        <td>Additional condition evaluated after candidate pairs meet</td>
+        <td>Many removed pairs can be expensive, especially inside loops</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Node figures include child work</strong>
+  <p>
+    A parent's elapsed range covers work performed while it pulls from its children. Do not add
+    every node time because that double-counts nested work. To approximate exclusive time, compare a
+    parent with its children carefully, account for loops, and use buffers and I/O evidence.
+  </p>
+</div>
+
+<h2 id="numbers"><span class="num">03.</span> Costs, rows, width, actual time and loops</h2>
+<p class="lead">
+  Every number answers a different question. Costs are planner estimates in arbitrary units. Actual
+  times are measured milliseconds. Never compare a cost number directly with milliseconds.
+</p>
+
+<figure class="code">
+  <figcaption><b>Anatomy of one node</b></figcaption>
+  <pre><code>Index Scan using orders_customer_id_idx on orders
+  (cost=0.43..18.77 rows=6 width=72)
+  (actual time=0.025..0.090 rows=120 loops=50)</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Meaning</th>
+        <th>How to interpret it</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Startup cost <code>0.43</code></td>
+        <td>Estimated work before the first row can be returned</td>
+        <td>High for blocking nodes such as a full sort or hash build</td>
+      </tr>
+      <tr>
+        <td>Total cost <code>18.77</code></td>
+        <td>Estimated work if the node runs to completion</td>
+        <td>Planner compares alternatives using cost, adjusted for LIMIT-like demand</td>
+      </tr>
+      <tr>
+        <td>Estimated rows <code>6</code></td>
+        <td>Rows emitted by one execution of this node</td>
+        <td>Not necessarily rows scanned or filtered internally</td>
+      </tr>
+      <tr>
+        <td>Width <code>72</code></td>
+        <td>Estimated average bytes per emitted row</td>
+        <td>Wide rows increase memory, copying, sorting and hash-table size</td>
+      </tr>
+      <tr>
+        <td>Actual time <code>0.025..0.090</code></td>
+        <td>Average time to first row and completion per loop</td>
+        <td>Multiply by loops for an approximate total across executions</td>
+      </tr>
+      <tr>
+        <td>Actual rows <code>120</code></td>
+        <td>Average rows emitted per loop</td>
+        <td>Total output is approximately <code>120 × 50 = 6,000</code></td>
+      </tr>
+      <tr>
+        <td>Loops <code>50</code></td>
+        <td>Number of times the node was executed</td>
+        <td>Often one inner execution per outer row in a nested loop</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  In this example, PostgreSQL expected about 6 rows per index lookup but received about 120, a 20
+  times underestimate. Across 50 loops, the node emitted roughly 6,000 rows rather than the roughly
+  300 implied by the estimate. That multiplicative error can make a nested loop look cheap during
+  planning and expensive during execution.
+</p>
+
+<h3 id="cost-model">What cost represents</h3>
+<p>
+  Cost combines estimated page access and CPU work using settings such as
+  <code>seq_page_cost</code>, <code>random_page_cost</code>, <code>cpu_tuple_cost</code> and
+  <code>cpu_operator_cost</code>. The scale is relative. Its purpose is to rank candidate plans on
+  the configured system, not predict wall-clock duration.
+</p>
+
+<ul class="clean">
+  <li>A lower estimated cost can still run slower if estimates are wrong.</li>
+  <li>Warm-cache and cold-cache executions can have the same plan but different times.</li>
+  <li>A fast node repeated 500,000 times can dominate a query.</li>
+  <li>
+    A <code>LIMIT</code> can stop a child early, so its actual rows may be below full-run estimates.
+  </li>
+  <li>Parallel-node row and loop reporting requires attention to leader and worker activity.</li>
+</ul>
+
+<h2 id="scans"><span class="num">04.</span> Sequential, index, index-only and bitmap scans</h2>
+<p class="lead">
+  A scan strategy is not a quality label. It is an access path chosen for an estimated fraction of
+  the table, required order, row width, physical locality and cost model.
+</p>
+
+<h3 id="seq-scan">Sequential Scan</h3>
+<p>
+  A <code>Seq Scan</code> reads table pages in physical order and tests each visible row. It is
+  often best when the query needs a large fraction of the table, the table is small, no usable index
+  exists, or index-driven random heap visits would cost more than reading the table once.
+</p>
+
+<figure class="code">
+  <figcaption><b>A sequential scan can be the correct plan</b></figcaption>
+  <pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, customer_id, total
+FROM orders
+WHERE status IN ('paid', 'shipped');
+
+Seq Scan on orders
+  Filter: (status = ANY ('{paid,shipped}'::text[]))
+  Rows Removed by Filter: 3800
+  Buffers: shared hit=920</code></pre>
+</figure>
+
+<p>
+  If 80 percent of rows qualify, an index on <code>status</code> may add traversal and scattered
+  heap access without avoiding much table work. Investigate a sequential scan when selectivity is
+  expected to be high, the table is large, execution is frequent, or the estimate is far from the
+  actual result. Do not investigate it only because its name contains "sequential."
+</p>
+
+<h3 id="index-scan">Index Scan</h3>
+<p>
+  An <code>Index Scan</code> walks matching index entries and fetches corresponding heap tuples. It
+  excels for selective predicates, ordered retrieval and small result sets. Heap access can be
+  scattered because PostgreSQL indexes are separate from the heap.
+</p>
+
+<figure class="code">
+  <figcaption><b>Selective lookup that also supplies order</b></figcaption>
+  <pre><code>CREATE INDEX orders_customer_ordered_idx
+    ON orders (customer_id, ordered_at DESC);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, ordered_at, total
+FROM orders
+WHERE customer_id = 42
+ORDER BY ordered_at DESC
+LIMIT 20;</code></pre>
+</figure>
+
+<p>
+  Look for the useful predicate under <code>Index Cond</code>. A condition only shown under
+  <code>Filter</code> may be evaluated after candidate entries are fetched. Column order, operator
+  class, casts, collation, expressions, partial-index predicates and parameter types all affect
+  whether a condition can become an index condition.
+</p>
+
+<h3 id="index-only-scan">Index Only Scan</h3>
+<p>
+  An <code>Index Only Scan</code> is possible when one index can supply every value the query needs.
+  PostgreSQL still has to check MVCC visibility. It can skip the heap only for pages marked
+  all-visible in the visibility map, so <code>Heap Fetches</code> is the critical measurement.
+</p>
+
+<figure class="code">
+  <figcaption><b>Cover a frequent read</b></figcaption>
+  <pre><code>CREATE INDEX orders_customer_cover_idx
+    ON orders (customer_id, ordered_at DESC)
+    INCLUDE (order_id, total);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, ordered_at, total
+FROM orders
+WHERE customer_id = 42
+ORDER BY ordered_at DESC
+LIMIT 20;
+
+-- A healthy, mostly static table may report:
+-- Index Only Scan using orders_customer_cover_idx on orders
+--   Heap Fetches: 0</code></pre>
+</figure>
+
+<p>
+  Frequent writes clear all-visible bits until vacuum can set them again. An index-only plan with
+  many heap fetches can therefore behave closer to an ordinary index scan. Adding payload columns
+  also enlarges the index and write cost, so covering indexes should target measured queries.
+</p>
+
+<h3 id="bitmap-scan">Bitmap Index Scan and Bitmap Heap Scan</h3>
+<p>
+  A bitmap plan separates matching from fetching. One or more
+  <code>Bitmap Index Scan</code> nodes collect tuple locations. PostgreSQL can combine them with
+  <code>BitmapAnd</code> or <code>BitmapOr</code>. A <code>Bitmap Heap Scan</code> then visits heap
+  pages in physical order and rechecks conditions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Middle-selectivity access path</b></figcaption>
+  <pre><code>Bitmap Heap Scan on orders
+  Recheck Cond: (customer_id = 42)
+  Heap Blocks: exact=310 lossy=0
+  -&gt; Bitmap Index Scan on orders_customer_id_idx
+       Index Cond: (customer_id = 42)</code></pre>
+</figure>
+
+<p>
+  Bitmap scans often win between the extremes of a few random index fetches and a whole-table
+  sequential scan. They reduce scattered heap I/O but do not preserve index order, so an
+  <code>ORDER BY</code> may still require a sort.
+</p>
+
+<div class="warn">
+  <strong>Lossy does not mean incorrect</strong>
+  <p>
+    When the bitmap cannot retain exact tuple locations within its memory allowance, it can record
+    page-level matches. The heap scan then checks all rows on those lossy pages against
+    <code>Recheck Cond</code>. Results remain correct, but extra CPU and heap work appear as lossy
+    blocks and rows removed by index recheck.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Access path</th>
+        <th>Typical strength</th>
+        <th>Important evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Seq Scan</td>
+        <td>Large fraction, compact table, bulk read</td>
+        <td>Buffers and rows removed</td>
+      </tr>
+      <tr>
+        <td>Index Scan</td>
+        <td>Selective or ordered retrieval</td>
+        <td>Index Cond, heap buffers, loops</td>
+      </tr>
+      <tr>
+        <td>Index Only Scan</td>
+        <td>Covered read on mostly all-visible pages</td>
+        <td>Heap Fetches and buffers</td>
+      </tr>
+      <tr>
+        <td>Bitmap Scan</td>
+        <td>Moderate result set or combined indexes</td>
+        <td>Exact/lossy blocks, recheck removals</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="joins"><span class="num">05.</span> Nested loop, hash and merge joins</h2>
+<p class="lead">
+  Join choice depends on input sizes, estimated matches, available order, indexes, operators and
+  memory. The same pair of tables can correctly use different algorithms for different parameters.
+</p>
+
+<h3 id="nested-loop">Nested Loop</h3>
+<p>
+  A nested loop obtains a row from its outer child and runs or probes the inner child for that row.
+  It is excellent when the outer input is small and the inner side has a cheap parameterized index
+  lookup. It is dangerous when the outer side is much larger than estimated or the inner work is
+  expensive.
+</p>
+
+<figure class="code">
+  <figcaption><b>Efficient selective nested loop</b></figcaption>
+  <pre><code>Nested Loop
+  -&gt; Index Scan using customers_pkey on customers c
+       Index Cond: (customer_id = 42)
+  -&gt; Index Scan using orders_customer_id_idx on orders o
+       Index Cond: (customer_id = c.customer_id)</code></pre>
+</figure>
+
+<p>
+  Inspect the inner node's <code>loops</code>. An inner lookup taking 0.05 ms seems cheap, but
+  200,000 loops imply about 10 seconds of repeated work before accounting for other nodes.
+  PostgreSQL may add <code>Memoize</code> to cache repeated parameterized inner results when outer
+  keys repeat.
+</p>
+
+<h3 id="hash-join">Hash Join</h3>
+<p>
+  A hash join builds a hash table from one input, usually the smaller one, then probes it with rows
+  from the other input. It supports hashable equality conditions and is strong for unsorted,
+  medium-to-large inputs. Startup cost includes building the hash.
+</p>
+
+<figure class="code">
+  <figcaption><b>Read hash diagnostics</b></figcaption>
+  <pre><code>Hash Join
+  Hash Cond: (o.customer_id = c.customer_id)
+  -&gt; Seq Scan on orders o
+  -&gt; Hash
+       Buckets: 131072  Batches: 8  Memory Usage: 6145kB
+       -&gt; Seq Scan on customers c</code></pre>
+</figure>
+
+<p>
+  <code>Batches: 1</code> normally means the hash table fit in its memory budget. Multiple batches
+  mean partitioning and temporary-file work. A spill is a clue, not an automatic command to raise
+  memory. First ask whether fewer or narrower rows should reach the hash and whether the build-side
+  estimate was wrong.
+</p>
+
+<h3 id="merge-join">Merge Join</h3>
+<p>
+  A merge join consumes both inputs in join-key order and advances through matching ranges. It is
+  useful for large inputs, equality and supported ordered comparisons, especially when indexes or
+  earlier nodes already provide the required order. Otherwise one or both sides may need a sort.
+</p>
+
+<figure class="code">
+  <figcaption><b>Merge join with ordered inputs</b></figcaption>
+  <pre><code>Merge Join
+  Merge Cond: (o.customer_id = c.customer_id)
+  -&gt; Index Scan using orders_customer_id_idx on orders o
+  -&gt; Index Scan using customers_pkey on customers c</code></pre>
+</figure>
+
+<p>
+  Merge joins handle long ordered streams predictably and can be attractive when output order is
+  useful later. Added sort nodes increase startup work and may spill. As with a <code>LIMIT</code>,
+  a merge join can stop reading one child when no later match is possible, so an apparently low
+  actual row count for that child is not always an estimation error.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Join</th>
+        <th>Best common shape</th>
+        <th>Main risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Nested loop</td>
+        <td>Small outer side and cheap indexed inner lookup</td>
+        <td>Unexpectedly large outer input multiplies inner work</td>
+      </tr>
+      <tr>
+        <td>Hash join</td>
+        <td>Equality join over unsorted medium/large inputs</td>
+        <td>Wrong build size or insufficient memory causes batches</td>
+      </tr>
+      <tr>
+        <td>Merge join</td>
+        <td>Large inputs already ordered by join keys</td>
+        <td>Sorting wide or large inputs can dominate and spill</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Outer join names and outer input are different ideas</strong>
+  <p>
+    The outer input of a nested loop is the child read first and shown first. This execution term
+    does not mean the SQL statement uses <code>LEFT OUTER JOIN</code>. A regular inner join also has
+    an outer and inner input in a nested-loop plan.
+  </p>
+</div>
+
+<h2 id="supporting-nodes">
+  <span class="num">06.</span> Sorts, aggregates, limits and parallel nodes
+</h2>
+<p class="lead">
+  Scans and joins are only part of a plan. Supporting nodes explain blocking work, memory demand,
+  repeated evaluation, row reduction and parallel coordination.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Node</th>
+        <th>Purpose</th>
+        <th>What to inspect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Sort</code></td>
+        <td>Orders rows for ORDER BY, merge, DISTINCT or another parent</td>
+        <td>Sort Method, memory or disk, input width and rows</td>
+      </tr>
+      <tr>
+        <td><code>Incremental Sort</code></td>
+        <td>Sorts within groups when input is already partly ordered</td>
+        <td>Presorted key and full-sort/pre-sorted group details</td>
+      </tr>
+      <tr>
+        <td><code>Aggregate</code></td>
+        <td>Computes grouped or global aggregates over ordered input</td>
+        <td>Input order, rows and upstream sort</td>
+      </tr>
+      <tr>
+        <td><code>HashAggregate</code></td>
+        <td>Stores groups in hash tables</td>
+        <td>Batches, memory and disk usage</td>
+      </tr>
+      <tr>
+        <td><code>Limit</code></td>
+        <td>Stops after the requested number of rows</td>
+        <td>Whether child order permits stopping early</td>
+      </tr>
+      <tr>
+        <td><code>Materialize</code></td>
+        <td>Stores child output for efficient rereads</td>
+        <td>Why the parent needs repeated access and how large it is</td>
+      </tr>
+      <tr>
+        <td><code>Memoize</code></td>
+        <td>Caches parameterized results by lookup key</td>
+        <td>Hits, misses, evictions, overflows and memory</td>
+      </tr>
+      <tr>
+        <td><code>Gather</code></td>
+        <td>Combines rows from parallel workers without preserving order</td>
+        <td>Workers planned/launched and per-worker output</td>
+      </tr>
+      <tr>
+        <td><code>Gather Merge</code></td>
+        <td>Merges ordered parallel streams</td>
+        <td>Worker sorts, ordering and leader work</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Top-N and full sort are materially different</b></figcaption>
+  <pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, total
+FROM orders
+ORDER BY total DESC
+LIMIT 10;
+
+-- A plan may show:
+-- Sort Method: top-N heapsort  Memory: 26kB
+--
+-- Without LIMIT it may need:
+-- Sort Method: external merge  Disk: 184320kB</code></pre>
+</figure>
+
+<p>
+  Push row reduction before expensive sorts and hashes when semantics allow it, and avoid carrying
+  unused wide columns through them. <code>SELECT *</code> can increase width enough to change a join
+  or spill decision. The optimizer already pushes many safe predicates, but query boundaries,
+  volatile expressions and forced materialization can prevent transformations.
+</p>
+
+<h2 id="estimates"><span class="num">07.</span> Estimated rows versus actual rows</h2>
+<p class="lead">
+  Row-count errors are often more important than node-time differences because estimates determine
+  plan choice. Errors early in a tree propagate into join order, join strategy, memory sizing and
+  downstream cardinality.
+</p>
+
+<h3 id="estimate-ratio">Measure the ratio at each important node</h3>
+<figure class="code">
+  <figcaption><b>Use order-of-magnitude thinking</b></figcaption>
+  <pre><code>estimate ratio = actual rows per loop / estimated rows
+
+estimated rows = 100, actual rows = 120       -- 1.2x, usually close
+estimated rows = 100, actual rows = 12,000    -- 120x underestimate
+estimated rows = 50,000, actual rows = 20     -- 2500x overestimate</code></pre>
+</figure>
+
+<p>
+  Exact equality is not expected. Sampling, changing data and inherently uncertain predicates make
+  estimates approximate. Focus on large factors at the lowest node where the mismatch first appears.
+  A parent mismatch may simply inherit a child's error.
+</p>
+
+<h3 id="why-estimates-fail">Common causes of estimation errors</h3>
+<ul class="clean">
+  <li>
+    <strong>Stale statistics:</strong> many writes occurred since auto-analyze or manual
+    <code>ANALYZE</code>.
+  </li>
+  <li>
+    <strong>Skew:</strong> a rare tenant and a huge tenant share one column, but the statistics do
+    not represent the important value precisely enough.
+  </li>
+  <li>
+    <strong>Correlated columns:</strong> city and postal code, country and currency, or status and
+    archived date are not independent.
+  </li>
+  <li>
+    <strong>Expression predicates:</strong> the planner lacks statistics for the expression or the
+    query hides the base distribution.
+  </li>
+  <li>
+    <strong>Cross-table relationships:</strong> ordinary statistics are table-local and do not know
+    every semantic relationship across a join.
+  </li>
+  <li>
+    <strong>Generic prepared plans:</strong> one plan is reused without a specific parameter value,
+    which can be poor for highly skewed values.
+  </li>
+  <li>
+    <strong>Uncertain patterns:</strong> complex functions, wildcards, user-defined operators and
+    data-dependent conditions may require fallback selectivity assumptions.
+  </li>
+</ul>
+
+<h3 id="statistics-fixes">Fix statistics at the right level</h3>
+<figure class="code">
+  <figcaption><b>Refresh and enrich planner knowledge</b></figcaption>
+  <pre><code>-- Refresh ordinary statistics after a representative data change.
+ANALYZE orders;
+
+-- Collect a larger sample for a highly skewed column.
+ALTER TABLE orders ALTER COLUMN customer_id SET STATISTICS 500;
+ANALYZE orders;
+
+-- Teach PostgreSQL about correlation and combined distinct counts.
+CREATE STATISTICS orders_status_date_stats
+    (dependencies, mcv, ndistinct)
+    ON status, ordered_at
+    FROM orders;
+ANALYZE orders;
+
+-- Expression statistics can help matching expression predicates.
+CREATE STATISTICS orders_month_stats
+    ON (date_trunc('month', ordered_at))
+    FROM orders;
+ANALYZE orders;</code></pre>
+</figure>
+
+<p>
+  Higher statistics targets increase sample size and catalog detail, which can improve estimates for
+  irregular distributions at the cost of more analysis time and statistics storage. Do not raise the
+  global target blindly. Target the columns and expressions where plan evidence shows a meaningful
+  error.
+</p>
+
+<div class="note">
+  <strong>CREATE STATISTICS does not collect data by itself</strong>
+  <p>
+    It declares a statistics object. Run <code>ANALYZE</code>, or wait for auto-analyze, to populate
+    it. Extended statistics can capture dependencies, most-common-value combinations and combined
+    distinct counts within one table. They do not become indexes and do not speed row access
+    directly.
+  </p>
+</div>
+
+<h2 id="buffers">
+  <span class="num">08.</span> Buffers, I/O timing, rows removed and heap fetches
+</h2>
+<p class="lead">
+  Runtime alone says a query was slow on one execution. Resource evidence explains what it asked the
+  server to do and is often more stable across cache states.
+</p>
+
+<h3 id="buffer-fields">Understanding buffer fields</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Meaning</th>
+        <th>Important caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>shared hit</code></td>
+        <td>Requested block was already in PostgreSQL shared buffers</td>
+        <td>A hit still consumes CPU and is not free</td>
+      </tr>
+      <tr>
+        <td><code>shared read</code></td>
+        <td>Block had to be brought into shared buffers</td>
+        <td>It may come from OS cache, not necessarily physical storage</td>
+      </tr>
+      <tr>
+        <td><code>dirtied</code></td>
+        <td>Previously clean block was changed by the operation</td>
+        <td>Writing it later can occur outside the measured statement</td>
+      </tr>
+      <tr>
+        <td><code>written</code></td>
+        <td>Block was written during this operation</td>
+        <td>Can expose checkpoint or buffer-pressure effects</td>
+      </tr>
+      <tr>
+        <td><code>temp read/written</code></td>
+        <td>Temporary-file block activity</td>
+        <td>Often indicates sort, hash or materialization spill</td>
+      </tr>
+      <tr>
+        <td><code>I/O Timings</code></td>
+        <td>Measured read/write wait when tracking is enabled</td>
+        <td>Timing collection has overhead and depends on configuration</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Buffer counts at a parent include its descendants. Compare related nodes rather than adding every
+  line. A query with millions of shared hits can be slow even with zero reads because it repeatedly
+  walks cached pages. A query with many reads but low I/O time may be benefiting from the operating
+  system cache.
+</p>
+
+<h3 id="removed-rows">Rows removed</h3>
+<p>
+  <code>Rows Removed by Filter</code>, <code>Rows Removed by Join Filter</code> and
+  <code>Rows Removed by Index Recheck</code> are average per-loop values when loops exceed one.
+  Multiply before judging total waste. Large removal is meaningful only in context:
+</p>
+
+<ul class="clean">
+  <li>A one-time sequential scan removing 90 percent may be correct for a reporting query.</li>
+  <li>An inner scan removing 1,000 rows across 50,000 loops is likely a serious repeated cost.</li>
+  <li>
+    Rows removed by index recheck on lossy bitmap pages point to memory pressure and page rechecks.
+  </li>
+  <li>
+    A highly selective filter applied late may belong earlier or in an index condition if semantics
+    permit.
+  </li>
+</ul>
+
+<h3 id="heap-fetches">Heap Fetches</h3>
+<p>
+  For <code>Index Only Scan</code>, heap fetches show how often PostgreSQL still visited the table
+  to verify visibility. High values can come from recently modified pages or delayed vacuuming. They
+  do not prove the index definition is wrong. Check table churn, vacuum health and whether
+  index-only access is a realistic goal for the workload.
+</p>
+
+<h2 id="work-mem"><span class="num">09.</span> work_mem effects without memory accidents</h2>
+<p class="lead">
+  <code>work_mem</code> is a base limit for one sort, hash table or similar executor operation
+  before temporary files are used. It is not a per-query or per-connection memory cap.
+</p>
+
+<p>
+  One query may contain several sorts and hashes, and many sessions may run them concurrently.
+  Parallel workers can each receive operation-level budgets. Hash operations use a limit derived
+  from <code>work_mem × hash_mem_multiplier</code>. Therefore, changing a global value from 4 MB to
+  256 MB does not mean each connection can consume only 256 MB. Worst-case demand can be much
+  larger.
+</p>
+
+<figure class="code">
+  <figcaption><b>Use a transaction-local experiment</b></figcaption>
+  <pre><code>BEGIN;
+SET LOCAL work_mem = '64MB';
+
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS)
+SELECT customer_id, SUM(total)
+FROM orders
+GROUP BY customer_id
+ORDER BY SUM(total) DESC;
+
+ROLLBACK;</code></pre>
+</figure>
+
+<h3 id="sort-memory">Reading sort evidence</h3>
+<figure class="code">
+  <figcaption><b>Memory and disk sort methods</b></figcaption>
+  <pre><code>-- Fits in memory:
+Sort Method: quicksort  Memory: 18340kB
+
+-- Uses a bounded top-N algorithm:
+Sort Method: top-N heapsort  Memory: 27kB
+
+-- Spills to temporary files:
+Sort Method: external merge  Disk: 145920kB</code></pre>
+</figure>
+
+<p>
+  A disk sort can improve with more memory, but also test whether an index can supply the required
+  order, whether a LIMIT enables top-N work, whether fewer rows can reach the sort, and whether
+  unused wide columns can be removed. A large disk figure is evidence for this execution, not a
+  universally safe global setting.
+</p>
+
+<h3 id="hash-memory">Reading hash evidence</h3>
+<p>
+  Hash nodes report buckets, batches and peak memory. One batch normally means the hash structure
+  fit in memory. Multiple batches mean data was partitioned, with temporary I/O. Wrong build-side
+  estimates can cause unexpected batching even when configuration seemed adequate.
+</p>
+
+<div class="warn">
+  <strong>Do concurrency arithmetic before changing the default</strong>
+  <p>
+    Estimate active expensive queries, memory-consuming nodes per query, parallel processes, and
+    hash multipliers. Prefer scoped <code>SET LOCAL</code> changes for a known report or role when
+    possible. Monitor temporary-file activity and system memory under realistic concurrency, not
+    only one successful session.
+  </p>
+</div>
+
+<h2 id="workflow"><span class="num">10.</span> A repeatable optimization workflow</h2>
+<p class="lead">
+  Optimization is an experiment with a baseline, a hypothesis, one controlled change and a new
+  measurement. Random index creation and planner switches make results hard to explain or retain.
+</p>
+
+<ol class="clean">
+  <li>
+    <strong>Define the slow workload.</strong> Capture the exact SQL, parameters, frequency,
+    expected result, latency objective, concurrency and PostgreSQL version.
+  </li>
+  <li>
+    <strong>Make the test representative.</strong> Use realistic row counts, value skew, schema,
+    indexes, statistics and configuration. Preserve correctness tests.
+  </li>
+  <li>
+    <strong>Take a baseline.</strong> Record <code>EXPLAIN (ANALYZE, BUFFERS, SETTINGS)</code>,
+    execution time, relevant system load and more than one run when safe.
+  </li>
+  <li>
+    <strong>Read bottom-up.</strong> Note scan conditions, child sizes, join order, loops, sorts,
+    hashes and parallel workers.
+  </li>
+  <li>
+    <strong>Find the first cardinality surprise.</strong> Compare estimated and actual rows per
+    loop, starting at leaves. Correct stale, skewed or correlated statistics first.
+  </li>
+  <li>
+    <strong>Find the largest resource waste.</strong> Inspect cumulative buffers, I/O timing,
+    repeated loops, filtered rows, heap fetches, temporary blocks and spills.
+  </li>
+  <li>
+    <strong>Form one hypothesis.</strong> Examples: a selective predicate lacks a matching index;
+    two columns are correlated; a generic plan ignores parameter skew; a wide sort spills.
+  </li>
+  <li>
+    <strong>Make the smallest durable change.</strong> Rewrite a predicate, add a targeted index,
+    refresh statistics, add extended statistics, reduce selected columns, or apply scoped memory.
+  </li>
+  <li>
+    <strong>Measure again.</strong> Compare plan shape, rows, loops, buffers, spill evidence and
+    end-to-end latency. Include write cost and other parameter values.
+  </li>
+  <li>
+    <strong>Keep or revert using evidence.</strong> Document the reason and monitor production
+    behavior. Plans can change as data and software evolve.
+  </li>
+</ol>
+
+<div class="key">
+  <strong>Fix the earliest cause, not the loudest downstream symptom</strong>
+  <p>
+    If a leaf estimate is wrong by 1,000 times, a downstream nested loop, spill and bad join order
+    may all follow from it. Adding memory or disabling nested loops might improve one example while
+    leaving the planner misinformed for every related query.
+  </p>
+</div>
+
+<h2 id="worked-scan">
+  <span class="num">11.</span> Worked diagnosis: ignored index and wrong estimate
+</h2>
+<p class="lead">
+  An available index is only one candidate path. Diagnose why the chosen path was cheaper under the
+  planner's estimates and whether those estimates matched reality.
+</p>
+
+<figure class="code">
+  <figcaption><b>Query and initial plan</b></figcaption>
+  <pre><code>SELECT order_id, customer_id, ordered_at, total
+FROM orders
+WHERE status = 'cancelled'
+  AND ordered_at &gt;= CURRENT_DATE - INTERVAL '7 days';
+
+Seq Scan on orders
+  (cost=0.00..182000.00 rows=40 width=40)
+  (actual time=0.030..880.000 rows=185000 loops=1)
+  Filter: ((status = 'cancelled') AND
+           (ordered_at &gt;= (CURRENT_DATE - '7 days'::interval)))
+  Rows Removed by Filter: 4815000</code></pre>
+</figure>
+
+<p>
+  The first major fact is not simply "Seq Scan." PostgreSQL expected 40 output rows and received
+  185,000, an underestimate of more than 4,000 times. If recently cancelled orders are strongly
+  concentrated in the recent date range, treating the two predicates as independent can create that
+  error.
+</p>
+
+<ol class="clean">
+  <li>Run <code>ANALYZE orders</code> if statistics may be stale, then remeasure.</li>
+  <li>
+    Inspect whether each single-column estimate is reasonable and whether the combination is the
+    failure.
+  </li>
+  <li>
+    Create multivariate most-common-value or dependency statistics for
+    <code>(status, ordered_at)</code>, run <code>ANALYZE</code>, and remeasure.
+  </li>
+  <li>
+    If this frequent query genuinely needs 185,000 rows, calculate whether transferring and
+    processing that result is itself the bottleneck.
+  </li>
+  <li>
+    Evaluate a composite or partial index whose column order and predicate match the workload, then
+    include its write and storage cost.
+  </li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Possible statistics and access-path changes</b></figcaption>
+  <pre><code>CREATE STATISTICS orders_status_ordered_mcv (mcv, dependencies)
+    ON status, ordered_at
+    FROM orders;
+ANALYZE orders;
+
+-- Candidate only after measuring query frequency and write cost:
+CREATE INDEX orders_cancelled_ordered_idx
+    ON orders (ordered_at)
+    WHERE status = 'cancelled';</code></pre>
+</figure>
+
+<p>
+  The index may still be ignored if most cancelled rows fall in the seven-day range, table pages are
+  small and cached, the partial predicate cannot be proven from a parameterized condition, or
+  returning four columns requires many scattered heap visits. The corrected estimate lets the
+  planner compare those realities more honestly.
+</p>
+
+<h2 id="worked-join"><span class="num">12.</span> Worked diagnosis: nested loop explosion</h2>
+<p class="lead">
+  Nested loops become painful when a supposedly small outer stream is large and the inner operation
+  repeats for every outer row.
+</p>
+
+<figure class="code">
+  <figcaption><b>Recognize multiplication</b></figcaption>
+  <pre><code>Nested Loop
+  (cost=1.00..4200.00 rows=200 width=64)
+  (actual time=0.080..9200.000 rows=240000 loops=1)
+  -&gt; Seq Scan on events e
+       (cost=0.00..3000.00 rows=100 width=32)
+       (actual time=0.020..310.000 rows=120000 loops=1)
+       Filter: (event_type = 'purchase')
+  -&gt; Index Scan using users_pkey on users u
+       (cost=0.43..12.00 rows=1 width=32)
+       (actual time=0.040..0.070 rows=2 loops=120000)
+       Index Cond: (user_id = e.user_id)</code></pre>
+</figure>
+
+<p>
+  The event scan is the first large mismatch: 100 estimated outer rows versus 120,000 actual. The
+  inner scan then runs 120,000 times. Its reported 0.070 ms completion time is an average per loop,
+  so its total contribution is approximately 8.4 seconds.
+</p>
+
+<ul class="clean">
+  <li>Refresh and improve statistics for <code>event_type</code> and related predicates.</li>
+  <li>Verify uniqueness assumptions if the primary-key lookup unexpectedly returns two rows.</li>
+  <li>After estimates improve, PostgreSQL may choose a hash join without any hint.</li>
+  <li>Reduce outer rows early if the requested result permits it.</li>
+  <li>Do not globally disable nested loops; they remain ideal for genuinely selective lookups.</li>
+</ul>
+
+<h2 id="prepared-partitioned">
+  <span class="num">13.</span> Prepared plans, parameters and partition pruning
+</h2>
+<p class="lead">
+  The plan observed for a literal is not always the plan an application uses. Prepared statements
+  can use parameter-specific custom plans or a reusable generic plan.
+</p>
+
+<figure class="code">
+  <figcaption><b>Inspect a prepared statement</b></figcaption>
+  <pre><code>PREPARE recent_orders (bigint) AS
+SELECT *
+FROM orders
+WHERE customer_id = $1
+ORDER BY ordered_at DESC
+LIMIT 50;
+
+EXPLAIN (ANALYZE, BUFFERS)
+EXECUTE recent_orders(42);</code></pre>
+</figure>
+
+<p>
+  A custom plan knows the supplied value. A generic plan avoids repeated planning but cannot tailor
+  estimates to a specific value. That tradeoff matters when customer 42 has five orders and customer
+  99 has five million. Compare the plan used through the application path, not only an equivalent
+  literal in a SQL console. <code>plan_cache_mode</code> can support diagnosis, but forcing a mode
+  globally is rarely the first fix.
+</p>
+
+<h3 id="partition-pruning">Partition pruning evidence</h3>
+<p>
+  For partitioned tables, inspect whether irrelevant partitions disappear. Plans can show
+  <code>Subplans Removed</code> or child nodes marked <code>never executed</code>. Pruning may occur
+  during planning or execution depending on when parameter values become known. Missing pruning can
+  come from mismatched expressions, types or partition keys, and it can multiply scan overhead.
+</p>
+
+<h2 id="caveats"><span class="num">14.</span> Measurement caveats and common mistakes</h2>
+<p class="lead">
+  Plans are measurements from a particular environment and execution. Good diagnosis preserves that
+  context and avoids conclusions that the evidence cannot support.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Assume every sequential scan is bad</td>
+        <td>Bulk reads and small tables often favor it</td>
+        <td>Compare fraction read, buffers, result size and alternatives</td>
+      </tr>
+      <tr>
+        <td>Compare cost with milliseconds</td>
+        <td>Cost is a relative planner unit</td>
+        <td>Compare cost to cost and measured time to measured time</td>
+      </tr>
+      <tr>
+        <td>Add all node times</td>
+        <td>Parent time includes child work</td>
+        <td>Read tree nesting, loops and resource counters</td>
+      </tr>
+      <tr>
+        <td>Ignore loops</td>
+        <td>Actual time and rows are averages per execution</td>
+        <td>Multiply by loops for approximate total work</td>
+      </tr>
+      <tr>
+        <td>Test only with warm cache</td>
+        <td>It can hide storage demand</td>
+        <td>Report cache state and compare buffers/I/O under relevant conditions</td>
+      </tr>
+      <tr>
+        <td>Run ANALYZE on a write casually</td>
+        <td>The statement executes and side effects occur</td>
+        <td>Use plain EXPLAIN or a carefully controlled rollback</td>
+      </tr>
+      <tr>
+        <td>Increase work_mem globally from one spill</td>
+        <td>Budget multiplies across operations, workers and sessions</td>
+        <td>Reduce work and test scoped memory under concurrency</td>
+      </tr>
+      <tr>
+        <td>Force scan or join types permanently</td>
+        <td>It treats a symptom and harms other parameter shapes</td>
+        <td>Use enable flags only for comparison; fix estimates or access paths</td>
+      </tr>
+      <tr>
+        <td>Optimize a toy data set</td>
+        <td>Plan choices change nonlinearly with size and distribution</td>
+        <td>Use representative volume, skew and statistics</td>
+      </tr>
+      <tr>
+        <td>Trust one fast execution</td>
+        <td>Cache, concurrency and background work vary</td>
+        <td>Repeat safely and inspect resource evidence plus percentiles</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="explain-overhead">EXPLAIN ANALYZE overhead and missing client cost</h3>
+<p>
+  Per-node timing adds instrumentation overhead, especially for nodes executed many times.
+  <code>TIMING OFF</code> keeps row and loop counts while reducing clock-call overhead. Also,
+  ordinary <code>EXPLAIN ANALYZE</code> does not send result rows to the client, so network transfer
+  and normal output conversion are not represented in the same way as application latency. Wide,
+  large result sets can therefore be slow for users even when server execution looks acceptable.
+</p>
+
+<h3 id="locks-and-concurrency">Locks and concurrency</h3>
+<p>
+  A plan explains executor strategy, not every source of elapsed latency. Lock waits, CPU
+  saturation, storage queueing, connection-pool waits and client backpressure can dominate.
+  Correlate plans with database activity and system metrics. Never conclude that identical plans
+  must have identical production latency.
+</p>
+
+<h2 id="performance"><span class="num">15.</span> Performance implications of common fixes</h2>
+<p class="lead">
+  Every optimization spends a resource or adds operational responsibility. Evaluate the complete
+  workload, not only the improved SELECT.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Change</th>
+        <th>Possible benefit</th>
+        <th>Tradeoff to measure</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Add an index</td>
+        <td>Selective access, useful order, index-only opportunity</td>
+        <td>Write latency, WAL, storage, cache pressure and vacuum work</td>
+      </tr>
+      <tr>
+        <td>Add INCLUDE columns</td>
+        <td>Cover a frequent read</td>
+        <td>Larger index and limited benefit on write-heavy pages</td>
+      </tr>
+      <tr>
+        <td>Raise statistics target</td>
+        <td>Better skew and histogram estimates</td>
+        <td>Longer ANALYZE and larger statistics data</td>
+      </tr>
+      <tr>
+        <td>Add extended statistics</td>
+        <td>Better multi-column or expression estimates</td>
+        <td>Analysis overhead and maintenance of targeted objects</td>
+      </tr>
+      <tr>
+        <td>Raise work_mem</td>
+        <td>Fewer temporary spills</td>
+        <td>Multiplied memory and out-of-memory risk under concurrency</td>
+      </tr>
+      <tr>
+        <td>Rewrite SQL</td>
+        <td>Earlier reduction or a usable predicate</td>
+        <td>Semantic changes, null behavior and maintainability</td>
+      </tr>
+      <tr>
+        <td>Materialize intermediate results</td>
+        <td>Avoid repeated expensive computation</td>
+        <td>Lost predicate pushdown, storage and stale intermediate data</td>
+      </tr>
+      <tr>
+        <td>Partition a table</td>
+        <td>Prune large unrelated regions and simplify lifecycle tasks</td>
+        <td>Planning overhead, key constraints and operational complexity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>End-to-end optimization includes correctness and stability</strong>
+  <p>
+    A rewrite that changes null semantics is not an optimization. An index that speeds one report
+    but overloads the write path is not a complete win. A memory setting that works for one session
+    but exhausts the server at peak concurrency is unsafe. Keep changes only after testing their
+    full effect.
+  </p>
+</div>
+
+<h2 id="practice"><span class="num">16.</span> Practice problems</h2>
+<p class="lead">
+  For each problem, state the evidence you would collect before proposing a fix. Several answers can
+  be valid when they are supported by measurement.
+</p>
+
+<div class="qa">
+  <p class="q">
+    1. A query on a 50-row lookup table uses a sequential scan even though a primary-key index
+    exists. Is that a bug?
+  </p>
+  <p class="a">
+    Not necessarily. The table may occupy one or very few pages, making a direct scan cheaper than
+    traversing an index and fetching the heap. Verify actual buffers and latency. Do not force an
+    index merely to change the node name.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    2. An inner index scan reports 0.02 ms, 4 rows and 300,000 loops. Estimate its output and why it
+    matters.
+  </p>
+  <p class="a">
+    It emits about 1.2 million rows in total and spends roughly 6 seconds if 0.02 ms is its average
+    completion time per loop. Inspect the outer-side estimate, repeated keys, Memoize suitability
+    and whether a different join becomes attractive after cardinality is corrected.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    3. A bitmap heap scan shows 20 exact blocks, 8,000 lossy blocks and many rows removed by index
+    recheck. What happened?
+  </p>
+  <p class="a">
+    The bitmap stored page-level rather than exact tuple locations for many pages, commonly because
+    of its memory allowance. PostgreSQL rechecked rows for correctness. Reduce candidate rows and
+    test a scoped work_mem change while checking total concurrency memory.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">4. A hash join reports eight batches. Should work_mem be raised globally?</p>
+  <p class="a">
+    Not from that fact alone. Confirm temporary I/O, build rows and width, estimate accuracy, query
+    frequency, simultaneous memory nodes and concurrent sessions. Reduce input or width first, then
+    test a transaction-local budget and calculate fleet-wide risk.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    5. Filtering on country and currency is underestimated because the planner treats them as
+    independent. What is a targeted fix?
+  </p>
+  <p class="a">
+    Create appropriate extended statistics on the two columns, often dependencies and/or MCV,
+    analyze the table, and compare the new estimates. An index may improve access but does not by
+    itself teach the planner the joint distribution.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    6. An index-only scan has almost as many heap fetches as rows. What should you inspect?
+  </p>
+  <p class="a">
+    Inspect table write churn, vacuum progress, all-visible coverage and buffers. The index covers
+    the values, but PostgreSQL still visits heap pages whose visibility-map bits are not set.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    7. A literal query is fast in psql but the prepared application statement is slow for one large
+    tenant. What is the next experiment?
+  </p>
+  <p class="a">
+    Explain the prepared execution with representative parameter values and compare custom and
+    generic behavior in a controlled session. Parameter skew can make one reusable generic plan
+    unsuitable for extreme tenants.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    8. A plan has a 900 MB external sort before returning 10 rows. Give three hypotheses.
+  </p>
+  <p class="a">
+    The required order may lack a supporting index, LIMIT may be separated from the sort by query
+    semantics, or excessive rows and wide columns may reach the sort. Test each hypothesis without
+    assuming memory is the only solution.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">17.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: What is the difference between EXPLAIN and EXPLAIN ANALYZE?</p>
+  <p class="a">
+    EXPLAIN shows the planner's estimated plan without running it. EXPLAIN ANALYZE executes the
+    statement and adds actual rows, time, loops and other runtime details. Because it executes,
+    writes and side effects really happen unless safely controlled.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you read a PostgreSQL plan?</p>
+  <p class="a">
+    Read the most-indented child nodes first and work upward. At each node, identify its input,
+    output, condition, estimated versus actual rows, loops and resource evidence. Find the earliest
+    large estimate mismatch and the largest repeated or I/O-heavy work.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What do the two cost numbers mean?</p>
+  <p class="a">
+    They are estimated startup cost and total cost in arbitrary planner units. Startup cost is work
+    before the first row, while total cost assumes the node runs to completion. They rank plans and
+    are not milliseconds.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why must rows and actual time be multiplied by loops?</p>
+  <p class="a">
+    When a node executes multiple times, PostgreSQL displays average actual rows and time per
+    execution. Multiplying by loops approximates total output and total time for that node. This is
+    essential for inner nodes of nested loops.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Sequential scan versus index scan?</p>
+  <p class="a">
+    A sequential scan reads table pages in physical order and is efficient for large fractions or
+    small tables. An index scan finds matching index entries then visits heap tuples, which is
+    efficient for selective or ordered retrieval but can create scattered access.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When does PostgreSQL choose a bitmap scan?</p>
+  <p class="a">
+    Commonly for a moderate number of matches or when combining indexes. It builds a bitmap of tuple
+    locations, then visits heap pages in physical order. Under memory pressure it can become lossy
+    and recheck rows on matching pages.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What makes an index-only scan truly avoid heap access?</p>
+  <p class="a">
+    One index must contain all required values, and matching heap pages must be marked all-visible
+    so PostgreSQL can verify MVCC visibility from the visibility map. EXPLAIN ANALYZE reports heap
+    fetches when table visits are still required.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Nested loop versus hash join versus merge join?</p>
+  <p class="a">
+    Nested loop is strong for a small outer input and cheap inner lookups. Hash join is strong for
+    unsorted equality joins over larger inputs. Merge join is strong when large inputs are already
+    ordered or sorting is otherwise worthwhile. Estimates determine which shape appears cheapest.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do row-estimate errors cause slow plans?</p>
+  <p class="a">
+    Cardinality drives join order, scan choice, join algorithm and expected memory. An underestimate
+    can select repeated nested-loop probes or undersize a hash. An overestimate can discourage a
+    useful index path or favor unnecessary bulk processing.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you fix correlated-column estimates?</p>
+  <p class="a">
+    After checking freshness, create targeted extended statistics such as dependencies or
+    multivariate most-common values on the related columns, run ANALYZE and remeasure. Ordinary
+    single-column statistics often assume conditions are independent.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does work_mem control?</p>
+  <p class="a">
+    It is the base memory limit for each sort, hash table and similar executor operation before
+    temporary-file work. It is not a whole-query cap. Multiple nodes, parallel processes and
+    concurrent sessions multiply potential usage, while hashes also use hash_mem_multiplier.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is the first thing you do with a slow query?</p>
+  <p class="a">
+    Capture the exact query, representative parameters, context and baseline EXPLAIN (ANALYZE,
+    BUFFERS, SETTINGS). Then locate the earliest large row-estimate error and the dominant repeated,
+    buffer-heavy or spilling operation before proposing one measured change.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why might PostgreSQL ignore an available index?</p>
+  <p class="a">
+    The result may be too large, the table may be small, heap fetches may be expensive, statistics
+    may predict low selectivity, the predicate may not match the index expression or leading
+    columns, an implicit cast or collation may interfere, or a partial-index predicate may not be
+    provable. An index is an option, not a command.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why avoid disabling planner methods as a permanent fix?</p>
+  <p class="a">
+    It restricts alternatives for every affected query and often hides wrong estimates or missing
+    access paths. Method switches are useful experiments: if forcing an alternative helps, ask what
+    information made its estimated cost lose and fix that cause.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">18.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li><strong>EXPLAIN:</strong> estimate only; statement is not executed.</li>
+  <li><strong>EXPLAIN ANALYZE:</strong> executes and measures; writes have real effects.</li>
+  <li><strong>Read:</strong> deepest children first, then move upward.</li>
+  <li><strong>Cost:</strong> relative planner units, not milliseconds.</li>
+  <li><strong>rows:</strong> output per execution, not necessarily rows inspected.</li>
+  <li><strong>loops:</strong> multiply actual rows and time to estimate total work.</li>
+  <li><strong>width:</strong> estimated bytes per row; wide rows enlarge memory and I/O.</li>
+  <li><strong>Seq Scan:</strong> often correct for large fractions and small tables.</li>
+  <li><strong>Index Scan:</strong> selective/ordered access plus heap visits.</li>
+  <li><strong>Index Only:</strong> inspect Heap Fetches and visibility-map coverage.</li>
+  <li><strong>Bitmap:</strong> middle selectivity; lossy pages require rechecks.</li>
+  <li><strong>Nested Loop:</strong> small outer input plus cheap inner lookup.</li>
+  <li><strong>Hash Join:</strong> equality join; multiple batches indicate spill work.</li>
+  <li><strong>Merge Join:</strong> ordered inputs; inspect sort cost and spill.</li>
+  <li><strong>Buffers:</strong> parent counts include children; hits still cost CPU.</li>
+  <li><strong>Estimate error:</strong> find the first large mismatch in the tree.</li>
+  <li><strong>Statistics:</strong> ANALYZE freshness, skew target, extended correlations.</li>
+  <li><strong>work_mem:</strong> per operation, multiplied by nodes/workers/sessions.</li>
+  <li><strong>Spill:</strong> first reduce rows and width, then test scoped memory.</li>
+  <li><strong>Workflow:</strong> baseline, hypothesis, one change, remeasure, monitor.</li>
+</ul>
+
+<h2 id="references"><span class="num">19.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/using-explain.html"
+      >Using EXPLAIN and interpreting plan output</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-explain.html"
+      >EXPLAIN syntax, options and safety</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/planner-stats.html"
+      >Statistics used by the planner and extended statistics</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-analyze.html"
+      >ANALYZE and statistics sampling</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-createstatistics.html"
+      >CREATE STATISTICS</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-resource.html"
+      >work_mem, hash_mem_multiplier and resource settings</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-query.html"
+      >Planner method and cost configuration</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+      >Index-only scans and covering indexes</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-prepare.html"
+      >Prepared statements, generic plans and custom plans</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">Partition pruning</a>
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
