@@ -17,7 +17,11 @@
       "name": "PostgreSQL",
       "pages": [
         { "title": "SQL Fundamentals", "path": "postgresql/sql-fundamentals" },
-        { "title": "Advanced Querying", "path": "postgresql/advanced-querying" }
+        { "title": "Advanced Querying", "path": "postgresql/advanced-querying" },
+        {
+          "title": "Schema Design and Data Modeling",
+          "path": "postgresql/schema-design-data-modeling"
+        }
       ]
     }
   ]
