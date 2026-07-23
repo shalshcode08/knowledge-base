@@ -22,7 +22,11 @@
           "title": "Schema Design and Data Modeling",
           "path": "postgresql/schema-design-data-modeling"
         },
-        { "title": "Indexing", "path": "postgresql/indexing" }
+        { "title": "Indexing", "path": "postgresql/indexing" },
+        {
+          "title": "EXPLAIN ANALYZE and Query Optimization",
+          "path": "postgresql/explain-analyze-query-optimization"
+        }
       ]
     }
   ]
