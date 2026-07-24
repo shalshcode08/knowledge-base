@@ -28,6 +28,10 @@
           "path": "postgresql/explain-analyze-query-optimization"
         },
         {
+          "title": "Transactions, MVCC and Isolation",
+          "path": "postgresql/transactions-mvcc-isolation"
+        },
+        {
           "title": "Locking and Concurrency",
           "path": "postgresql/locking-concurrency"
         }
