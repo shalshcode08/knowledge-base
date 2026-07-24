@@ -26,6 +26,10 @@
         {
           "title": "EXPLAIN ANALYZE and Query Optimization",
           "path": "postgresql/explain-analyze-query-optimization"
+        },
+        {
+          "title": "Locking and Concurrency",
+          "path": "postgresql/locking-concurrency"
         }
       ]
     }

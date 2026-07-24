@@ -1,0 +1,1712 @@
+<h1>PostgreSQL Locking &amp; Concurrency - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth, practical and interview-focused guide to table and row locks, locking reads,
+  deadlocks, advisory locks, lock monitoring, timeouts, and reliable worker queues with
+  <code>SKIP LOCKED</code>.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The locking mental model</h2>
+<p class="lead">
+  MVCC lets readers and writers overlap, while locks protect operations that must not overlap.
+  Correct concurrency comes from identifying the exact resource, choosing the weakest sufficient
+  lock, acquiring locks in a stable order, and holding them for the shortest complete transaction.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of MVCC as giving every reader a dated photograph of the data. A lock is a reservation
+    sign placed on a resource while a change is coordinated. The photograph avoids unnecessary
+    reader-writer blocking, but it cannot reserve the last seat, serialize two account transfers, or
+    stop a table from being dropped. Those jobs need locks, constraints, or serializable validation.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Mechanism to consider</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Can ordinary reads continue while rows change?</td>
+        <td>MVCC visibility</td>
+        <td>A report reads a consistent snapshot while orders are updated</td>
+      </tr>
+      <tr>
+        <td>Must a selected row be reserved before a later write?</td>
+        <td>Row-level locking clause</td>
+        <td><code>SELECT ... FOR UPDATE</code> before changing an account</td>
+      </tr>
+      <tr>
+        <td>Must a schema or maintenance operation exclude conflicting table use?</td>
+        <td>Table-level lock</td>
+        <td><code>ALTER TABLE</code>, <code>TRUNCATE</code>, or explicit <code>LOCK</code></td>
+      </tr>
+      <tr>
+        <td>Is the resource a business concept rather than one stored row?</td>
+        <td>Advisory lock</td>
+        <td>Only one monthly billing run for tenant 42</td>
+      </tr>
+      <tr>
+        <td>Should competing workers claim different available rows?</td>
+        <td><code>FOR UPDATE SKIP LOCKED</code></td>
+        <td>Concurrent database-backed job consumers</td>
+      </tr>
+      <tr>
+        <td>Must a multi-row rule remain true without an obvious lock target?</td>
+        <td>Constraint or Serializable isolation</td>
+        <td>Prevent write skew across several rows</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>A lock is attached to a transaction boundary</strong>
+  <p>
+    Most PostgreSQL locks are retained until <code>COMMIT</code> or <code>ROLLBACK</code>, not until
+    the locking statement finishes. A fast query inside a transaction that remains idle for ten
+    minutes can therefore block others for ten minutes. Transaction scope is part of every locking
+    design.
+  </p>
+</div>
+
+<h2 id="mvcc-and-locks"><span class="num">01.</span> MVCC and locks work together</h2>
+<p class="lead">
+  PostgreSQL does not replace locks with MVCC. MVCC handles visibility; locks coordinate conflicting
+  actions and protect database objects.
+</p>
+
+<p>
+  An ordinary <code>SELECT</code> usually reads a snapshot and does not wait for an uncommitted row
+  update. It sees the version allowed by its snapshot. At the same time, the query takes an
+  <code>ACCESS SHARE</code> table lock so that a conflicting operation such as
+  <code>DROP TABLE</code> cannot remove the relation while it is being read.
+</p>
+
+<p>
+  An <code>UPDATE</code> creates a new row version under MVCC, but it also takes a table-level
+  <code>ROW EXCLUSIVE</code> lock and a row-level lock on each affected row. Another writer
+  targeting the same row must wait, fail immediately with <code>NOWAIT</code>, skip it with
+  <code>SKIP LOCKED</code> where supported, or be canceled by a timeout.
+</p>
+
+<div class="note">
+  <strong>Plain reads are not row-lock reads</strong>
+  <p>
+    Row-level locks do not block an ordinary snapshot <code>SELECT</code>. They block incompatible
+    row lockers, updates and deletes. If an application assumes that reading a row reserves it, it
+    has a race unless a constraint, atomic statement, suitable row lock, or serializable transaction
+    closes that gap.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The check-then-act race</b></figcaption>
+  <pre><code>-- Unsafe when two sessions can do this concurrently.
+SELECT stock FROM products WHERE id = 10;
+-- Application sees stock = 1.
+UPDATE products SET stock = stock - 1 WHERE id = 10;
+
+-- Better when the whole rule fits one atomic statement.
+UPDATE products
+SET stock = stock - 1
+WHERE id = 10
+  AND stock &gt; 0
+RETURNING id, stock;</code></pre>
+</figure>
+
+<p>
+  The second form lets the database evaluate the condition and update under the write operation's
+  concurrency rules. Zero returned rows means no stock was reserved. When several tables or
+  additional business checks are involved, an explicit transaction with locking or Serializable
+  isolation may still be necessary.
+</p>
+
+<h3 id="lockable-resources">What PostgreSQL can lock</h3>
+<ul class="clean">
+  <li>Relations, including tables, indexes, views and sequences.</li>
+  <li>Individual table rows, represented through tuple state and transaction IDs.</li>
+  <li>Pages briefly for internal buffer access.</li>
+  <li>Transaction IDs and virtual transaction IDs while sessions wait for transactions.</li>
+  <li>Database objects and extension-specific resources.</li>
+  <li>Application-defined numeric advisory-lock keys.</li>
+  <li>
+    Predicate-lock structures used by Serializable Snapshot Isolation. These detect dangerous
+    dependency patterns and are not ordinary blocking row locks.
+  </li>
+</ul>
+
+<h2 id="lifecycle"><span class="num">02.</span> Lock acquisition, waiting and release</h2>
+<p class="lead">
+  A request is granted immediately if it is compatible with existing holders. Otherwise it joins the
+  wait queue until the conflict ends, a timeout fires, the query is canceled, or deadlock detection
+  aborts a participant.
+</p>
+
+<ol class="clean">
+  <li>A statement requests the table locks required to access its relations.</li>
+  <li>As rows are found, a modifying or locking statement requests row locks as needed.</li>
+  <li>A compatible request is granted; an incompatible request waits.</li>
+  <li>The lock normally remains held until the owning transaction ends.</li>
+  <li>Commit or rollback releases transaction-scoped locks and wakes eligible waiters.</li>
+</ol>
+
+<p>
+  Locks acquired after a savepoint are released when the transaction rolls back to that savepoint.
+  This also applies when a PL/pgSQL exception block rolls back its internal subtransaction. Earlier
+  locks survive.
+</p>
+
+<figure class="code">
+  <figcaption><b>Bound how long application work may wait</b></figcaption>
+  <pre><code>BEGIN;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '10s';
+SET LOCAL idle_in_transaction_session_timeout = '30s';
+
+SELECT id, balance
+FROM accounts
+WHERE id = 42
+FOR UPDATE;
+
+UPDATE accounts
+SET balance = balance - 50
+WHERE id = 42;
+
+COMMIT;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Control</th>
+        <th>What it bounds</th>
+        <th>Important distinction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>lock_timeout</code></td>
+        <td>Time spent waiting to acquire any one lock</td>
+        <td>Does not limit CPU, I/O, or total statement duration</td>
+      </tr>
+      <tr>
+        <td><code>statement_timeout</code></td>
+        <td>Total statement duration</td>
+        <td>Includes lock waiting and execution</td>
+      </tr>
+      <tr>
+        <td><code>idle_in_transaction_session_timeout</code></td>
+        <td>How long a session may sit idle inside an open transaction</td>
+        <td>Protects against forgotten transactions holding locks and old snapshots</td>
+      </tr>
+      <tr>
+        <td><code>NOWAIT</code></td>
+        <td>One supported row or table lock request</td>
+        <td>Fails immediately instead of waiting</td>
+      </tr>
+      <tr>
+        <td><code>SKIP LOCKED</code></td>
+        <td>Rows that cannot be locked immediately</td>
+        <td>Skips them and intentionally returns an inconsistent view</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>A timeout error aborts the current transaction</strong>
+  <p>
+    After a lock timeout, deadlock error, or canceled statement inside a transaction, issue
+    <code>ROLLBACK</code> or roll back to a savepoint before continuing. Do not catch the
+    application exception and keep using a transaction that PostgreSQL has marked failed.
+  </p>
+</div>
+
+<h2 id="table-locks"><span class="num">03.</span> Table-level lock modes</h2>
+<p class="lead">
+  Every table access takes a table-level lock. The historical names can be misleading:
+  <code>ROW SHARE</code> and <code>ROW EXCLUSIVE</code> are table-level modes, not row locks.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>Common automatic holder</th>
+        <th>What it mainly protects against</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ACCESS SHARE</code></td>
+        <td>Plain <code>SELECT</code></td>
+        <td>Conflicts only with <code>ACCESS EXCLUSIVE</code></td>
+      </tr>
+      <tr>
+        <td><code>ROW SHARE</code></td>
+        <td><code>SELECT ... FOR UPDATE/SHARE</code> variants</td>
+        <td>Conflicts with <code>EXCLUSIVE</code> and <code>ACCESS EXCLUSIVE</code></td>
+      </tr>
+      <tr>
+        <td><code>ROW EXCLUSIVE</code></td>
+        <td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>MERGE</code></td>
+        <td>Conflicts with modes intended to exclude concurrent data changes</td>
+      </tr>
+      <tr>
+        <td><code>SHARE UPDATE EXCLUSIVE</code></td>
+        <td><code>VACUUM</code>, <code>ANALYZE</code>, <code>CREATE INDEX CONCURRENTLY</code></td>
+        <td>Serializes several maintenance and schema-change operations</td>
+      </tr>
+      <tr>
+        <td><code>SHARE</code></td>
+        <td><code>CREATE INDEX</code> without <code>CONCURRENTLY</code></td>
+        <td>Allows reads but blocks concurrent data changes</td>
+      </tr>
+      <tr>
+        <td><code>SHARE ROW EXCLUSIVE</code></td>
+        <td><code>CREATE TRIGGER</code> and some <code>ALTER TABLE</code> forms</td>
+        <td>Excludes data changes and is self-conflicting</td>
+      </tr>
+      <tr>
+        <td><code>EXCLUSIVE</code></td>
+        <td><code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code></td>
+        <td>Allows only ordinary <code>ACCESS SHARE</code> readers</td>
+      </tr>
+      <tr>
+        <td><code>ACCESS EXCLUSIVE</code></td>
+        <td>
+          <code>DROP TABLE</code>, <code>TRUNCATE</code>, <code>VACUUM FULL</code>, many
+          <code>ALTER TABLE</code> forms
+        </td>
+        <td>Conflicts with every table lock mode, including ordinary reads</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Only ACCESS EXCLUSIVE blocks an ordinary SELECT</strong>
+  <p>
+    This fact is a useful first diagnostic. If a plain read is waiting on a relation lock, look for
+    a schema change, rewrite, <code>TRUNCATE</code>, <code>VACUUM FULL</code>, non-concurrent
+    <code>REINDEX</code>, or another operation holding or waiting for <code>ACCESS EXCLUSIVE</code>.
+  </p>
+</div>
+
+<h3 id="explicit-table-lock">Explicit LOCK TABLE</h3>
+<figure class="code">
+  <figcaption><b>Acquire a deliberate table lock</b></figcaption>
+  <pre><code>BEGIN;
+
+LOCK TABLE daily_totals IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+
+-- Perform the operation that requires this exclusion level.
+UPDATE daily_totals
+SET amount = amount + 100
+WHERE business_date = CURRENT_DATE;
+
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  <code>LOCK TABLE</code> must be used inside a transaction block because a lock released
+  immediately after the statement would provide no useful protection. If the mode is omitted,
+  PostgreSQL requests <code>ACCESS EXCLUSIVE</code>, the strongest mode. Always state the mode
+  explicitly and verify its conflict set.
+</p>
+
+<p>
+  Ask for an explicit table lock only when the invariant truly concerns the table or a broad set of
+  rows. Locking an entire hot table to protect one account is correct but unnecessarily destroys
+  concurrency. A row lock, unique constraint, exclusion constraint, atomic DML statement, or
+  advisory lock may express the rule more precisely.
+</p>
+
+<h2 id="row-locks"><span class="num">04.</span> Row-level lock modes and conflicts</h2>
+<p class="lead">
+  PostgreSQL has four row-lock strengths. The right choice describes what concurrent changes must be
+  prevented, especially whether a key referenced by a foreign key may change.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Requested mode</th>
+        <th>Meaning</th>
+        <th>Conflicts with existing</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>FOR KEY SHARE</code></td>
+        <td>Protect the row from deletion or key-changing updates</td>
+        <td><code>FOR UPDATE</code></td>
+      </tr>
+      <tr>
+        <td><code>FOR SHARE</code></td>
+        <td>Shared protection against updates and deletes</td>
+        <td><code>FOR NO KEY UPDATE</code>, <code>FOR UPDATE</code></td>
+      </tr>
+      <tr>
+        <td><code>FOR NO KEY UPDATE</code></td>
+        <td>Exclusive update protection while still allowing key-share lockers</td>
+        <td><code>FOR SHARE</code>, <code>FOR NO KEY UPDATE</code>, <code>FOR UPDATE</code></td>
+      </tr>
+      <tr>
+        <td><code>FOR UPDATE</code></td>
+        <td>Strongest row lock; reserve for any change or deletion</td>
+        <td>All four row-lock modes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The conflict table is symmetric even though it is often read as "requested versus existing."
+  Shared modes can coexist only where the matrix permits. A transaction never conflicts with itself,
+  and it can strengthen a lock it already owns.
+</p>
+
+<h3 id="automatic-row-locks">Locks acquired by data changes</h3>
+<ul class="clean">
+  <li><code>DELETE</code> takes the strongest <code>FOR UPDATE</code>-like row lock.</li>
+  <li>
+    An <code>UPDATE</code> that changes columns covered by a suitable unique index usable by a
+    foreign key takes a <code>FOR UPDATE</code>-like lock.
+  </li>
+  <li>Other updates normally take the weaker <code>FOR NO KEY UPDATE</code>-like lock.</li>
+  <li>
+    Foreign-key checks can take <code>FOR KEY SHARE</code>-like protection on referenced rows so a
+    parent key cannot disappear while the relationship is established.
+  </li>
+</ul>
+
+<p>
+  The exact set of columns that causes the stronger update lock is an implementation detail that can
+  change. Design for documented semantics, not for a fragile assumption that one update will always
+  choose a particular internal lock.
+</p>
+
+<div class="note">
+  <strong>Row locks are not counted by max_locks_per_transaction</strong>
+  <p>
+    PostgreSQL stores row-lock information with tuples and transaction state rather than keeping
+    every locked row as a normal shared-memory lock-table entry. There is no configured maximum
+    number of rows a transaction may lock. However, locking many rows increases tuple writes,
+    transaction duration, contention, WAL and recovery work, so "unlimited" does not mean "free."
+  </p>
+</div>
+
+<h2 id="locking-reads"><span class="num">05.</span> SELECT locking clauses</h2>
+<p class="lead">
+  A locking read finds rows and locks them as part of one statement. It closes the race between
+  "read a row" and "reserve that row" when the transaction will act on the result.
+</p>
+
+<figure class="code">
+  <figcaption><b>General syntax</b></figcaption>
+  <pre><code>SELECT select_list
+FROM table_expression
+WHERE condition
+FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
+    [ OF table_alias [, ...] ]
+    [ NOWAIT | SKIP LOCKED ];</code></pre>
+</figure>
+
+<h3 id="for-update">FOR UPDATE</h3>
+<p>
+  Use <code>FOR UPDATE</code> when the selected row may be updated in any way or deleted and the
+  transaction needs the strongest reservation. Other sessions attempting incompatible row locks,
+  updates, or deletes wait until the transaction ends.
+</p>
+
+<figure class="code">
+  <figcaption><b>Transfer with deterministic lock order</b></figcaption>
+  <pre><code>BEGIN;
+
+SELECT id, balance
+FROM accounts
+WHERE id IN (10, 20)
+ORDER BY id
+FOR UPDATE;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 10;
+UPDATE accounts SET balance = balance + 100 WHERE id = 20;
+
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  Both accounts are locked in ascending ID order before either balance changes. Every transfer path
+  should use the same order. The transaction must still validate sufficient funds and rely on
+  constraints where suitable.
+</p>
+
+<h3 id="for-no-key-update">FOR NO KEY UPDATE</h3>
+<p>
+  Use <code>FOR NO KEY UPDATE</code> when a row will change but its key values must not change. It
+  is weaker than <code>FOR UPDATE</code> because it can coexist with <code>FOR KEY SHARE</code>.
+  This can improve concurrency when child inserts only need to protect a referenced parent key.
+</p>
+
+<h3 id="for-share">FOR SHARE</h3>
+<p>
+  <code>FOR SHARE</code> lets multiple sessions hold shared row locks, but blocks updates, deletes,
+  <code>FOR UPDATE</code>, and <code>FOR NO KEY UPDATE</code>. Use it only when shared lockers may
+  proceed together and any row change must wait. It is stronger than many read-only checks need.
+</p>
+
+<h3 id="for-key-share">FOR KEY SHARE</h3>
+<p>
+  <code>FOR KEY SHARE</code> is the weakest row lock. It prevents deletion and changes to key values
+  while allowing non-key updates and all weaker compatible locking reads. It is useful when the
+  identity of a referenced row must remain stable but other attributes may change.
+</p>
+
+<h3 id="nowait">NOWAIT</h3>
+<figure class="code">
+  <figcaption><b>Fail fast when a row is busy</b></figcaption>
+  <pre><code>BEGIN;
+
+SELECT id, status
+FROM orders
+WHERE id = 7001
+FOR UPDATE NOWAIT;
+
+-- If the row is immediately available, continue.
+UPDATE orders SET status = 'cancelled' WHERE id = 7001;
+
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  <code>NOWAIT</code> is appropriate when waiting would be worse than returning a "currently being
+  edited" response. The error still leaves the transaction failed unless handled through a
+  savepoint. It applies to row locking, not to the required <code>ROW SHARE</code> table lock. Use
+  explicit <code>LOCK TABLE ... NOWAIT</code> first if table-lock waiting must also fail fast.
+</p>
+
+<h2 id="locking-read-details"><span class="num">06.</span> Locking-read scope and edge cases</h2>
+<p class="lead">
+  The visible syntax is short, but joins, limits, ordering, CTEs and isolation levels determine
+  which rows are locked and what happens after a wait.
+</p>
+
+<h3 id="of-clause">Limit locking to selected join inputs with OF</h3>
+<figure class="code">
+  <figcaption><b>Lock the order but not the customer</b></figcaption>
+  <pre><code>SELECT o.id, o.status, c.display_name
+FROM orders AS o
+JOIN customers AS c ON c.id = o.customer_id
+WHERE o.id = 7001
+FOR UPDATE OF o;</code></pre>
+</figure>
+
+<p>
+  Without an <code>OF</code> list, a top-level locking clause affects rows from every lockable table
+  contributing to the result. Use table aliases in <code>OF</code> to avoid locking unrelated join
+  inputs. The clause identifies tables, not selected output columns.
+</p>
+
+<h3 id="limit-offset">LIMIT, OFFSET and returned rows</h3>
+<ul class="clean">
+  <li>A top-level locking clause locks rows that are returned by the query.</li>
+  <li>With <code>LIMIT</code>, locking stops after enough rows have been returned.</li>
+  <li>Rows stepped over by <code>OFFSET</code> are still locked.</li>
+  <li>
+    A cursor locks rows that it fetches or steps past, not necessarily the whole result at once.
+  </li>
+  <li>
+    Use a unique, deterministic <code>ORDER BY</code> when a limited worker query must choose rows
+    predictably.
+  </li>
+</ul>
+
+<h3 id="cte-subquery">CTEs, views and subqueries</h3>
+<p>
+  A locking clause on a view or subquery can propagate to underlying tables, but a top-level clause
+  does not automatically lock rows inside an independently referenced <code>WITH</code> query. Put
+  the locking clause inside the CTE that selects the rows when that is the intended claim point.
+</p>
+
+<figure class="code">
+  <figcaption><b>Place the lock where rows are selected</b></figcaption>
+  <pre><code>WITH selected_orders AS (
+    SELECT id
+    FROM orders
+    WHERE status = 'ready'
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 20
+)
+SELECT o.*
+FROM orders AS o
+JOIN selected_orders AS s ON s.id = o.id;</code></pre>
+</figure>
+
+<h3 id="unsupported-shapes">Query shapes that cannot identify individual rows</h3>
+<p>
+  PostgreSQL rejects locking clauses where result rows cannot be clearly mapped back to table rows.
+  Current restrictions include several uses with aggregation, <code>GROUP BY</code>,
+  <code>HAVING</code>, <code>DISTINCT</code>, window clauses, and set-operation results. Lock base
+  rows in a separate query layer and aggregate afterward when the design genuinely requires both.
+</p>
+
+<h3 id="read-committed-recheck">What happens after waiting</h3>
+<p>
+  At <code>READ COMMITTED</code>, a locking read can wait for a row-changing transaction. After the
+  other transaction ends, PostgreSQL attempts to lock and return the updated version if it still
+  qualifies, or returns no row if it was deleted or no longer qualifies. At
+  <code>REPEATABLE READ</code> or <code>SERIALIZABLE</code>, a row changed since the transaction
+  began can instead cause a serialization failure.
+</p>
+
+<div class="warn">
+  <strong>ORDER BY can appear out of order after lock waits at READ COMMITTED</strong>
+  <p>
+    PostgreSQL can sort first and then wait to lock a row. While it waits, another transaction might
+    change the ordering column. The returned row values can therefore appear out of order. Moving
+    the lock into a subquery can force locking before the outer sort, but may lock many more rows.
+    Use that tradeoff only when strict post-wait ordering is required.
+  </p>
+</div>
+
+<h2 id="dml-concurrency"><span class="num">07.</span> DML, constraints and concurrency patterns</h2>
+<p class="lead">
+  The best lock is often the one PostgreSQL takes for an atomic statement or constraint. Prefer
+  declarative correctness before adding manual lock protocols.
+</p>
+
+<h3 id="atomic-update">Conditional UPDATE</h3>
+<figure class="code">
+  <figcaption><b>Reserve capacity without a separate read</b></figcaption>
+  <pre><code>UPDATE events
+SET seats_remaining = seats_remaining - 1
+WHERE id = 55
+  AND seats_remaining &gt; 0
+RETURNING id, seats_remaining;</code></pre>
+</figure>
+
+<p>
+  Concurrent updates to the same row are serialized. PostgreSQL rechecks the condition against the
+  relevant current row version at <code>READ COMMITTED</code>. The application uses the returned-row
+  count as the outcome instead of trusting an earlier read.
+</p>
+
+<h3 id="constraints">Let constraints arbitrate races</h3>
+<figure class="code">
+  <figcaption><b>Unique claim using INSERT</b></figcaption>
+  <pre><code>CREATE TABLE username_claims (
+    username text PRIMARY KEY,
+    user_id bigint NOT NULL,
+    claimed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+INSERT INTO username_claims (username, user_id)
+VALUES (lower($1), $2)
+ON CONFLICT (username) DO NOTHING
+RETURNING username, user_id;</code></pre>
+</figure>
+
+<p>
+  A unique index resolves concurrent attempts correctly even when both sessions initially observe no
+  row. A check-then-insert protocol with only <code>SELECT FOR UPDATE</code> cannot lock a row that
+  does not exist. Unique constraints, exclusion constraints, or Serializable isolation are usually
+  better tools for absence-based rules.
+</p>
+
+<h3 id="foreign-keys">Foreign keys and hidden contention</h3>
+<p>
+  A child insert must ensure that its referenced parent key remains valid, while a parent delete or
+  key update must inspect referencing rows. Missing indexes on referencing columns can make parent
+  changes scan and lock far more work than expected. PostgreSQL does not automatically create the
+  child-side index for every foreign key, so add one when the workload needs efficient lookups or
+  parent changes.
+</p>
+
+<h3 id="upsert-contention">UPSERT hot keys</h3>
+<p>
+  <code>INSERT ... ON CONFLICT</code> safely coordinates conflicting unique keys, but many sessions
+  targeting one key still serialize around that key. Correct syntax does not remove a hot spot.
+  Shard counters, batch writes, or redesign the contention point only when measurements show the
+  single key is a bottleneck.
+</p>
+
+<h2 id="deadlocks"><span class="num">08.</span> Deadlocks: detection, prevention and retry</h2>
+<p class="lead">
+  Blocking is a line: one transaction waits for another. A deadlock is a cycle: every participant
+  waits for a lock that another participant in the cycle holds, so none can make progress.
+</p>
+
+<figure class="code">
+  <figcaption><b>A classic two-row deadlock</b></figcaption>
+  <pre><code>-- Session A                              -- Session B
+BEGIN;                                    BEGIN;
+UPDATE accounts                           UPDATE accounts
+SET balance = balance - 10                SET balance = balance - 20
+WHERE id = 1;                             WHERE id = 2;
+
+UPDATE accounts                           UPDATE accounts
+SET balance = balance + 10                SET balance = balance + 20
+WHERE id = 2;  -- waits for B             WHERE id = 1;  -- waits for A</code></pre>
+</figure>
+
+<p>
+  PostgreSQL waits for <code>deadlock_timeout</code> before running the relatively expensive
+  deadlock check. If it finds a cycle, it aborts one transaction and reports SQLSTATE
+  <code>40P01</code>. Which participant becomes the victim is not a contract and must not be relied
+  on.
+</p>
+
+<h3 id="deadlock-prevention">Prevent cycles</h3>
+<ol class="clean">
+  <li>List every resource that a transaction path can lock.</li>
+  <li>Define one global ordering key, such as account ID ascending.</li>
+  <li>Make every code path, trigger and background job follow that order.</li>
+  <li>Acquire the strongest mode that path will need when it first reaches the resource.</li>
+  <li>
+    Keep transactions short and never wait for user input or remote HTTP calls while holding locks.
+  </li>
+  <li>Index predicates so write statements find and lock target rows efficiently.</li>
+</ol>
+
+<h3 id="deadlock-retry">Retry the complete transaction</h3>
+<figure class="code">
+  <figcaption><b>Application-level retry shape</b></figcaption>
+  <pre><code>for attempt in 1..max_attempts:
+    try:
+        begin transaction
+        execute every read, validation, lock and write
+        commit
+        return success
+    catch SQLSTATE 40P01 or retryable serialization failure:
+        rollback
+        sleep using bounded exponential backoff plus jitter
+
+return a controlled retry-exhausted error</code></pre>
+</figure>
+
+<p>
+  Retry from the beginning because the aborted transaction lost all its work and locks. Cap retries,
+  add jitter to avoid synchronized collisions, and make external side effects idempotent. Do not
+  retry every database error. Invalid SQL, violated business constraints, and authentication
+  failures need different handling.
+</p>
+
+<div class="note">
+  <strong>deadlock_timeout is not a general lock timeout</strong>
+  <p>
+    It controls when PostgreSQL checks for a deadlock and also influences lock-wait logging when
+    <code>log_lock_waits</code> is enabled. A wait with no cycle can continue indefinitely unless
+    <code>lock_timeout</code>, <code>statement_timeout</code>, cancellation, or session termination
+    ends it.
+  </p>
+</div>
+
+<h2 id="advisory-locks"><span class="num">09.</span> Advisory locks</h2>
+<p class="lead">
+  Advisory locks attach application-defined meaning to numeric keys. PostgreSQL coordinates the
+  keys, but it does not know which business resource they represent and does not force every code
+  path to participate.
+</p>
+
+<h3 id="advisory-keyspace">Keys and lock strengths</h3>
+<p>
+  A resource can be identified by one signed 64-bit integer or by a pair of signed 32-bit integers.
+  These are separate key spaces. Advisory locks can be exclusive or shared, blocking or try-lock,
+  and session-scoped or transaction-scoped.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Function family</th>
+        <th>Scope</th>
+        <th>Behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>pg_advisory_lock(...)</code></td>
+        <td>Session</td>
+        <td>Wait for exclusive lock; manually unlock</td>
+      </tr>
+      <tr>
+        <td><code>pg_try_advisory_lock(...)</code></td>
+        <td>Session</td>
+        <td>Return <code>true</code> or <code>false</code> immediately</td>
+      </tr>
+      <tr>
+        <td><code>pg_advisory_xact_lock(...)</code></td>
+        <td>Transaction</td>
+        <td>Wait for exclusive lock; automatically release at transaction end</td>
+      </tr>
+      <tr>
+        <td><code>pg_try_advisory_xact_lock(...)</code></td>
+        <td>Transaction</td>
+        <td>Try immediately; automatically release if acquired</td>
+      </tr>
+      <tr>
+        <td>Functions ending in <code>_shared</code></td>
+        <td>Session or transaction</td>
+        <td>Shared locks coexist but conflict with exclusive locks on the same key</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Serialize one tenant's billing run</b></figcaption>
+  <pre><code>BEGIN;
+
+-- Namespace 20 means "monthly billing"; tenant_id is the resource.
+SELECT pg_advisory_xact_lock(20, $1);
+
+INSERT INTO invoices (tenant_id, billing_month, amount)
+SELECT $1, date_trunc('month', CURRENT_DATE), SUM(unbilled_amount)
+FROM usage_events
+WHERE tenant_id = $1
+  AND billed_at IS NULL;
+
+UPDATE usage_events
+SET billed_at = clock_timestamp()
+WHERE tenant_id = $1
+  AND billed_at IS NULL;
+
+COMMIT;</code></pre>
+</figure>
+
+<h3 id="session-vs-transaction">Session scope versus transaction scope</h3>
+<ul class="clean">
+  <li>
+    Transaction-level locks release automatically on commit or rollback and are safest for database
+    work contained in one transaction.
+  </li>
+  <li>
+    Session-level locks survive transaction rollback and remain until matching unlock calls or
+    session end.
+  </li>
+  <li>
+    Session-level acquisition is reentrant and stacks. Three successful acquisitions need three
+    matching unlocks.
+  </li>
+  <li>
+    Connection pooling makes session ownership easy to misuse because a later request may receive a
+    different connection, while the original pooled connection still owns the lock.
+  </li>
+</ul>
+
+<div class="warn">
+  <strong>Advisory means cooperative</strong>
+  <p>
+    An ordinary <code>UPDATE</code> does not inspect your advisory key. Every code path that touches
+    the protected resource must follow the same key scheme and acquisition protocol. Document the
+    namespace, key derivation, scope and ordering as part of the data model.
+  </p>
+</div>
+
+<h3 id="advisory-limit-danger">Control evaluation before taking many advisory locks</h3>
+<p>
+  Do not assume that a <code>LIMIT</code> is evaluated before an advisory-lock function in the
+  select list. Put the limited row selection in a subquery, then lock its output. This prevents
+  acquiring more session locks than the application expects.
+</p>
+
+<figure class="code">
+  <figcaption><b>Limit resources before calling the lock function</b></figcaption>
+  <pre><code>SELECT pg_advisory_xact_lock(q.id)
+FROM (
+    SELECT id
+    FROM tenants
+    WHERE billing_due
+    ORDER BY id
+    LIMIT 100
+) AS q;</code></pre>
+</figure>
+
+<p>
+  Advisory locks share the server lock-manager memory pool with regular locks. An unbounded
+  high-cardinality lock scheme can exhaust shared lock capacity. Use them for active coordination,
+  not as a permanent registry of every business object.
+</p>
+
+<h2 id="skip-locked"><span class="num">10.</span> SKIP LOCKED and a PostgreSQL job queue</h2>
+<p class="lead">
+  <code>SKIP LOCKED</code> lets workers ignore rows currently claimed by competitors. It is useful
+  for queue-like workloads because workers need distinct available jobs, not a globally consistent
+  view of all jobs.
+</p>
+
+<div class="warn">
+  <strong>SKIP LOCKED is not a general query optimization</strong>
+  <p>
+    Skipped rows make the result intentionally inconsistent. Do not use it for reports, balances,
+    authorization checks, or any query that must represent all qualifying data. Its main fit is a
+    competing-consumer queue or similar work allocator.
+  </p>
+</div>
+
+<h3 id="queue-schema">Queue schema and claim index</h3>
+<figure class="code">
+  <figcaption><b>A durable queue table</b></figcaption>
+  <pre><code>CREATE TABLE jobs (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    queue_name text NOT NULL,
+    payload jsonb NOT NULL,
+    status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+    priority integer NOT NULL DEFAULT 0,
+    run_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempts integer NOT NULL DEFAULT 0,
+    max_attempts integer NOT NULL DEFAULT 10,
+    locked_at timestamptz,
+    locked_by text,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finished_at timestamptz,
+    CHECK (attempts &gt;= 0),
+    CHECK (max_attempts &gt; 0)
+);
+
+CREATE INDEX jobs_claim_idx
+    ON jobs (queue_name, priority DESC, run_at, id)
+    WHERE status = 'pending';</code></pre>
+</figure>
+
+<p>
+  The partial index matches the fixed pending-state predicate and starts with the queue partition.
+  The remaining keys support priority and deterministic tie-breaking. Validate the exact query with
+  <code>EXPLAIN (ANALYZE, BUFFERS)</code> on representative queue volume.
+</p>
+
+<h3 id="atomic-claim">Claim and mark jobs in one statement</h3>
+<figure class="code">
+  <figcaption><b>Atomic batch claim</b></figcaption>
+  <pre><code>WITH picked AS (
+    SELECT id
+    FROM jobs
+    WHERE queue_name = $1
+      AND status = 'pending'
+      AND run_at &lt;= clock_timestamp()
+      AND attempts &lt; max_attempts
+    ORDER BY priority DESC, run_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+)
+UPDATE jobs AS j
+SET status = 'running',
+    attempts = j.attempts + 1,
+    locked_at = clock_timestamp(),
+    locked_by = $3
+FROM picked
+WHERE j.id = picked.id
+RETURNING j.id, j.payload, j.attempts, j.locked_at;</code></pre>
+</figure>
+
+<ol class="clean">
+  <li>The CTE finds eligible rows in deterministic priority order.</li>
+  <li><code>FOR UPDATE</code> reserves each selected row.</li>
+  <li><code>SKIP LOCKED</code> moves past rows another worker already reserved.</li>
+  <li>The same SQL statement changes claimed rows to <code>running</code>.</li>
+  <li><code>RETURNING</code> gives the worker exactly the jobs it claimed.</li>
+  <li>
+    The application commits promptly, then performs long-running work outside that transaction.
+  </li>
+</ol>
+
+<p>
+  Keeping the transaction open while executing a slow job holds row locks, grows contention, and
+  makes worker failure harder to recover. Persist a lease-like claim, commit, then do the work. The
+  row state, not a long-lived database lock, records ownership during processing.
+</p>
+
+<h3 id="complete-job">Complete with an ownership check</h3>
+<figure class="code">
+  <figcaption><b>Only the current claimant may finish</b></figcaption>
+  <pre><code>UPDATE jobs
+SET status = 'succeeded',
+    finished_at = clock_timestamp(),
+    locked_at = NULL,
+    locked_by = NULL,
+    last_error = NULL
+WHERE id = $1
+  AND status = 'running'
+  AND locked_by = $2
+RETURNING id;</code></pre>
+</figure>
+
+<p>
+  Treat zero returned rows as a lost or stale claim. A stronger design gives every claim a unique
+  token and requires that token on completion, preventing a restarted worker with the same name from
+  completing work owned by a newer attempt.
+</p>
+
+<h3 id="queue-recovery">Recover abandoned work</h3>
+<figure class="code">
+  <figcaption><b>Requeue expired claims in bounded batches</b></figcaption>
+  <pre><code>WITH expired AS (
+    SELECT id
+    FROM jobs
+    WHERE status = 'running'
+      AND locked_at &lt; clock_timestamp() - INTERVAL '15 minutes'
+      AND attempts &lt; max_attempts
+    ORDER BY locked_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 100
+)
+UPDATE jobs AS j
+SET status = 'pending',
+    run_at = clock_timestamp() + INTERVAL '30 seconds',
+    locked_at = NULL,
+    locked_by = NULL,
+    last_error = 'worker lease expired'
+FROM expired
+WHERE j.id = expired.id
+RETURNING j.id;</code></pre>
+</figure>
+
+<p>
+  The lease duration must exceed normal work or be renewed safely with a heartbeat and claim token.
+  Jobs at <code>max_attempts</code> should move to a terminal failed state or dead-letter workflow
+  with enough error context for diagnosis.
+</p>
+
+<h3 id="delivery-semantics">Delivery is normally at least once</h3>
+<p>
+  A worker can perform an external side effect and crash before recording success, so the recovered
+  job may run again. A database row lock cannot create exactly-once behavior across PostgreSQL and
+  an unrelated external service. Use idempotency keys, unique constraints, an outbox pattern, or a
+  target API that deduplicates requests.
+</p>
+
+<h3 id="queue-fairness">Fairness, starvation and throughput</h3>
+<ul class="clean">
+  <li>
+    A hot high-priority stream can starve lower-priority jobs unless policy ages or quotas them.
+  </li>
+  <li>Large claim batches hold more locks and can make work distribution uneven.</li>
+  <li>Small batches reduce lock duration but add more transactions and round trips.</li>
+  <li>
+    A deterministic final key such as <code>id</code> makes selection stable among equal priorities.
+  </li>
+  <li>
+    Monitor the age of the oldest pending job, not only total queue depth. A flat depth can hide
+    starvation.
+  </li>
+</ul>
+
+<h2 id="monitoring">
+  <span class="num">11.</span> Diagnose blocking with pg_stat_activity and pg_locks
+</h2>
+<p class="lead">
+  Start with the waiting session, identify its direct blockers, inspect both transactions, and then
+  decide whether to wait, cancel work, terminate a session, or fix the application.
+</p>
+
+<figure class="code">
+  <figcaption><b>Find blocked sessions and direct blockers</b></figcaption>
+  <pre><code>SELECT
+    blocked.pid AS blocked_pid,
+    blocked.usename AS blocked_user,
+    blocked.application_name AS blocked_application,
+    blocked.wait_event_type,
+    blocked.wait_event,
+    clock_timestamp() - blocked.query_start AS blocked_for,
+    blocked.query AS blocked_query,
+    blocker.pid AS blocker_pid,
+    blocker.state AS blocker_state,
+    clock_timestamp() - blocker.xact_start AS blocker_xact_age,
+    blocker.query AS blocker_query
+FROM pg_stat_activity AS blocked
+CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid)
+JOIN pg_stat_activity AS blocker ON blocker.pid = b.pid
+ORDER BY blocked_for DESC;</code></pre>
+</figure>
+
+<p>
+  <code>pg_blocking_pids()</code> understands PostgreSQL's lock conflict and wait-queue rules and is
+  safer than attempting to reconstruct every blocker with a simplistic self-join on
+  <code>pg_locks</code>. An empty array means no lock-manager blocker is currently identified.
+</p>
+
+<figure class="code">
+  <figcaption><b>Inspect lock requests for one session</b></figcaption>
+  <pre><code>SELECT
+    l.pid,
+    l.locktype,
+    l.mode,
+    l.granted,
+    l.waitstart,
+    l.relation::regclass AS relation,
+    l.page,
+    l.tuple,
+    l.transactionid,
+    l.virtualxid
+FROM pg_locks AS l
+WHERE l.pid = $1
+ORDER BY l.granted, l.locktype, l.mode;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Row locks often appear as transaction-ID waits</strong>
+  <p>
+    Row-lock state is primarily stored with tuples, so a held row lock normally does not appear as
+    one intuitive <code>tuple</code> row in <code>pg_locks</code>. A waiter commonly appears as
+    waiting for the holder's <code>transactionid</code>. Combine <code>pg_locks</code>,
+    <code>pg_stat_activity</code>, <code>pg_blocking_pids()</code>, query context and application
+    metadata.
+  </p>
+</div>
+
+<h3 id="monitoring-questions">Questions to answer during an incident</h3>
+<ol class="clean">
+  <li>Which PID is waiting, and for how long?</li>
+  <li>Which direct and indirect sessions form the blocking chain?</li>
+  <li>Is the blocker actively working or <code>idle in transaction</code>?</li>
+  <li>When did the blocker's transaction begin?</li>
+  <li>Which relation and lock mode are involved?</li>
+  <li>Is a DDL statement waiting behind writes while new requests queue behind the DDL?</li>
+  <li>Can the owning application safely cancel or terminate the chosen session?</li>
+  <li>
+    What code path, missing timeout, slow query, or transaction boundary caused the condition?
+  </li>
+</ol>
+
+<p>
+  Canceling a query with <code>pg_cancel_backend(pid)</code> is less disruptive than terminating its
+  session with <code>pg_terminate_backend(pid)</code>. Either action can affect users and roll back
+  work. Confirm the target, owner, transaction and business impact before intervening.
+</p>
+
+<h3 id="lock-logging">Useful operational settings</h3>
+<ul class="clean">
+  <li>
+    Enable <code>log_lock_waits</code> when lock waits need server-log visibility. Messages are tied
+    to <code>deadlock_timeout</code>.
+  </li>
+  <li>
+    Keep <code>deadlock_timeout</code> high enough to avoid excessive checks but low enough for the
+    desired diagnosis. Its default is normally suitable before workload-specific tuning.
+  </li>
+  <li>Set application-specific <code>lock_timeout</code> and <code>statement_timeout</code>.</li>
+  <li>Tag connections with meaningful <code>application_name</code> values.</li>
+  <li>Track transaction age and idle-in-transaction sessions continuously.</li>
+</ul>
+
+<h2 id="performance"><span class="num">12.</span> Performance implications</h2>
+<p class="lead">
+  Locks are cheap when uncontended and expensive when they serialize hot work. Performance depends
+  more on lock scope, acquisition order and hold time than on the number of locking keywords.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Cause</th>
+        <th>Effect</th>
+        <th>Typical response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Long transaction</td>
+        <td>Locks and old snapshots live longer; queues build</td>
+        <td>Move remote work out of the transaction and commit promptly</td>
+      </tr>
+      <tr>
+        <td>Hot row</td>
+        <td>Writers serialize regardless of indexes</td>
+        <td>Batch, partition ownership, or redesign the shared counter</td>
+      </tr>
+      <tr>
+        <td>Missing predicate index</td>
+        <td>More rows scanned, examined and possibly locked</td>
+        <td>Add a measured index matching the write or claim query</td>
+      </tr>
+      <tr>
+        <td>Oversized lock batch</td>
+        <td>More conflicts, memory, rollback work and unfairness</td>
+        <td>Use bounded batches with stable ordering</td>
+      </tr>
+      <tr>
+        <td>DDL needing strong lock</td>
+        <td>Waits behind traffic and can become a queue head</td>
+        <td>Use safer online forms, short lock timeout and a rollout plan</td>
+      </tr>
+      <tr>
+        <td>Too-strong row mode</td>
+        <td>Blocks otherwise compatible operations</td>
+        <td>Use the weakest mode that fully protects the invariant</td>
+      </tr>
+      <tr>
+        <td>Many advisory keys</td>
+        <td>Consumes shared lock-manager memory</td>
+        <td>Bound active keys and release session locks reliably</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="lock-amplification">Lock amplification</h3>
+<p>
+  A query intended to change ten rows may scan thousands because of a weak predicate or missing
+  index. Depending on the plan and statement, it can spend time evaluating, waiting, or locking much
+  more work than the business action suggests. Use
+  <code>EXPLAIN (ANALYZE, BUFFERS)</code> safely in a representative environment and inspect rows,
+  loops, filters, triggers, and foreign-key work.
+</p>
+
+<h3 id="ddl-queueing">Strong-lock queueing</h3>
+<p>
+  A migration requesting <code>ACCESS EXCLUSIVE</code> can wait behind a long reader. New ordinary
+  reads can then queue behind the waiting migration rather than bypass it forever. A seemingly
+  harmless DDL deployment can therefore create an application-wide pileup. Use a short
+  <code>lock_timeout</code>, understand the exact command's lock level, and retry during a safe
+  window instead of waiting indefinitely.
+</p>
+
+<h3 id="row-lock-writes">Locking reads can write</h3>
+<p>
+  <code>SELECT FOR UPDATE</code> marks tuples as locked and can cause disk writes. It also adds a
+  <code>LockRows</code> operation to the execution plan and prevents a purely index-only result for
+  those locked tuples because PostgreSQL must visit tuple state. Do not add locking clauses to
+  read-only queries "just in case."
+</p>
+
+<h2 id="design-patterns"><span class="num">13.</span> Practical concurrency patterns</h2>
+
+<h3 id="pattern-inventory">Inventory reservation</h3>
+<ol class="clean">
+  <li>Use one conditional update that decrements only when inventory is sufficient.</li>
+  <li>Return the new state with <code>RETURNING</code>.</li>
+  <li>Check that exactly one row was returned.</li>
+  <li>Record a unique reservation ID in the same transaction for idempotency.</li>
+  <li>Release or expire reservations through another guarded state transition.</li>
+</ol>
+
+<h3 id="pattern-account">Account transfer</h3>
+<ol class="clean">
+  <li>Begin one database transaction.</li>
+  <li>Lock all participating accounts in ascending primary-key order.</li>
+  <li>Validate balances after acquiring the locks.</li>
+  <li>Apply both ledger entries and balance changes atomically.</li>
+  <li>Commit, then publish external notifications through an outbox.</li>
+</ol>
+
+<h3 id="pattern-leader">One active task per business key</h3>
+<p>
+  Use a transaction-level advisory lock when the resource is naturally identified by a stable
+  numeric key and all participants share the protocol. Use a unique row or lease table when
+  ownership must remain queryable and survive beyond a transaction or connection.
+</p>
+
+<h3 id="pattern-optimistic">Optimistic version check</h3>
+<figure class="code">
+  <figcaption><b>Detect a stale editor without holding a long lock</b></figcaption>
+  <pre><code>UPDATE documents
+SET body = $1,
+    version = version + 1,
+    updated_at = clock_timestamp()
+WHERE id = $2
+  AND version = $3
+RETURNING id, version;</code></pre>
+</figure>
+
+<p>
+  Zero returned rows means another writer changed the document after it was read. This is useful
+  when users edit for minutes and holding a transaction open would be unacceptable. The application
+  can reload, merge, or report a conflict.
+</p>
+
+<h3 id="pattern-serializable">When no row is a natural mutex</h3>
+<p>
+  If correctness depends on a set of rows that can change shape, manual row locks may miss phantoms
+  or absent rows. Prefer a database constraint if the rule can be expressed declaratively. Otherwise
+  consider <code>SERIALIZABLE</code> isolation and retry serialization failures. Do not invent a
+  random existing row to lock without documenting why every participant uses it.
+</p>
+
+<h2 id="mistakes"><span class="num">14.</span> Common mistakes and safer choices</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails or hurts</th>
+        <th>Safer choice</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Assume plain <code>SELECT</code> reserves rows</td>
+        <td>Another transaction can change them before later DML</td>
+        <td>Atomic DML, a constraint, or a locking read</td>
+      </tr>
+      <tr>
+        <td>Use <code>FOR UPDATE</code> for every read</td>
+        <td>Creates writes and unnecessary blocking</td>
+        <td>Lock only transactions that will coordinate a protected action</td>
+      </tr>
+      <tr>
+        <td>Use a table lock for one-row invariants</td>
+        <td>Serializes unrelated keys</td>
+        <td>Row lock, constraint, or keyed advisory lock</td>
+      </tr>
+      <tr>
+        <td>Lock joined tables unintentionally</td>
+        <td>Expands contention beyond the modified relation</td>
+        <td>Use <code>FOR UPDATE OF target_alias</code></td>
+      </tr>
+      <tr>
+        <td>Hold locks while calling another service</td>
+        <td>Remote latency and failure extend database blocking</td>
+        <td>Commit state, then use an outbox or lease workflow</td>
+      </tr>
+      <tr>
+        <td>Retry only the failed statement after deadlock</td>
+        <td>The whole transaction was aborted</td>
+        <td>Rollback and retry the complete idempotent transaction</td>
+      </tr>
+      <tr>
+        <td>Assume lock timeout detects deadlocks</td>
+        <td>Timeout and cycle detection solve different problems</td>
+        <td>Use deadlock prevention, detector, and bounded waits</td>
+      </tr>
+      <tr>
+        <td>Use <code>SKIP LOCKED</code> for reports</td>
+        <td>Silently omits busy rows</td>
+        <td>Use a normal consistent query</td>
+      </tr>
+      <tr>
+        <td>Process queue work before committing the claim</td>
+        <td>Holds locks during long work and complicates recovery</td>
+        <td>Persist claim, commit, process, then guard completion</td>
+      </tr>
+      <tr>
+        <td>Claim queue rows without a lease or recovery</td>
+        <td>Crashed workers leave jobs stuck forever</td>
+        <td>Timestamped claim, unique token, retry limit and reaper</td>
+      </tr>
+      <tr>
+        <td>Use session advisory locks through a pool casually</td>
+        <td>Unlock may run on another connection; locks can leak</td>
+        <td>Prefer transaction scope or pin and clean the session carefully</td>
+      </tr>
+      <tr>
+        <td>Derive advisory keys inconsistently</td>
+        <td>Different code paths lock different numbers</td>
+        <td>Centralize a collision-aware namespace and key mapping</td>
+      </tr>
+      <tr>
+        <td>Kill the oldest session without investigation</td>
+        <td>May roll back important work or target the wrong owner</td>
+        <td>Trace the chain and coordinate the least disruptive action</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="review-workflow"><span class="num">15.</span> Concurrency design and incident checklist</h2>
+
+<h3 id="design-checklist">Before shipping a concurrent workflow</h3>
+<ol class="clean">
+  <li>Write the business invariant in one sentence.</li>
+  <li>Identify whether it concerns one row, many rows, absence, or an abstract resource.</li>
+  <li>Prefer a constraint or one atomic statement when it can enforce the invariant.</li>
+  <li>Choose the weakest sufficient row, table, advisory, or isolation mechanism.</li>
+  <li>Define a global acquisition order for multiple resources.</li>
+  <li>Keep the transaction free of user think time and remote service calls.</li>
+  <li>Add bounded timeouts and handle the resulting SQLSTATEs deliberately.</li>
+  <li>Design whole-transaction retries with idempotency.</li>
+  <li>Index target predicates and foreign-key paths.</li>
+  <li>Load-test with real contention, not only single-session correctness tests.</li>
+  <li>Expose application name, transaction age, queue age and blocker metrics.</li>
+  <li>Document failure recovery, especially for leases and background jobs.</li>
+</ol>
+
+<h3 id="incident-checklist">During a blocking incident</h3>
+<ol class="clean">
+  <li>Capture current <code>pg_stat_activity</code> and blocker chains before state disappears.</li>
+  <li>Find the root blocker, not only the final waiting query.</li>
+  <li>Check transaction age, state, application, user and current or last query.</li>
+  <li>Identify the lock type, relation and requested mode.</li>
+  <li>Check for a waiting schema migration that has become the queue head.</li>
+  <li>Coordinate cancel or termination with the workload owner.</li>
+  <li>Confirm recovery and watch for retried traffic creating another spike.</li>
+  <li>Fix the transaction boundary, query plan, lock order, timeout or deployment process.</li>
+</ol>
+
+<h2 id="practice"><span class="num">16.</span> Practice problems</h2>
+
+<h3 id="practice-1">1. Prevent overselling</h3>
+<p>
+  Write one statement that reserves three units from product 7 only if at least three remain. It
+  must return the remaining count and report failure through zero returned rows.
+</p>
+<details>
+  <summary>Solution</summary>
+  <figure class="code">
+    <figcaption><b>Conditional atomic update</b></figcaption>
+    <pre><code>UPDATE products
+SET stock = stock - 3
+WHERE id = 7
+  AND stock &gt;= 3
+RETURNING id, stock;</code></pre>
+  </figure>
+</details>
+
+<h3 id="practice-2">2. Limit lock scope in a join</h3>
+<p>
+  Select order 99 with its customer name, but lock only the order because only its status will
+  change.
+</p>
+<details>
+  <summary>Solution</summary>
+  <figure class="code">
+    <figcaption><b>Use an OF list</b></figcaption>
+    <pre><code>SELECT o.id, o.status, c.display_name
+FROM orders AS o
+JOIN customers AS c ON c.id = o.customer_id
+WHERE o.id = 99
+FOR UPDATE OF o;</code></pre>
+  </figure>
+</details>
+
+<h3 id="practice-3">3. Remove a transfer deadlock</h3>
+<p>
+  Transfers sometimes lock the source first and destination second. Explain the flaw and define one
+  rule that works for transfers in either direction.
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    Opposite-direction transfers acquire the same pair in opposite order, creating a cycle. Select
+    and lock both account rows in ascending account ID order, then apply source and destination
+    changes according to their roles. Every path must follow the same ordering.
+  </p>
+</details>
+
+<h3 id="practice-4">4. Build a two-job claim</h3>
+<p>
+  Claim at most two pending email jobs without waiting for rows claimed by other workers. Persist
+  ownership before returning work.
+</p>
+<details>
+  <summary>Solution</summary>
+  <figure class="code">
+    <figcaption><b>Lock and update in one statement</b></figcaption>
+    <pre><code>WITH picked AS (
+    SELECT id
+    FROM jobs
+    WHERE queue_name = 'email'
+      AND status = 'pending'
+      AND run_at &lt;= clock_timestamp()
+    ORDER BY priority DESC, run_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 2
+)
+UPDATE jobs AS j
+SET status = 'running',
+    locked_by = 'worker-7',
+    locked_at = clock_timestamp(),
+    attempts = attempts + 1
+FROM picked
+WHERE j.id = picked.id
+RETURNING j.id, j.payload;</code></pre>
+  </figure>
+</details>
+
+<h3 id="practice-5">5. Choose advisory-lock scope</h3>
+<p>
+  A tenant-scoped report is generated entirely inside one transaction. Should its advisory lock be
+  session-level or transaction-level?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    Prefer <code>pg_advisory_xact_lock</code>. It releases automatically on commit or rollback and
+    avoids lock leakage through pooled sessions. Session scope is justified only when ownership
+    intentionally extends outside transaction boundaries and the connection lifecycle is controlled.
+  </p>
+</details>
+
+<h3 id="practice-6">6. Read a blocker chain</h3>
+<p>
+  Session 501 is waiting, <code>pg_blocking_pids(501)</code> returns <code>{420}</code>, and session
+  420 is <code>idle in transaction</code> with a transaction age of 18 minutes. What is the likely
+  issue and first safe operational step?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    Session 420 finished a statement but left its transaction open, retaining locks. Confirm the
+    application and business owner, capture diagnostic context, then coordinate cancellation,
+    termination, or application cleanup according to operational policy. The lasting fix is a short
+    transaction boundary plus an idle-in-transaction timeout.
+  </p>
+</details>
+
+<h3 id="practice-7">7. Protect an absent value</h3>
+<p>
+  Two sessions both check that no user has email <code>a@example.com</code>. Why can
+  <code>SELECT ... FOR UPDATE</code> still fail to prevent duplicates?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    There is no existing row to lock. Both sessions can observe absence. A unique constraint on the
+    normalized email value should arbitrate the race, with the application handling the unique
+    conflict or using <code>ON CONFLICT</code>.
+  </p>
+</details>
+
+<h2 id="interview"><span class="num">17.</span> Interview Q&amp;A</h2>
+
+<h3 id="qa-1">Why does PostgreSQL need locks if it has MVCC?</h3>
+<p>
+  MVCC determines which row versions a statement can see and removes much reader-writer blocking.
+  Locks still coordinate conflicting writes, locking reads, schema changes, object lifetime,
+  uniqueness, foreign keys and application-defined critical sections.
+</p>
+
+<h3 id="qa-2">Does SELECT FOR UPDATE block ordinary SELECT?</h3>
+<p>
+  No. An ordinary query generally reads an MVCC-visible version. <code>FOR UPDATE</code> blocks
+  incompatible row lockers, updates and deletes on the same rows. A strong table lock such as
+  <code>ACCESS EXCLUSIVE</code> can block the ordinary query at the relation level.
+</p>
+
+<h3 id="qa-3">What is the difference between FOR UPDATE and FOR NO KEY UPDATE?</h3>
+<p>
+  <code>FOR UPDATE</code> is strongest and conflicts with every row-lock mode.
+  <code>FOR NO KEY UPDATE</code> is weaker and can coexist with <code>FOR KEY SHARE</code>, making
+  it suitable when non-key attributes change but referenced key identity remains stable.
+</p>
+
+<h3 id="qa-4">What is the difference between FOR SHARE and FOR KEY SHARE?</h3>
+<p>
+  <code>FOR SHARE</code> blocks all updates and deletes through its conflicts with both update-style
+  modes. <code>FOR KEY SHARE</code> mainly prevents deletion and key-changing updates while allowing
+  non-key updates.
+</p>
+
+<h3 id="qa-5">What do NOWAIT and SKIP LOCKED do?</h3>
+<p>
+  <code>NOWAIT</code> fails immediately when a selected row cannot be locked.
+  <code>SKIP LOCKED</code> silently omits such rows. Both apply to the row-lock request, not the
+  required table lock. <code>SKIP LOCKED</code> is appropriate for queue-like consumers, not general
+  consistent reads.
+</p>
+
+<h3 id="qa-6">How does PostgreSQL resolve a deadlock?</h3>
+<p>
+  After waiting for <code>deadlock_timeout</code>, PostgreSQL checks the wait-for graph. If it finds
+  a cycle, it aborts one participant with SQLSTATE <code>40P01</code>, releasing its locks so others
+  can continue. Applications should prevent cycles through stable lock ordering and retry the whole
+  aborted transaction when safe.
+</p>
+
+<h3 id="qa-7">Can row locks be exhausted through max_locks_per_transaction?</h3>
+<p>
+  Not directly. PostgreSQL stores row-lock state with tuples and transaction metadata, so there is
+  no configured count limit on locked rows. Table and advisory locks use shared lock-manager memory,
+  and large row-locking transactions are still operationally expensive.
+</p>
+
+<h3 id="qa-8">Why might a row-lock wait appear as transactionid in pg_locks?</h3>
+<p>
+  The row's lock state is stored on disk. A waiter commonly waits for the transaction that owns the
+  conflicting tuple state to finish, so <code>pg_locks</code> shows a share request on that
+  transaction ID rather than an obvious held tuple lock.
+</p>
+
+<h3 id="qa-9">How do advisory locks differ from row locks?</h3>
+<p>
+  Row locks are tied to real table rows and are automatically honored by relevant DML. Advisory
+  locks coordinate numeric keys whose meaning the application defines. PostgreSQL manages conflicts
+  but does not force non-participating SQL to respect an advisory lock.
+</p>
+
+<h3 id="qa-10">Why prefer transaction-level advisory locks?</h3>
+<p>
+  They release automatically on commit or rollback, match database transaction semantics, and are
+  less likely to leak through a connection pool. Session locks are useful only when coordination
+  intentionally spans transactions and connection ownership is controlled.
+</p>
+
+<h3 id="qa-11">How does SKIP LOCKED enable multiple workers?</h3>
+<p>
+  Each worker orders eligible rows, attempts to lock them, and skips rows already locked by other
+  workers. An atomic CTE plus <code>UPDATE ... RETURNING</code> persists distinct claims. Short
+  claim transactions, leases, retry limits and idempotent processing complete the design.
+</p>
+
+<h3 id="qa-12">Does that queue provide exactly-once execution?</h3>
+<p>
+  Normally no. A worker can complete an external effect and fail before marking the job successful,
+  causing a retry. The queue is usually at least once. Idempotency keys, deduplication,
+  transactional outbox patterns and guarded state changes control duplicate effects.
+</p>
+
+<h3 id="qa-13">What is the most common production lock problem?</h3>
+<p>
+  Often it is not a sophisticated deadlock. It is a long or idle transaction holding ordinary locks,
+  a hot row serializing writes, or DDL waiting for a strong lock. Transaction age, blocker chains
+  and application context reveal which one is happening.
+</p>
+
+<h3 id="qa-14">When is SERIALIZABLE better than manual row locking?</h3>
+<p>
+  It is useful when an invariant spans a changing predicate or absent rows and no fixed set of rows
+  can be locked safely. PostgreSQL detects dangerous serialization patterns and can abort a
+  transaction, so the application must retry complete transactions.
+</p>
+
+<h2 id="cheatsheet"><span class="num">18.</span> Concise cheat sheet</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Starting tool</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Read without reserving</td>
+        <td>Plain <code>SELECT</code> with MVCC</td>
+      </tr>
+      <tr>
+        <td>Reserve row for any update or delete</td>
+        <td><code>FOR UPDATE</code></td>
+      </tr>
+      <tr>
+        <td>Reserve for non-key update</td>
+        <td><code>FOR NO KEY UPDATE</code></td>
+      </tr>
+      <tr>
+        <td>Shared protection against updates</td>
+        <td><code>FOR SHARE</code></td>
+      </tr>
+      <tr>
+        <td>Protect key identity</td>
+        <td><code>FOR KEY SHARE</code></td>
+      </tr>
+      <tr>
+        <td>Fail instead of waiting</td>
+        <td><code>NOWAIT</code> or scoped <code>lock_timeout</code></td>
+      </tr>
+      <tr>
+        <td>Competing queue workers</td>
+        <td><code>FOR UPDATE SKIP LOCKED</code> plus persisted claims</td>
+      </tr>
+      <tr>
+        <td>Protect abstract business resource</td>
+        <td><code>pg_advisory_xact_lock</code></td>
+      </tr>
+      <tr>
+        <td>Protect an absent value</td>
+        <td>Unique constraint, exclusion constraint, or Serializable</td>
+      </tr>
+      <tr>
+        <td>Avoid deadlocks</td>
+        <td>Stable global lock order and short transactions</td>
+      </tr>
+      <tr>
+        <td>Handle deadlock</td>
+        <td>Rollback and retry complete idempotent transaction on <code>40P01</code></td>
+      </tr>
+      <tr>
+        <td>Find blockers</td>
+        <td><code>pg_blocking_pids()</code> plus <code>pg_stat_activity</code></td>
+      </tr>
+      <tr>
+        <td>Inspect lock requests</td>
+        <td><code>pg_locks</code>, especially <code>granted</code> and <code>waitstart</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ul class="clean">
+  <li>Locks normally live until transaction end.</li>
+  <li>Only <code>ACCESS EXCLUSIVE</code> blocks a plain table read.</li>
+  <li><code>ROW SHARE</code> and <code>ROW EXCLUSIVE</code> are table-lock names.</li>
+  <li>Use <code>OF alias</code> to restrict which join inputs are row-locked.</li>
+  <li><code>NOWAIT</code> and <code>SKIP LOCKED</code> do not bypass the table lock.</li>
+  <li>Never hold a transaction open for user input or remote service work.</li>
+  <li>Index write and queue predicates to reduce time spent finding target rows.</li>
+  <li>Use unique deterministic ordering before locking multiple resources.</li>
+  <li>Persist queue claims, commit quickly, recover leases, and make jobs idempotent.</li>
+</ul>
+
+<h2 id="references"><span class="num">19.</span> Official reference map</h2>
+<p class="lead">
+  These current PostgreSQL manuals are the primary references for the behavior and syntax in this
+  guide.
+</p>
+
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/explicit-locking.html"
+      >Explicit locking: table locks, row locks, deadlocks and advisory locks</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-select.html"
+      >SELECT locking-clause syntax, NOWAIT, SKIP LOCKED and query-shape details</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-lock.html"
+      >LOCK TABLE syntax and behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS"
+      >Advisory-lock functions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/view-pg-locks.html"
+      >The pg_locks system view</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/monitoring-stats.html"
+      >pg_stat_activity and activity monitoring</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-info.html"
+      >System information functions, including pg_blocking_pids</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-locks.html"
+      >Lock-management settings, including deadlock_timeout</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-client.html"
+      >Client statement and transaction timeout settings</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/transaction-iso.html"
+      >Transaction isolation and serialization behavior</a
+    >
+  </li>
+</ul>
