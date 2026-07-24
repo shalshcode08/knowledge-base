@@ -1,0 +1,1718 @@
+<h1>PostgreSQL Transactions, MVCC &amp; Isolation - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth and interview-focused guide to atomic work, snapshots, row versions, isolation
+  anomalies, safe retries, savepoints, and the concurrency behavior behind PostgreSQL transactions.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The transaction and snapshot mental model</h2>
+<p class="lead">
+  A transaction defines one logical unit of work. MVCC decides which row versions that work can see.
+  The isolation level decides when its snapshot is chosen and which concurrent outcomes PostgreSQL
+  must reject.
+</p>
+
+<p>
+  Imagine a table as a history of row versions rather than a collection of boxes that are
+  overwritten in place. When one transaction updates a row, PostgreSQL normally keeps the old
+  physical version and creates a new physical version. Each statement reads through a snapshot that
+  answers: "Which transactions count as completed for this view?" The visibility rules then choose
+  the correct version of every logical row.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of an online document with immutable revisions. A snapshot is a rule for choosing which
+    revisions belong to your view. Two readers can open the same document at different logical times
+    and correctly see different revisions. Publishing a new revision does not require erasing the
+    revision an older reader still needs.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Question it answers</th>
+        <th>PostgreSQL mechanism</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Transaction boundary</td>
+        <td>Which statements succeed or fail as one unit?</td>
+        <td><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code></td>
+      </tr>
+      <tr>
+        <td>Physical history</td>
+        <td>How can old and new states coexist?</td>
+        <td>Tuple versions carrying transaction metadata</td>
+      </tr>
+      <tr>
+        <td>Snapshot</td>
+        <td>Which transaction effects are visible to this statement?</td>
+        <td>Completed and in-progress transaction information</td>
+      </tr>
+      <tr>
+        <td>Isolation level</td>
+        <td>How stable must the view and final outcome be?</td>
+        <td>Statement snapshots, transaction snapshots, or SSI checks</td>
+      </tr>
+      <tr>
+        <td>Cleanup</td>
+        <td>When can obsolete versions be reused?</td>
+        <td><code>VACUUM</code> after no required snapshot can see them</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Visibility is not the same as existence</strong>
+  <p>
+    A row version may physically exist on disk but be invisible to a snapshot. Likewise, a version
+    marked by another transaction may remain visible until that transaction commits. Always reason
+    from versions, transaction status, and the current snapshot, not only from what is physically
+    stored.
+  </p>
+</div>
+
+<h2 id="acid"><span class="num">01.</span> ACID and choosing the unit of work</h2>
+<p class="lead">
+  ACID describes the guarantees expected around a transaction. It does not automatically make a
+  multi-step business workflow correct. The application still has to choose the right boundary,
+  constraints, isolation level, and retry behavior.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Practical meaning</th>
+        <th>What the developer must still do</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Atomicity</strong></td>
+        <td>Database changes in the transaction commit together or are discarded together</td>
+        <td>Place every database change for one invariant in the same transaction</td>
+      </tr>
+      <tr>
+        <td><strong>Consistency</strong></td>
+        <td>A committed state satisfies enforced database rules</td>
+        <td>Define constraints and write concurrency-safe business logic</td>
+      </tr>
+      <tr>
+        <td><strong>Isolation</strong></td>
+        <td>Concurrent work is hidden or rejected according to the selected level</td>
+        <td>Choose a sufficient level and handle permitted anomalies</td>
+      </tr>
+      <tr>
+        <td><strong>Durability</strong></td>
+        <td>After a successful durable commit, database changes survive a crash</td>
+        <td>Understand durability settings, backups, and external side effects</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>One invariant, one transaction</b></figcaption>
+  <pre><code>BEGIN;
+
+UPDATE accounts
+SET balance = balance - 100.00
+WHERE account_id = 10
+  AND balance &gt;= 100.00;
+
+-- The application must require exactly one updated source row.
+
+UPDATE accounts
+SET balance = balance + 100.00
+WHERE account_id = 20;
+
+INSERT INTO transfers (from_account, to_account, amount)
+VALUES (10, 20, 100.00);
+
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  Without one boundary, a crash after the debit but before the credit leaves incomplete work.
+  Atomicity prevents that database state. It does not make an email, HTTP request, or message sent
+  to an external system roll back. For cross-system work, patterns such as a transactional outbox
+  are needed so the committed database state records what must be delivered.
+</p>
+
+<div class="warn">
+  <strong>COMMIT is a decision point</strong>
+  <p>
+    Do not commit and then decide whether the business operation was valid. Validate first, let
+    constraints check the final state, and commit only when the whole unit is ready. If the client
+    loses its connection during commit, the outcome can be uncertain from the client's point of
+    view, so blindly repeating a non-idempotent operation can duplicate work.
+  </p>
+</div>
+
+<h2 id="boundaries"><span class="num">02.</span> BEGIN, COMMIT, ROLLBACK and autocommit</h2>
+<p class="lead">
+  PostgreSQL always executes statements in transactions. An explicit transaction block groups
+  several statements. Without one, a client normally uses autocommit, so each successful statement
+  is committed as its own transaction.
+</p>
+
+<figure class="code">
+  <figcaption><b>Core transaction syntax</b></figcaption>
+  <pre><code>-- BEGIN is PostgreSQL's common spelling.
+BEGIN;
+-- statements
+COMMIT;
+
+-- SQL-standard spelling with identical transaction-start behavior.
+START TRANSACTION;
+-- statements
+ROLLBACK;
+
+-- Set characteristics while starting the transaction.
+BEGIN TRANSACTION
+  ISOLATION LEVEL REPEATABLE READ
+  READ ONLY;
+
+-- Finish and immediately start another transaction with the same characteristics.
+COMMIT AND CHAIN;
+ROLLBACK AND CHAIN;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Command</th>
+        <th>Effect</th>
+        <th>Important detail</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>BEGIN</code></td>
+        <td>Starts an explicit transaction block</td>
+        <td>A second <code>BEGIN</code> warns; it does not create a nested transaction</td>
+      </tr>
+      <tr>
+        <td><code>COMMIT</code></td>
+        <td>Makes the transaction's database changes permanent and visible</td>
+        <td>Locks are released when the transaction ends</td>
+      </tr>
+      <tr>
+        <td><code>ROLLBACK</code></td>
+        <td>Discards the whole transaction's database changes</td>
+        <td>Some non-transactional effects, especially sequence advancement, remain</td>
+      </tr>
+      <tr>
+        <td><code>AND CHAIN</code></td>
+        <td>Ends one transaction and immediately starts another</td>
+        <td>The new transaction retains transaction characteristics</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  In many drivers, "autocommit off" means the driver opens a transaction implicitly and leaves it
+  open until the application commits or rolls back. Check the driver and framework behavior. A
+  forgotten transaction can retain snapshots, locks, and database resources even if the code never
+  typed <code>BEGIN</code>.
+</p>
+
+<h3 id="failed-state">What happens after a statement error</h3>
+<figure class="code">
+  <figcaption><b>A transaction stays failed until it is recovered or ended</b></figcaption>
+  <pre><code>BEGIN;
+
+INSERT INTO users (email) VALUES ('duplicate@example.com');
+-- ERROR: duplicate key value violates unique constraint
+
+SELECT 1;
+-- ERROR: current transaction is aborted, commands ignored...
+
+ROLLBACK;
+-- The session can now start new work.</code></pre>
+</figure>
+
+<p>
+  PostgreSQL does not silently skip a failed statement and continue the same top-level transaction.
+  That would make it too easy to commit a partially understood state. Use a savepoint when a
+  particular failure is expected and recoverable. Otherwise roll back the whole transaction.
+</p>
+
+<h2 id="savepoints"><span class="num">03.</span> Savepoints and partial rollback</h2>
+<p class="lead">
+  A savepoint is a named recovery point inside one transaction. It is useful for an optional step or
+  an expected error, but it is not an independently durable nested transaction.
+</p>
+
+<figure class="code">
+  <figcaption><b>Keep earlier work while undoing a later step</b></figcaption>
+  <pre><code>BEGIN;
+
+INSERT INTO orders (order_id, customer_id, status)
+VALUES (501, 42, 'created');
+
+SAVEPOINT optional_coupon;
+
+UPDATE coupons
+SET remaining_uses = remaining_uses - 1
+WHERE code = 'WELCOME'
+  AND remaining_uses &gt; 0;
+
+-- Suppose a later coupon operation fails.
+ROLLBACK TO SAVEPOINT optional_coupon;
+
+INSERT INTO audit_log (event_type, entity_id)
+VALUES ('order_created_without_coupon', 501);
+
+COMMIT;</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>
+    <code>SAVEPOINT name</code> records a point inside the current transaction. It requires an
+    explicit transaction block.
+  </li>
+  <li>
+    <code>ROLLBACK TO SAVEPOINT name</code> undoes work after the point and restores a usable
+    transaction state. The named savepoint remains available.
+  </li>
+  <li>
+    Rolling back to a savepoint destroys savepoints created after it. Earlier savepoints remain.
+  </li>
+  <li>
+    <code>RELEASE SAVEPOINT name</code> removes that savepoint and later nested savepoints while
+    keeping their successful effects in the enclosing transaction.
+  </li>
+  <li>
+    The outer <code>COMMIT</code> is still required. A released savepoint has not made anything
+    independently durable.
+  </li>
+</ul>
+
+<div class="note">
+  <strong>Savepoints have a cost</strong>
+  <p>
+    Savepoints use PostgreSQL subtransaction machinery. A sensible number for error recovery is
+    normal, but creating huge numbers in one transaction adds bookkeeping and can hurt performance.
+    Some framework "nested transactions" are savepoints, so inspect what the abstraction really
+    does.
+  </p>
+</div>
+
+<h2 id="mvcc"><span class="num">04.</span> MVCC: multiple physical versions of one logical row</h2>
+<p class="lead">
+  Multi-Version Concurrency Control lets readers use an older committed version while a writer
+  creates a newer version. Ordinary reads therefore do not block ordinary writes, and ordinary
+  writes do not block ordinary reads.
+</p>
+
+<figure class="code">
+  <figcaption><b>Conceptual version chain after an update</b></figcaption>
+  <pre><code>Logical account 42
+
+Version A: balance = 500, xmin = 100, xmax = 125
+Version B: balance = 450, xmin = 125, xmax = 0
+
+Transaction 125 performed:
+UPDATE accounts SET balance = 450 WHERE account_id = 42;
+
+Old snapshot: Version A may be visible
+New snapshot after transaction 125 commits: Version B may be visible</code></pre>
+</figure>
+
+<p>
+  An <code>UPDATE</code> is conceptually a delete of the old tuple version plus an insert of a new
+  tuple version. The old version cannot be reclaimed while an active snapshot might still need it. A
+  <code>DELETE</code> marks a version as deleted but does not immediately remove its bytes. Routine
+  <code>VACUUM</code> later makes dead-version space reusable after it is safe.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Version effect</th>
+        <th>What concurrent snapshots can do</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>INSERT</code></td>
+        <td>Creates a version whose creator is the inserting transaction</td>
+        <td>Ignore it until its creator is visible</td>
+      </tr>
+      <tr>
+        <td><code>UPDATE</code></td>
+        <td>Marks the old version and creates a replacement</td>
+        <td>Choose the old or new committed version as the snapshot requires</td>
+      </tr>
+      <tr>
+        <td><code>DELETE</code></td>
+        <td>Marks the current version as deleted</td>
+        <td>Keep seeing it if the deleting transaction is not visible</td>
+      </tr>
+      <tr>
+        <td><code>VACUUM</code></td>
+        <td>Reclaims versions no snapshot can need</td>
+        <td>Does not change the logical result of a valid snapshot</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  MVCC reduces read/write contention, but it does not mean "no locks." Writers of the same row can
+  wait for each other, schema changes can conflict with queries, and constraints can coordinate
+  concurrent transactions. Explicit lock modes belong to the locking topic; the important point here
+  is that snapshot visibility and blocking are different mechanisms.
+</p>
+
+<h2 id="tuple-metadata"><span class="num">05.</span> Tuple xmin, xmax and visibility</h2>
+<p class="lead">
+  Every table has system columns. For MVCC, <code>xmin</code> identifies the transaction that
+  created a row version and <code>xmax</code> usually identifies the transaction that deleted,
+  updated, or locked it.
+</p>
+
+<figure class="code">
+  <figcaption><b>Inspect system columns for learning and diagnostics</b></figcaption>
+  <pre><code>SELECT
+  account_id,
+  balance,
+  xmin,
+  xmax,
+  ctid
+FROM accounts
+WHERE account_id = 42;
+
+-- Use modern transaction and snapshot information functions.
+SELECT pg_current_xact_id_if_assigned();
+SELECT pg_current_snapshot();</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Value</th>
+        <th>Meaning</th>
+        <th>Caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tuple <code>xmin</code></td>
+        <td>XID of the transaction that inserted this physical version</td>
+        <td>It is not a creation timestamp or permanent business identifier</td>
+      </tr>
+      <tr>
+        <td>Tuple <code>xmax</code></td>
+        <td>XID-related deletion, update, or locking metadata</td>
+        <td>Nonzero does not by itself prove the version is invisible</td>
+      </tr>
+      <tr>
+        <td><code>ctid</code></td>
+        <td>Physical location of this tuple version</td>
+        <td>It can change after update or table movement; never use it as a primary key</td>
+      </tr>
+      <tr>
+        <td>Snapshot <code>xmin</code></td>
+        <td>Lowest XID that was still active for that snapshot</td>
+        <td>This is a snapshot boundary, not the tuple's creator field</td>
+      </tr>
+      <tr>
+        <td>Snapshot <code>xmax</code></td>
+        <td>One past the highest completed XID at snapshot time</td>
+        <td>XIDs at or above it are invisible to that snapshot</td>
+      </tr>
+      <tr>
+        <td>Snapshot <code>xip_list</code></td>
+        <td>Transactions in progress between the snapshot boundaries</td>
+        <td>Commit status is still part of visibility reasoning</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="visibility-rules">A simplified visibility checklist</h3>
+<ol class="clean">
+  <li>
+    Is the inserting transaction this transaction? If so, command ordering determines whether the
+    version is visible to later commands in the same transaction.
+  </li>
+  <li>
+    Otherwise, did the inserting transaction commit before the snapshot, and was it not in progress
+    for that snapshot? If not, the version is not visible.
+  </li>
+  <li>
+    Has a deleting or updating transaction marked the version? If that transaction is aborted or not
+    visible to the snapshot, the older version can remain visible.
+  </li>
+  <li>
+    If the deleting transaction committed and is visible to the snapshot, the old version is no
+    longer visible.
+  </li>
+</ol>
+
+<div class="warn">
+  <strong>Do not implement application logic from xmin or xmax</strong>
+  <p>
+    Real visibility also uses transaction status, tuple header flags, command IDs, subtransactions,
+    multitransaction IDs, freezing, and wraparound-safe XID comparisons. Transaction IDs are finite
+    internal identifiers and can wrap. Use normal SQL, constraints, explicit version columns, or
+    supported concurrency controls for business behavior.
+  </p>
+</div>
+
+<h2 id="snapshots"><span class="num">06.</span> Snapshots: a consistent visibility decision</h2>
+<p class="lead">
+  A snapshot is not a full copy of the database. It is compact transaction visibility information
+  used to decide which stored row versions a statement may see.
+</p>
+
+<figure class="code">
+  <figcaption><b>Reading a conceptual pg_snapshot value</b></figcaption>
+  <pre><code>100:110:103,108
+
+xmin = 100
+xmax = 110
+xip_list = 103,108
+
+XID less than 100:
+  completed before the snapshot horizon, then visibility depends on commit status
+
+XID 103 or 108:
+  in progress at snapshot time, so its new effects are invisible
+
+XID from 100 through 109 but not in xip_list:
+  completed by snapshot time, then commit or abort status decides
+
+XID 110 or greater:
+  had not completed as of the snapshot and is invisible</code></pre>
+</figure>
+
+<p>
+  A transaction always sees its own earlier changes even though no other transaction can see them
+  before commit. At <code>READ COMMITTED</code>, each command normally gets a fresh snapshot. At
+  <code>REPEATABLE READ</code> and <code>SERIALIZABLE</code>, the transaction uses the snapshot
+  established by its first query or data-changing statement.
+</p>
+
+<div class="note">
+  <strong>BEGIN time is not always snapshot time</strong>
+  <p>
+    For transaction-snapshot levels, merely issuing <code>BEGIN</code> does not freeze the data
+    view. The snapshot is acquired by the first non-transaction-control statement. This distinction
+    matters when reproducing concurrency demonstrations.
+  </p>
+</div>
+
+<h2 id="anomalies"><span class="num">07.</span> Concurrency anomalies in plain language</h2>
+<p class="lead">
+  Isolation levels are easiest to understand by the bad outcomes they permit or prevent. The SQL
+  standard names dirty reads, nonrepeatable reads, phantom reads, and serialization anomalies.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Anomaly</th>
+        <th>What happens</th>
+        <th>Simple example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Dirty read</td>
+        <td>A transaction reads another transaction's uncommitted write</td>
+        <td>Read a balance that the writer later rolls back</td>
+      </tr>
+      <tr>
+        <td>Nonrepeatable read</td>
+        <td>Reading one row twice gives different committed values</td>
+        <td>A status changes between two queries in the same transaction</td>
+      </tr>
+      <tr>
+        <td>Phantom read</td>
+        <td>Repeating a predicate query returns a different matching set</td>
+        <td>A new paid order appears in a repeated count</td>
+      </tr>
+      <tr>
+        <td>Serialization anomaly</td>
+        <td>The committed result cannot match any one-at-a-time transaction order</td>
+        <td>Two doctors each go off call after each saw the other on call</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="lost-update">Where does lost update fit?</h3>
+<p>
+  "Lost update" is a widely used practical term, but its exact definition varies. The classic form
+  is application-side read-modify-write:
+</p>
+
+<figure class="code">
+  <figcaption><b>Unsafe application-side calculation</b></figcaption>
+  <pre><code>-- Both transactions read 10.
+SELECT quantity FROM inventory WHERE sku = 'A';
+
+-- Each application calculates 10 - 1 and sends 9.
+UPDATE inventory SET quantity = 9 WHERE sku = 'A';
+
+-- Both can commit, but two sales reduced quantity only once.</code></pre>
+</figure>
+
+<p>Prefer one atomic SQL expression when possible:</p>
+
+<figure class="code">
+  <figcaption><b>Atomic relative update with invariant enforcement</b></figcaption>
+  <pre><code>UPDATE inventory
+SET quantity = quantity - 1
+WHERE sku = 'A'
+  AND quantity &gt; 0
+RETURNING quantity;</code></pre>
+</figure>
+
+<p>
+  Concurrent writers of this row serialize at the row update, and the second statement evaluates
+  against the current row version under <code>READ COMMITTED</code>. For a disconnected workflow,
+  use optimistic concurrency with an explicit version column:
+</p>
+
+<figure class="code">
+  <figcaption><b>Compare-and-set optimistic update</b></figcaption>
+  <pre><code>UPDATE documents
+SET body = $1,
+    version = version + 1
+WHERE document_id = $2
+  AND version = $3
+RETURNING version;
+
+-- Zero returned rows means another writer changed the document.</code></pre>
+</figure>
+
+<h2 id="isolation-matrix"><span class="num">08.</span> The four isolation levels in PostgreSQL</h2>
+<p class="lead">
+  SQL names four levels, but PostgreSQL implements three distinct behaviors because
+  <code>READ UNCOMMITTED</code> behaves exactly like <code>READ COMMITTED</code>.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Requested level</th>
+        <th>Dirty read</th>
+        <th>Nonrepeatable read</th>
+        <th>Phantom read</th>
+        <th>Serialization anomaly</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>READ UNCOMMITTED</code></td>
+        <td>Prevented by PostgreSQL</td>
+        <td>Possible</td>
+        <td>Possible</td>
+        <td>Possible</td>
+      </tr>
+      <tr>
+        <td><code>READ COMMITTED</code></td>
+        <td>Prevented</td>
+        <td>Possible</td>
+        <td>Possible</td>
+        <td>Possible</td>
+      </tr>
+      <tr>
+        <td><code>REPEATABLE READ</code></td>
+        <td>Prevented</td>
+        <td>Prevented</td>
+        <td>Prevented in PostgreSQL</td>
+        <td>Possible</td>
+      </tr>
+      <tr>
+        <td><code>SERIALIZABLE</code></td>
+        <td>Prevented</td>
+        <td>Prevented</td>
+        <td>Prevented</td>
+        <td>Prevented by aborting a conflicting transaction when needed</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  "Prevented" does not mean every transaction always commits. PostgreSQL may wait for a concurrent
+  writer or abort a transaction to preserve the requested guarantee. Higher isolation trades some
+  retry risk and overhead for stronger reasoning. It is not a substitute for constraints, correct
+  transaction boundaries, or handling external side effects.
+</p>
+
+<h2 id="read-committed"><span class="num">09.</span> Read Committed: one snapshot per command</h2>
+<p class="lead">
+  <code>READ COMMITTED</code> is PostgreSQL's default. A plain query sees rows committed before that
+  query began plus earlier changes from its own transaction.
+</p>
+
+<figure class="code">
+  <figcaption><b>Nonrepeatable read with two sessions</b></figcaption>
+  <pre><code>-- Session A                            -- Session B
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SELECT status FROM orders
+WHERE order_id = 10; -- 'pending'
+
+                                       BEGIN;
+                                       UPDATE orders
+                                       SET status = 'paid'
+                                       WHERE order_id = 10;
+                                       COMMIT;
+
+SELECT status FROM orders
+WHERE order_id = 10; -- 'paid'
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  Each individual statement sees a consistent snapshot, so it does not see half of Session B's
+  transaction. However, Session A's second statement starts later and gets a newer snapshot.
+  Therefore a multi-query report can mix different committed moments.
+</p>
+
+<h3 id="read-committed-writes">Concurrent writes under Read Committed</h3>
+<p>
+  An <code>UPDATE</code>, <code>DELETE</code>, <code>MERGE</code>, or row-locking command finds
+  targets using its command snapshot. If a target was concurrently changed, the command can wait.
+  After the other transaction commits, PostgreSQL can follow the updated version and re-evaluate the
+  command's condition against it.
+</p>
+
+<figure class="code">
+  <figcaption><b>A safe conditional state transition</b></figcaption>
+  <pre><code>UPDATE jobs
+SET status = 'running',
+    started_at = clock_timestamp()
+WHERE job_id = 900
+  AND status = 'queued'
+RETURNING *;
+
+-- Exactly one contender changes queued to running.
+-- Other contenders eventually return zero rows.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>One command can observe a specialized mix</strong>
+  <p>
+    In <code>READ COMMITTED</code>, a modifying command can update a newer version of a row that was
+    not visible in its original command snapshot after waiting and rechecking. This is useful for
+    simple targeted updates, but complex search conditions can produce surprising results. If the
+    business rule depends on a stable multi-row view, use stronger isolation or explicit
+    coordination.
+  </p>
+</div>
+
+<h2 id="read-uncommitted"><span class="num">10.</span> Read Uncommitted: an alias in PostgreSQL</h2>
+<p class="lead">
+  PostgreSQL accepts the SQL-standard name <code>READ UNCOMMITTED</code>, but gives it
+  <code>READ COMMITTED</code> behavior. Dirty reads are not available.
+</p>
+
+<figure class="code">
+  <figcaption><b>Accepted syntax, Read Committed semantics</b></figcaption>
+  <pre><code>BEGIN ISOLATION LEVEL READ UNCOMMITTED;
+
+SHOW transaction_isolation;
+-- PostgreSQL reports read uncommitted as the requested characteristic,
+-- but visibility behavior is the same as read committed.
+
+SELECT * FROM accounts;
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  This is an important interview detail. Do not describe PostgreSQL as exposing another session's
+  uncommitted tuple data through this level. PostgreSQL maps the level to its MVCC-compatible
+  <code>READ COMMITTED</code> behavior.
+</p>
+
+<h2 id="repeatable-read">
+  <span class="num">11.</span> Repeatable Read: one stable transaction snapshot
+</h2>
+<p class="lead">
+  PostgreSQL <code>REPEATABLE READ</code> uses one transaction snapshot. Successive queries see the
+  same committed database view plus the transaction's own changes.
+</p>
+
+<figure class="code">
+  <figcaption><b>A stable row and predicate result</b></figcaption>
+  <pre><code>-- Session A                            -- Session B
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT COUNT(*) FROM orders
+WHERE status = 'paid'; -- 50
+
+                                       INSERT INTO orders (order_id, status)
+                                       VALUES (999, 'paid');
+                                       COMMIT;
+
+SELECT COUNT(*) FROM orders
+WHERE status = 'paid'; -- still 50
+COMMIT;
+
+-- A transaction started after both commits can see 51.</code></pre>
+</figure>
+
+<p>
+  The SQL standard permits phantoms at Repeatable Read, but PostgreSQL's snapshot isolation
+  implementation prevents them. A repeated predicate sees the same row set from concurrent
+  transactions. PostgreSQL's implementation is therefore stronger than the standard minimum on that
+  dimension.
+</p>
+
+<h3 id="repeatable-write-conflict">Updating a row changed after the snapshot</h3>
+<p>
+  If a Repeatable Read transaction tries to modify or lock a row that another transaction changed
+  after its snapshot, it can fail with
+  <code>could not serialize access due to concurrent update</code>. The application must roll back
+  and retry the complete unit of work.
+</p>
+
+<div class="warn">
+  <strong>A stable snapshot is not automatically serializable</strong>
+  <p>
+    Two transactions can each make a decision from a stable snapshot and write different rows. Both
+    can commit even when their combined result violates a cross-row rule. This is write skew, a
+    serialization anomaly that Repeatable Read can allow.
+  </p>
+</div>
+
+<h2 id="serializable">
+  <span class="num">12.</span> Serializable and Serializable Snapshot Isolation
+</h2>
+<p class="lead">
+  <code>SERIALIZABLE</code> guarantees that committed transactions have an effect consistent with
+  some serial, one-at-a-time order. PostgreSQL preserves MVCC concurrency and aborts a transaction
+  when dangerous read/write dependencies make that guarantee impossible.
+</p>
+
+<p>
+  PostgreSQL implements this with Serializable Snapshot Isolation, commonly abbreviated SSI. A
+  serializable transaction reads from a stable snapshot like Repeatable Read. PostgreSQL also tracks
+  read/write dependency patterns, including predicate reads. If concurrent work forms a dangerous
+  structure that could produce a non-serializable result, one transaction receives a serialization
+  failure instead of all conflicting results being committed.
+</p>
+
+<figure class="code">
+  <figcaption><b>Write skew prevented by Serializable</b></figcaption>
+  <pre><code>-- Initially Alice and Bob are both on call.
+
+-- Session A                            -- Session B
+BEGIN ISOLATION LEVEL SERIALIZABLE;     BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+SELECT COUNT(*) FROM doctors            SELECT COUNT(*) FROM doctors
+WHERE on_call; -- 2                     WHERE on_call; -- 2
+
+UPDATE doctors                          UPDATE doctors
+SET on_call = false                     SET on_call = false
+WHERE name = 'Alice';                   WHERE name = 'Bob';
+
+COMMIT;                                 COMMIT;
+
+-- PostgreSQL cannot allow both effects to commit because no serial order
+-- would let both transactions read 2 and leave nobody on call.
+-- One transaction can fail with SQLSTATE 40001.</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Serializable feature</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Stable snapshot</td>
+        <td>Reads have Repeatable Read snapshot behavior</td>
+      </tr>
+      <tr>
+        <td>Dependency tracking</td>
+        <td>PostgreSQL detects read/write patterns that threaten a serial outcome</td>
+      </tr>
+      <tr>
+        <td>Predicate information</td>
+        <td>Logical ranges that were read can participate in dependency detection</td>
+      </tr>
+      <tr>
+        <td>Serialization failure</td>
+        <td>A transaction is canceled so the remaining committed history stays valid</td>
+      </tr>
+      <tr>
+        <td>Application retry</td>
+        <td>The complete decision-making transaction must be run again</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Serializable does not mean PostgreSQL runs every transaction one after another. Many serializable
+  transactions execute concurrently and commit. It also does not promise the wall-clock order you
+  imagined. It promises that some valid serial order explains the committed effects.
+</p>
+
+<h3 id="serializable-scope">The guarantee requires a consistent policy</h3>
+<p>
+  If a business rule depends on several writers, running only one of them at Serializable cannot
+  make non-serializable writers participate in SSI dependency tracking. For a serializable guarantee
+  over permanent data, all transactions that can affect the invariant should follow the required
+  policy.
+</p>
+
+<h2 id="worked-scenarios"><span class="num">13.</span> Worked isolation scenarios</h2>
+<p class="lead">
+  The fastest way to master isolation is to predict two-session outcomes before running them.
+</p>
+
+<h3 id="dirty-read-demo">Scenario A: dirty read attempt</h3>
+<figure class="code">
+  <figcaption><b>PostgreSQL never exposes the uncommitted balance</b></figcaption>
+  <pre><code>-- Session A                            -- Session B
+BEGIN;                                  BEGIN ISOLATION LEVEL READ UNCOMMITTED;
+UPDATE accounts
+SET balance = 0
+WHERE account_id = 42;
+
+                                       SELECT balance FROM accounts
+                                       WHERE account_id = 42;
+                                       -- Sees the previously committed balance.
+
+ROLLBACK;                               COMMIT;</code></pre>
+</figure>
+
+<h3 id="phantom-demo">Scenario B: phantom at Read Committed</h3>
+<figure class="code">
+  <figcaption><b>Each count uses a different command snapshot</b></figcaption>
+  <pre><code>-- Session A                            -- Session B
+BEGIN;
+SELECT COUNT(*) FROM bookings
+WHERE room_id = 7
+  AND booking_date = DATE '2026-08-01'; -- 3
+
+                                       INSERT INTO bookings
+                                         (room_id, booking_date)
+                                       VALUES (7, DATE '2026-08-01');
+                                       COMMIT;
+
+SELECT COUNT(*) FROM bookings
+WHERE room_id = 7
+  AND booking_date = DATE '2026-08-01'; -- 4
+COMMIT;</code></pre>
+</figure>
+
+<h3 id="write-skew-demo">Scenario C: write skew at Repeatable Read</h3>
+<figure class="code">
+  <figcaption><b>Different rows, shared invariant</b></figcaption>
+  <pre><code>-- Rule: at least one operator must remain active.
+-- Both transactions use REPEATABLE READ and see two active operators.
+
+-- Session A updates operator 1 to inactive.
+-- Session B updates operator 2 to inactive.
+-- They do not update the same row.
+-- Both may commit, leaving zero active operators.
+
+-- SERIALIZABLE detects the dangerous dependency pattern and aborts one.
+-- A schema redesign or explicit coordination may also enforce the rule.</code></pre>
+</figure>
+
+<h3 id="read-then-insert">Scenario D: check-then-insert race</h3>
+<figure class="code">
+  <figcaption><b>Let a unique constraint be the final authority</b></figcaption>
+  <pre><code>BEGIN;
+
+SELECT 1 FROM users WHERE email = 'sam@example.com';
+-- No row does not reserve this email.
+
+INSERT INTO users (email) VALUES ('sam@example.com');
+-- A concurrent transaction may insert it first.
+
+COMMIT;
+
+-- Define UNIQUE (email), then handle the conflict or use ON CONFLICT.</code></pre>
+</figure>
+
+<h2 id="transaction-modes"><span class="num">14.</span> Setting transaction characteristics</h2>
+<p class="lead">
+  Isolation, access mode, and deferrability can be set when a transaction starts or before its first
+  query or data-changing statement.
+</p>
+
+<figure class="code">
+  <figcaption><b>Transaction-level and session-level forms</b></figcaption>
+  <pre><code>BEGIN;
+SET TRANSACTION
+  ISOLATION LEVEL SERIALIZABLE
+  READ WRITE
+  NOT DEFERRABLE;
+-- The SET must happen before the first query or data-changing statement.
+
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+COMMIT;
+
+-- Default for later transactions in this session.
+SET SESSION CHARACTERISTICS AS TRANSACTION
+  ISOLATION LEVEL REPEATABLE READ
+  READ ONLY;</code></pre>
+</figure>
+
+<p>
+  <code>READ ONLY</code> rejects many commands that change non-temporary tables or schema objects.
+  It expresses intent and reduces accidental writes, but it is not a statement that the server will
+  perform no internal disk writes.
+</p>
+
+<h3 id="deferrable">Serializable Read Only Deferrable</h3>
+<figure class="code">
+  <figcaption><b>A good mode for a long, consistent report</b></figcaption>
+  <pre><code>BEGIN TRANSACTION
+  ISOLATION LEVEL SERIALIZABLE
+  READ ONLY
+  DEFERRABLE;
+
+SELECT region, SUM(amount)
+FROM payments
+GROUP BY region;
+
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  This transaction may wait while acquiring its initial snapshot. Once PostgreSQL finds a safe
+  snapshot, the transaction can run without normal Serializable tracking overhead and without risk
+  of a serialization cancellation caused by concurrent updates. <code>DEFERRABLE</code> has an
+  effect only with <code>SERIALIZABLE READ ONLY</code>.
+</p>
+
+<h3 id="export-snapshot">Exporting and importing a snapshot</h3>
+<figure class="code">
+  <figcaption><b>Coordinate consistent reads across sessions</b></figcaption>
+  <pre><code>-- Exporting transaction
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_export_snapshot();
+-- Example result: 00000003-0000001B-1
+
+-- Importing transaction, before its first query
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET TRANSACTION SNAPSHOT '00000003-0000001B-1';
+
+-- The exporter must remain open while the snapshot is imported.</code></pre>
+</figure>
+
+<p>
+  Snapshot export is useful for coordinated parallel reporting or backup tooling. It also prolongs
+  the visibility horizon while the exporting and importing transactions remain open, so keep the
+  operation bounded.
+</p>
+
+<h2 id="retry"><span class="num">15.</span> Correct transaction retry design</h2>
+<p class="lead">
+  A serialization failure is not a server defect. It is PostgreSQL refusing a concurrent outcome
+  that violates the chosen guarantee. The application must retry the complete transaction.
+</p>
+
+<figure class="code">
+  <figcaption><b>Language-neutral retry structure</b></figcaption>
+  <pre><code>for attempt from 1 to MAX_ATTEMPTS:
+    begin transaction isolation level serializable
+    try:
+        read every value used to make the decision
+        recompute the decision
+        perform every database write
+        commit
+        return success
+    catch SQLSTATE 40001:
+        rollback
+        if attempt == MAX_ATTEMPTS:
+            report transient failure
+        wait using bounded exponential backoff plus jitter
+    catch any other error:
+        rollback
+        rethrow</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>
+    Retry SQLSTATE <code>40001</code> from the beginning, including reads and application-side
+    calculations. Retrying only the final <code>UPDATE</code> reuses a stale decision.
+  </li>
+  <li>
+    Deadlock SQLSTATE <code>40P01</code> is often retryable too, but it is a different failure and
+    can reveal inconsistent lock ordering.
+  </li>
+  <li>
+    Bound retries. Use exponential backoff and jitter so many conflicting workers do not retry in
+    lockstep.
+  </li>
+  <li>
+    Keep effects outside PostgreSQL idempotent or delay them until the database outcome is known. A
+    retried transaction can otherwise send an email or charge a card twice.
+  </li>
+  <li>
+    Generate an idempotency key at the operation boundary and enforce it with a unique constraint
+    when requests themselves may be repeated.
+  </li>
+</ul>
+
+<div class="warn">
+  <strong>Commit outcome can be ambiguous to the client</strong>
+  <p>
+    A connection failure during <code>COMMIT</code> can leave the client unsure whether the server
+    committed. A retry loop must distinguish a known serialization rollback from an unknown commit
+    outcome. Idempotency records let the application safely discover or repeat an operation.
+  </p>
+</div>
+
+<h2 id="performance"><span class="num">16.</span> Performance and operational implications</h2>
+<p class="lead">
+  Transactions are not only correctness boundaries. Their duration and contention shape vacuum
+  progress, lock duration, memory use, latency, and retry rates.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Cost or risk</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Long transaction with an old snapshot</td>
+        <td>Can prevent cleanup of obsolete tuples and contribute to bloat</td>
+        <td>Process bounded batches and commit between independent units</td>
+      </tr>
+      <tr>
+        <td>Idle in transaction session</td>
+        <td>May retain a snapshot, locks, and backend resources</td>
+        <td>Always commit or roll back promptly; configure suitable timeouts</td>
+      </tr>
+      <tr>
+        <td>Very large write transaction</td>
+        <td>More WAL, longer recovery on abort, longer lock retention</td>
+        <td>Batch only when batches preserve the business invariant</td>
+      </tr>
+      <tr>
+        <td>Many savepoints</td>
+        <td>Subtransaction bookkeeping and cache pressure</td>
+        <td>Use savepoints for real recovery boundaries, not every trivial statement</td>
+      </tr>
+      <tr>
+        <td>High Serializable contention</td>
+        <td>More dependency tracking and transaction retries</td>
+        <td>Shorten transactions, reduce hot conflicts, and retry with jitter</td>
+      </tr>
+      <tr>
+        <td>Transaction held during network calls</td>
+        <td>Unpredictable duration and longer retained resources</td>
+        <td>Move slow external work outside the transaction where correctness permits</td>
+      </tr>
+      <tr>
+        <td>One transaction per inserted row</td>
+        <td>Repeated commit and WAL flush overhead</td>
+        <td>Batch related writes without creating an unbounded transaction</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Find sessions that may be holding old transaction state</b></figcaption>
+  <pre><code>SELECT
+  pid,
+  usename,
+  state,
+  xact_start,
+  backend_xid,
+  backend_xmin,
+  query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start;</code></pre>
+</figure>
+
+<p>
+  A long transaction is not automatically wrong. A consistent backup or report may require one. The
+  operational lesson is to make its cost intentional and monitored. The separate VACUUM topic
+  explains cleanup and transaction ID wraparound in depth.
+</p>
+
+<h2 id="edge-cases"><span class="num">17.</span> PostgreSQL transaction edge cases</h2>
+<p class="lead">
+  Most table changes are transactional, but several PostgreSQL behaviors surprise developers who
+  assume rollback rewinds every observable effect.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Edge case</th>
+        <th>Actual behavior</th>
+        <th>Consequence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Sequences</td>
+        <td><code>nextval</code> values are not returned on rollback</td>
+        <td>Sequence gaps are normal; sequences are not gapless invoice numbering</td>
+      </tr>
+      <tr>
+        <td><code>setval</code></td>
+        <td>Its state changes are visible immediately and not undone by rollback</td>
+        <td>Do not treat sequence state like ordinary table state</td>
+      </tr>
+      <tr>
+        <td>Transaction timestamps</td>
+        <td><code>current_timestamp</code> is fixed at transaction start</td>
+        <td>
+          Use <code>statement_timestamp()</code> or <code>clock_timestamp()</code> when needed
+        </td>
+      </tr>
+      <tr>
+        <td>Transactional DDL</td>
+        <td>Many schema changes can roll back</td>
+        <td>Do not assume every database product has identical DDL behavior</td>
+      </tr>
+      <tr>
+        <td>MVCC-unsafe DDL</td>
+        <td>
+          <code>TRUNCATE</code> and table-rewriting <code>ALTER TABLE</code> have snapshot caveats
+        </td>
+        <td>Plan these changes carefully around concurrent snapshot transactions</td>
+      </tr>
+      <tr>
+        <td>Read-only mode</td>
+        <td>Rejects many logical writes but does not imply zero internal disk writes</td>
+        <td>Treat it as access intent, not storage-level immutability</td>
+      </tr>
+      <tr>
+        <td>Exported snapshot</td>
+        <td>Valid only while its exporting transaction remains open</td>
+        <td>Coordinate lifecycle and avoid retaining it longer than necessary</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Sequence gaps survive rollback</b></figcaption>
+  <pre><code>BEGIN;
+INSERT INTO orders (description) VALUES ('cancelled attempt')
+RETURNING order_id; -- suppose this returns 100
+ROLLBACK;
+
+INSERT INTO orders (description) VALUES ('real order')
+RETURNING order_id; -- commonly returns 101, not 100</code></pre>
+</figure>
+
+<h2 id="mistakes"><span class="num">18.</span> Common mistakes and precise fixes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Fix</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Assuming autocommit groups several statements</td>
+        <td>Each statement can commit independently</td>
+        <td>Use an explicit transaction for one logical unit</td>
+      </tr>
+      <tr>
+        <td>Continuing after an error without rollback</td>
+        <td>The transaction remains in an aborted state</td>
+        <td>Rollback the transaction or recover to a prior savepoint</td>
+      </tr>
+      <tr>
+        <td>Calling savepoints nested commits</td>
+        <td>Only the outer transaction can make their work durable</td>
+        <td>Describe them as partial rollback points</td>
+      </tr>
+      <tr>
+        <td>Expecting Read Committed to provide a stable report</td>
+        <td>Every statement can get a newer snapshot</td>
+        <td>Use Repeatable Read or a suitable Serializable read-only mode</td>
+      </tr>
+      <tr>
+        <td>Expecting Repeatable Read to prevent write skew</td>
+        <td>A stable snapshot can still produce a non-serializable combined result</td>
+        <td>Use Serializable or redesign enforcement</td>
+      </tr>
+      <tr>
+        <td>Using Serializable without retries</td>
+        <td>Correctness can require SQLSTATE <code>40001</code> cancellation</td>
+        <td>Retry the complete transaction with bounded backoff</td>
+      </tr>
+      <tr>
+        <td>Retrying only the failed write</td>
+        <td>The decision may depend on stale reads</td>
+        <td>Repeat all reads, calculations, and writes</td>
+      </tr>
+      <tr>
+        <td>Reading then writing a literal value</td>
+        <td>Concurrent changes can be overwritten</td>
+        <td>Use atomic SQL, a constraint, or compare-and-set versioning</td>
+      </tr>
+      <tr>
+        <td>Treating nonzero <code>xmax</code> as deleted</td>
+        <td>The marking transaction may be active, aborted, or only locking</td>
+        <td>Let PostgreSQL's visibility machinery interpret tuple headers</td>
+      </tr>
+      <tr>
+        <td>Using <code>xmin</code> as a permanent version field</td>
+        <td>It is internal, finite, and subject to freezing and wraparound concerns</td>
+        <td>Store an explicit application version column</td>
+      </tr>
+      <tr>
+        <td>Keeping a transaction open during user input</td>
+        <td>Duration, lock time, and vacuum impact become unbounded</td>
+        <td>Collect input first, then open a short transaction</td>
+      </tr>
+      <tr>
+        <td>Expecting rollback to restore sequence numbers</td>
+        <td>Sequence advancement is deliberately non-transactional</td>
+        <td>Accept gaps or design a separately controlled numbering workflow</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="decision-guide"><span class="num">19.</span> Choosing an isolation strategy</h2>
+<p class="lead">
+  Start from the invariant and concurrent decision pattern, not from a belief that the strongest
+  isolation is always the fastest or that the default is always enough.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Good starting point</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Independent request with atomic conditional update</td>
+        <td>Read Committed plus constraints</td>
+        <td>One statement can recheck the newest row and enforce a local condition</td>
+      </tr>
+      <tr>
+        <td>Consistent multi-query report</td>
+        <td>Repeatable Read, Read Only</td>
+        <td>Every query sees one stable snapshot</td>
+      </tr>
+      <tr>
+        <td>Long report that must be serially valid</td>
+        <td>Serializable, Read Only, Deferrable</td>
+        <td>It can wait for a safe snapshot and then run without serialization abort risk</td>
+      </tr>
+      <tr>
+        <td>Cross-row rule with concurrent readers and writers</td>
+        <td>Serializable plus complete retry</td>
+        <td>SSI rejects outcomes inconsistent with every serial order</td>
+      </tr>
+      <tr>
+        <td>Disconnected edit form</td>
+        <td>Explicit version column and compare-and-set</td>
+        <td>A database transaction should not remain open during human think time</td>
+      </tr>
+      <tr>
+        <td>Uniqueness or simple data invariant</td>
+        <td>Database constraint at every isolation level</td>
+        <td>Constraints remain the authoritative last line of defense</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ol class="clean">
+  <li>Write the invariant in one sentence.</li>
+  <li>List every row or predicate read to make the decision.</li>
+  <li>List every concurrent transaction that can change those facts.</li>
+  <li>Prefer constraints and atomic SQL for invariants they can express directly.</li>
+  <li>Choose isolation for the remaining multi-statement or multi-row reasoning.</li>
+  <li>Design retries and idempotency before enabling a retry-producing level.</li>
+  <li>Test the interleavings using two real sessions, not only single-session unit tests.</li>
+</ol>
+
+<h2 id="practice"><span class="num">20.</span> Practice problems</h2>
+<p class="lead">Predict the visibility, blocking, and commit outcome before reading each answer.</p>
+
+<div class="qa">
+  <p class="q">
+    1. A Read Committed transaction runs the same <code>SELECT COUNT(*)</code> twice. Another
+    transaction inserts and commits a matching row between them. Can the counts differ?
+  </p>
+  <p class="a">
+    Yes. Each statement receives a fresh snapshot, so the second count can include the newly
+    committed row. This is a phantom read.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    2. Would requesting Read Uncommitted let the first count see a concurrent uncommitted insert?
+  </p>
+  <p class="a">
+    No. PostgreSQL treats Read Uncommitted as Read Committed and does not expose dirty tuple data.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    3. A Repeatable Read transaction issues <code>BEGIN</code>, waits, and then performs its first
+    <code>SELECT</code>. At which point is its data snapshot chosen?
+  </p>
+  <p class="a">
+    At the first query or data-modification statement, not merely at <code>BEGIN</code>. Transaction
+    control statements do not establish the data snapshot.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    4. Two Repeatable Read transactions read a cross-row rule and update different rows. Must one
+    abort?
+  </p>
+  <p class="a">
+    Not necessarily. They may avoid a direct write conflict and both commit, producing write skew.
+    Serializable is designed to detect dangerous dependency patterns of this kind.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. Does <code>RELEASE SAVEPOINT s</code> commit that part of the work?</p>
+  <p class="a">
+    No. It removes the recovery point while retaining its changes inside the outer transaction. The
+    outer transaction can still roll back everything.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    6. A unique violation happens after a savepoint. How can the transaction continue safely?
+  </p>
+  <p class="a">
+    Execute <code>ROLLBACK TO SAVEPOINT</code> for the earlier savepoint, then continue from the
+    restored transaction state. Without that recovery, later commands are rejected.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    7. A Serializable transaction fails with SQLSTATE <code>40001</code>. Should only
+    <code>COMMIT</code> be retried?
+  </p>
+  <p class="a">
+    No. Roll back and repeat the entire transaction, including every read and application
+    calculation. The original decision was made from a snapshot that can no longer commit safely.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    8. An inserted row received sequence value 55, then its transaction rolled back. Must the next
+    row receive 55?
+  </p>
+  <p class="a">
+    No. Sequence values are not reclaimed on rollback. The next value will commonly be 56 or later,
+    and gaps are correct behavior.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    9. A row has nonzero <code>xmax</code> but is visible to your query. Is PostgreSQL corrupted?
+  </p>
+  <p class="a">
+    No. The marking transaction might be uncommitted, aborted, or represented there for locking
+    metadata. Visibility requires more than testing whether <code>xmax</code> is zero.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    10. Why can an hour-long idle transaction cause table growth even when it performs no more work?
+  </p>
+  <p class="a">
+    Its old snapshot or transaction horizon can keep obsolete row versions potentially visible,
+    limiting cleanup. It may also retain locks and backend resources.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">21.</span> Interview Q&amp;A</h2>
+
+<div class="qa">
+  <p class="q">Q: What is MVCC in PostgreSQL?</p>
+  <p class="a">
+    MVCC is Multi-Version Concurrency Control. PostgreSQL keeps multiple physical tuple versions so
+    each statement can see the version valid for its snapshot. This lets ordinary reads and writes
+    proceed without blocking each other, while vacuum later reclaims obsolete versions.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What do tuple xmin and xmax mean?</p>
+  <p class="a">
+    Tuple <code>xmin</code> is the transaction ID that created that row version.
+    <code>xmax</code> stores transaction-related deletion, update, or locking metadata. Nonzero
+    <code>xmax</code> alone does not prove invisibility because transaction status and snapshot
+    rules also matter.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is the difference between tuple xmin and snapshot xmin?</p>
+  <p class="a">
+    Tuple <code>xmin</code> identifies a version's creator. Snapshot <code>xmin</code> is the lowest
+    transaction ID still active for a snapshot and helps define its visibility horizon. They share a
+    name but represent different things.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Does PostgreSQL support dirty reads?</p>
+  <p class="a">
+    No. Even when Read Uncommitted is requested, PostgreSQL uses Read Committed visibility behavior.
+    A query does not see another transaction's uncommitted tuple writes.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Read Committed versus Repeatable Read?</p>
+  <p class="a">
+    Read Committed takes a new snapshot for each command, so repeated queries can see newer commits.
+    Repeatable Read uses one snapshot established by the first query or data-changing statement, so
+    repeated row and predicate reads remain stable.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Does PostgreSQL Repeatable Read allow phantom reads?</p>
+  <p class="a">
+    No. Although the SQL standard permits phantoms at that level, PostgreSQL's snapshot isolation
+    implementation prevents them. It can still allow serialization anomalies such as write skew.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Repeatable Read versus Serializable?</p>
+  <p class="a">
+    Both use a stable transaction snapshot. Serializable additionally tracks read/write dependencies
+    and cancels a transaction when needed to ensure committed effects match some serial execution.
+    Repeatable Read does not provide that final serial-order guarantee.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is write skew?</p>
+  <p class="a">
+    Two transactions read a shared condition, update different rows, and both commit changes that
+    jointly violate the condition. There may be no same-row write conflict. PostgreSQL Serializable
+    can detect the dangerous dependency pattern and abort one transaction.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Does Serializable mean transactions execute one at a time?</p>
+  <p class="a">
+    No. Transactions still run concurrently through MVCC. The committed result must be explainable
+    as some serial order. PostgreSQL uses SSI tracking and aborts a transaction if necessary to
+    preserve that property.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How should a serialization failure be handled?</p>
+  <p class="a">
+    Detect SQLSTATE <code>40001</code>, roll back, and rerun the complete transaction with fresh
+    reads and calculations. Use bounded retry attempts, backoff, jitter, and idempotent handling of
+    effects outside the database.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is a savepoint?</p>
+  <p class="a">
+    A savepoint is a named point inside one transaction. Rolling back to it discards later work and
+    restores a usable transaction. Releasing it keeps the work but does not commit independently;
+    only the outer commit makes the work durable.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why are long-running transactions harmful?</p>
+  <p class="a">
+    They can retain old snapshots, delay cleanup of dead tuples, hold locks and resources, increase
+    bloat, and make operational changes wait. Transactions should normally be as short as
+    correctness allows.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you prevent an application-level lost update?</p>
+  <p class="a">
+    Prefer an atomic relative update such as <code>SET quantity = quantity - 1</code> with a guarded
+    predicate. For disconnected edits, include an explicit version in the <code>WHERE</code> clause
+    and treat zero updated rows as a conflict.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Are sequence values transactional?</p>
+  <p class="a">
+    Sequence advancement is deliberately not rolled back, so concurrent allocation stays efficient
+    and values remain unique. Aborts and conflicts can create gaps. A sequence should not be used
+    when gapless numbering is a legal or business requirement.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When is a Serializable Read Only Deferrable transaction useful?</p>
+  <p class="a">
+    It is useful for long consistent reports or backups. PostgreSQL may delay its first snapshot
+    until the snapshot is safe, after which it avoids normal Serializable tracking overhead and
+    serialization cancellation risk from concurrent updates.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">22.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li><strong>Transaction:</strong> one atomic database unit ending in commit or rollback.</li>
+  <li><strong>Autocommit:</strong> usually one implicit transaction per statement.</li>
+  <li><strong>Savepoint:</strong> partial rollback point, never an independent commit.</li>
+  <li><strong>MVCC:</strong> concurrent snapshots choose among physical tuple versions.</li>
+  <li><strong>UPDATE:</strong> marks an old version and creates a replacement version.</li>
+  <li><strong>Tuple xmin:</strong> XID that created a physical row version.</li>
+  <li>
+    <strong>Tuple xmax:</strong> deletion, update, or locking metadata; nonzero is not enough.
+  </li>
+  <li><strong>Snapshot:</strong> transaction visibility information, not a database copy.</li>
+  <li><strong>Read Uncommitted:</strong> behaves like Read Committed in PostgreSQL.</li>
+  <li><strong>Read Committed:</strong> fresh snapshot per command; default level.</li>
+  <li><strong>Repeatable Read:</strong> stable transaction snapshot; no PostgreSQL phantoms.</li>
+  <li><strong>Repeatable Read risk:</strong> serialization anomalies such as write skew.</li>
+  <li><strong>Serializable:</strong> serial outcome through SSI dependency checks and aborts.</li>
+  <li><strong>40001:</strong> retry the entire transaction from fresh reads.</li>
+  <li><strong>Atomic update:</strong> compute from the current column in one SQL statement.</li>
+  <li><strong>Optimistic edit:</strong> explicit version column plus compare-and-set.</li>
+  <li><strong>Constraint:</strong> final authority for expressible data invariants.</li>
+  <li>
+    <strong>Sequences:</strong> unique allocation can have gaps and does not rewind on rollback.
+  </li>
+  <li>
+    <strong>Operational rule:</strong> keep transactions short and never idle unintentionally.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">23.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/mvcc-intro.html"
+      >MVCC and PostgreSQL concurrency control introduction</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/transaction-iso.html"
+      >Transaction isolation levels, anomalies, and PostgreSQL behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html"
+      >Serialization failure handling and retry SQLSTATE codes</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-begin.html"
+      >BEGIN syntax, transaction modes, and autocommit behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-commit.html">COMMIT behavior and syntax</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-rollback.html"
+      >ROLLBACK behavior and syntax</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-savepoint.html"
+      >SAVEPOINT semantics and nesting behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-rollback-to.html"
+      >ROLLBACK TO SAVEPOINT semantics and cursor caveats</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-release-savepoint.html"
+      >RELEASE SAVEPOINT behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-set-transaction.html"
+      >SET TRANSACTION, read-only, deferrable, and snapshot import</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-system-columns.html"
+      >System columns including xmin, xmax, and ctid</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-info.html"
+      >Transaction ID and snapshot information functions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html"
+      >MVCC row-version cleanup and effects of old transactions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-sequence.html"
+      >Sequence allocation and non-rollback behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/mvcc-caveats.html"
+      >MVCC caveats for DDL, catalogs, and standby behavior</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
