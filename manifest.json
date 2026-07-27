@@ -36,6 +36,10 @@
           "path": "postgresql/locking-concurrency"
         },
         {
+          "title": "Performance Tuning and Operations",
+          "path": "postgresql/performance-tuning-operations"
+        },
+        {
           "title": "Replication and Scaling",
           "path": "postgresql/replication-scaling"
         }
