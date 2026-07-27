@@ -38,6 +38,10 @@
         {
           "title": "Performance Tuning and Operations",
           "path": "postgresql/performance-tuning-operations"
+        },
+        {
+          "title": "Extensions and Specialized Features",
+          "path": "postgresql/extensions-specialized-features"
         }
       ]
     }
