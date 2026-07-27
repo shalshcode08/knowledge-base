@@ -1,0 +1,1641 @@
+<h1>PostgreSQL Performance Tuning &amp; Operations - Complete Notes</h1>
+<p class="subtitle">
+  A measurement-first, practical and interview-focused guide to server resources, memory, planner
+  settings, connection pooling, observability, slow-query diagnosis, partitioning, capacity
+  planning, and safe production operations.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The measurement-first mental model</h2>
+<p class="lead">
+  Performance tuning is controlled problem solving. Define the user-visible problem, capture a
+  baseline, locate the constrained resource, form one testable hypothesis, change the smallest
+  relevant thing, and compare the same measurements again.
+</p>
+
+<div class="analogy">
+  <p>
+    Treat PostgreSQL like a busy restaurant. Buying a larger pantry does not help if orders wait at
+    the payment desk. Adding more tables can make service worse when the kitchen is already full.
+    First measure where time is spent: waiting for a worker, waiting for a lock, reading storage,
+    sorting, writing, or returning rows. Then increase capacity or reduce work at that exact stage.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Question</th>
+        <th>Evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>User</td>
+        <td>Which operation is slow, how slow, and for whom?</td>
+        <td>p50, p95, p99 latency, errors, timeouts and request traces</td>
+      </tr>
+      <tr>
+        <td>Workload</td>
+        <td>Did arrival rate, query mix, data size, or concurrency change?</td>
+        <td>Requests/s, transactions/s, rows/s, deployments and growth</td>
+      </tr>
+      <tr>
+        <td>Database</td>
+        <td>Is work executing or waiting?</td>
+        <td><code>pg_stat_activity</code>, wait events, locks and statement statistics</td>
+      </tr>
+      <tr>
+        <td>Plan</td>
+        <td>Does one statement read, spill, loop, or estimate badly?</td>
+        <td><code>EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS)</code></td>
+      </tr>
+      <tr>
+        <td>Host</td>
+        <td>Which physical resource is saturated?</td>
+        <td>CPU, memory, storage latency/queue, filesystem space and network</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>A setting is not a goal</strong>
+  <p>
+    A higher cache hit ratio, larger <code>shared_buffers</code>, or lower
+    <code>random_page_cost</code> is not automatically success. Success is a workload meeting its
+    latency, throughput, correctness, durability and cost targets with safe operating headroom.
+  </p>
+</div>
+
+<h2 id="workload-basics"><span class="num">01.</span> Workload, latency, throughput and queues</h2>
+<p class="lead">
+  A useful baseline describes both demand and service. Latency says how long one operation takes;
+  throughput says how many complete per unit time; concurrency says how many are in flight.
+</p>
+
+<ul class="clean">
+  <li>
+    <strong>Latency:</strong> report percentiles, not only averages. A 20 ms average can hide a 2
+    second p99 that harms real users.
+  </li>
+  <li>
+    <strong>Throughput:</strong> requests, transactions, queries, rows, or bytes completed per
+    second. Name the unit and whether failed work is counted.
+  </li>
+  <li>
+    <strong>Concurrency:</strong> active requests, active database backends and transactions. More
+    concurrency raises throughput only until a constrained resource saturates.
+  </li>
+  <li>
+    <strong>Utilization:</strong> the fraction of resource capacity in use. Near saturation, small
+    demand increases can create disproportionate queueing delay.
+  </li>
+  <li>
+    <strong>Service time versus wait time:</strong> a query can be slow because it is doing work or
+    because it is queued behind a lock, CPU, I/O, connection pool, or rate limit.
+  </li>
+</ul>
+
+<p>
+  Little's Law gives a valuable consistency check for a stable system:
+  <code>concurrency = throughput × average time in system</code>. If 200 requests finish each second
+  and average end-to-end time is 0.05 seconds, about 10 requests are in flight on average. If
+  latency grows while throughput is flat and concurrency rises, work is probably queueing.
+</p>
+
+<div class="warn">
+  <strong>Do not compare different workloads</strong>
+  <p>
+    A before-and-after test is meaningful only when data volume, cache state, parameters, query mix,
+    concurrency and observation window are comparable. A faster result after traffic dropped does
+    not prove the configuration change helped.
+  </p>
+</div>
+
+<h2 id="constraints"><span class="num">02.</span> Find the constrained resource</h2>
+<p class="lead">
+  PostgreSQL performance is bounded by CPU, memory, storage, network, locks, connection slots, or
+  the amount of work requested. Tuning the wrong resource often moves no useful metric.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Constraint</th>
+        <th>Common signals</th>
+        <th>First questions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CPU</td>
+        <td>Sustained busy cores, runnable queue, CPU-heavy plans</td>
+        <td>Are rows filtered late, expressions expensive, or concurrency excessive?</td>
+      </tr>
+      <tr>
+        <td>Memory</td>
+        <td>Swap, OOM kills, reclaim pressure, unstable latency</td>
+        <td>How many backends and simultaneous memory operations exist?</td>
+      </tr>
+      <tr>
+        <td>Storage</td>
+        <td>High read/write latency, queue depth, fsync waits, temp I/O</td>
+        <td>Is the access necessary, sequential/random, cached, or spilled?</td>
+      </tr>
+      <tr>
+        <td>Locks</td>
+        <td><code>wait_event_type = 'Lock'</code>, blocker chains</td>
+        <td>Which transaction owns the lock and why is it still open?</td>
+      </tr>
+      <tr>
+        <td>Connections</td>
+        <td>Pool wait, connection errors, many mostly idle backends</td>
+        <td>Is server concurrency bounded independently from client count?</td>
+      </tr>
+      <tr>
+        <td>Network/client</td>
+        <td><code>ClientRead</code>/<code>ClientWrite</code>, slow result consumption</td>
+        <td>Are too many or too-wide rows crossing the network?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  CPU utilization alone is incomplete. One busy core can limit a serial query while total host CPU
+  looks low. Conversely, 100 percent CPU can be healthy at peak if latency stays within target and
+  headroom is deliberate. Storage IOPS alone is also incomplete: latency and queue depth show
+  whether requests are completing promptly.
+</p>
+
+<h2 id="shared-memory"><span class="num">03.</span> Shared buffers, OS cache and huge pages</h2>
+<p class="lead">
+  PostgreSQL reads table and index blocks through its shared buffer cache, while the operating
+  system also caches file data. Memory planning must leave room for both caches, backend memory,
+  maintenance, the kernel, monitoring, poolers and other processes.
+</p>
+
+<h3 id="shared-buffers"><code>shared_buffers</code></h3>
+<p>
+  <code>shared_buffers</code> is the amount of memory PostgreSQL dedicates to shared database
+  blocks. It is allocated at server start. Current official guidance suggests about 25 percent of
+  RAM as a reasonable starting point on a dedicated server with at least 1 GB, then measurement.
+  Allocating more than roughly 40 percent is unlikely to work better because PostgreSQL also relies
+  on the OS cache. These are starting points, not universal formulas.
+</p>
+
+<ul class="clean">
+  <li>
+    A buffer hit avoids a filesystem read but still consumes CPU, locking and memory bandwidth.
+  </li>
+  <li>A shared-buffer miss can still be satisfied quickly from the OS page cache.</li>
+  <li>
+    Increasing the setting does not repair a query that reads millions of unnecessary rows or lacks
+    a suitable index.
+  </li>
+  <li>
+    A larger dirty-buffer population can increase checkpoint work. Official guidance notes that a
+    larger value often needs a corresponding <code>max_wal_size</code> increase to spread writes.
+  </li>
+  <li>
+    The database-wide block hit ratio is not a sufficient target. Sequential analytics can have a
+    low ratio and be healthy; a tiny hot OLTP working set can have a high ratio while one query is
+    still bad.
+  </li>
+</ul>
+
+<h3 id="huge-pages">Huge pages</h3>
+<p>
+  Huge pages map the main shared memory region with fewer page-table entries. This can reduce CPU
+  time spent managing memory mappings, especially with large shared memory. On supported systems,
+  <code>huge_pages = try</code> requests them and falls back if unavailable, <code>on</code> makes
+  failure fatal, and <code>off</code> disables the request. Check
+  <code>SHOW huge_pages_status</code> after startup rather than assuming they were used.
+</p>
+
+<div class="note">
+  <strong>Explicit huge pages and transparent huge pages differ</strong>
+  <p>
+    PostgreSQL's <code>huge_pages</code> setting controls the main shared memory request. Operating
+    system transparent huge pages are a separate mechanism and can have different latency behavior.
+    Follow the PostgreSQL version and operating-system guidance, test on representative load, and
+    verify startup plus memory telemetry.
+  </p>
+</div>
+
+<h2 id="query-memory"><span class="num">04.</span> Query and maintenance memory</h2>
+<p class="lead">
+  PostgreSQL memory settings are different budgets with different multiplication rules.
+  <code>work_mem</code> is not a per-session or per-query cap.
+</p>
+
+<h3 id="work-mem"><code>work_mem</code> and multiplication</h3>
+<p>
+  Each sort, hash table, hash aggregate, Memoize cache and similar executor operation can use a
+  memory allowance based on <code>work_mem</code> before temporary-file work. One plan may contain
+  several such nodes. Parallel workers may each build their own state, and many sessions may do this
+  together. Hash operations derive their limit from <code>work_mem × hash_mem_multiplier</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Reason about an upper-risk scenario, not a fake exact total</b></figcaption>
+  <pre><code>Potential executor memory
+  ≈ active memory nodes
+  × processes participating per query
+  × concurrent heavy queries
+  × applicable memory allowance
+
+Example risk:
+  3 sort/hash nodes × 3 processes × 20 queries × 64 MB
+  = 11,520 MB before backend overhead and other memory</code></pre>
+</figure>
+
+<p>
+  Nodes do not always peak simultaneously and may use less than their allowance, so this is not an
+  exact reservation formula. It is a safety model showing why a global jump from 4 MB to 256 MB can
+  exhaust a server. Prefer reducing input rows and row width. Then use a scoped experiment for a
+  known reporting job.
+</p>
+
+<figure class="code">
+  <figcaption><b>Use a transaction-local allowance for a measured workload</b></figcaption>
+  <pre><code>BEGIN;
+SET LOCAL work_mem = '128MB';
+
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS)
+SELECT customer_id, SUM(total)
+FROM orders
+WHERE ordered_at &gt;= DATE '2026-01-01'
+GROUP BY customer_id;
+
+COMMIT;</code></pre>
+</figure>
+
+<h3 id="maintenance-work-mem"><code>maintenance_work_mem</code></h3>
+<p>
+  <code>maintenance_work_mem</code> is used by operations such as <code>VACUUM</code>,
+  <code>CREATE INDEX</code> and <code>ALTER TABLE ADD FOREIGN KEY</code>. A larger budget can make
+  index creation or vacuum work faster, but concurrent maintenance still multiplies memory. Each
+  autovacuum worker can use memory up to <code>autovacuum_work_mem</code>, or inherit
+  <code>maintenance_work_mem</code> when the former is <code>-1</code>. Budget for the configured
+  and observed worker count.
+</p>
+
+<div class="warn">
+  <strong>Temporary files are evidence, not permission to raise memory globally</strong>
+  <p>
+    Inspect which statement and plan node spills, the temporary bytes, concurrent frequency and
+    total host headroom. A spill may be cheaper and safer than keeping every occasional large sort
+    in RAM.
+  </p>
+</div>
+
+<h2 id="planner-settings"><span class="num">05.</span> Planner cache, I/O costs and statistics</h2>
+<p class="lead">
+  Planner settings describe PostgreSQL's cost model. They do not make hardware faster. Change them
+  only when measurements show the model consistently misrepresents the environment.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Meaning</th>
+        <th>Common mistake</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>effective_cache_size</code></td>
+        <td>Planner estimate of cache available to one query</td>
+        <td>Treating it as allocated or reserved memory</td>
+      </tr>
+      <tr>
+        <td><code>effective_io_concurrency</code></td>
+        <td>Expected concurrent storage I/O and prefetch behavior</td>
+        <td>Setting it high without storage latency testing</td>
+      </tr>
+      <tr>
+        <td><code>seq_page_cost</code></td>
+        <td>Relative cost of a sequential page fetch, default 1.0</td>
+        <td>Reading the number as milliseconds</td>
+      </tr>
+      <tr>
+        <td><code>random_page_cost</code></td>
+        <td>Relative cost of non-sequential page access, default 4.0</td>
+        <td>Lowering it only to force one desired index plan</td>
+      </tr>
+      <tr>
+        <td><code>default_statistics_target</code></td>
+        <td>Default detail collected for columns, default 100</td>
+        <td>Raising every column rather than the skewed one</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  <code>effective_cache_size</code> should consider shared buffers plus the useful portion of the OS
+  file cache, adjusted for concurrent queries and overlap. It changes estimated index costs but
+  allocates nothing. A higher estimate can make index scans look more attractive.
+</p>
+
+<p>
+  <code>effective_io_concurrency</code> tells PostgreSQL how much parallel I/O the storage can
+  usefully handle and controls prefetch distance on supported systems. Current releases allow values
+  from 1 to 1000, with 0 disabling asynchronous I/O requests for this purpose. A value that helps a
+  high-IOPS device can overload slower or shared storage, so compare query latency and device
+  queueing. Tablespaces can override relevant I/O and cost settings.
+</p>
+
+<p>
+  Lowering <code>random_page_cost</code> relative to <code>seq_page_cost</code> favors index access.
+  Equal values can make sense for a fully cached database. A random cost below the sequential cost
+  is not physically sensible. Calibrate with a family of representative queries, not one plan.
+</p>
+
+<h3 id="planner-statistics">Statistics quality before cost tuning</h3>
+<p>
+  The planner estimates row counts from table size and statistics produced by <code>ANALYZE</code>.
+  Stale statistics, skew, correlated columns and parameter-sensitive distributions can cause wrong
+  scan, join and memory choices. First run or confirm auto-analyze, compare estimated and actual
+  rows, and inspect <code>pg_stats</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Target a skewed predicate column</b></figcaption>
+  <pre><code>ALTER TABLE orders
+  ALTER COLUMN tenant_id SET STATISTICS 1000;
+
+ANALYZE orders (tenant_id);
+
+-- Return to the database default if the larger target is no longer useful.
+ALTER TABLE orders
+  ALTER COLUMN tenant_id SET STATISTICS -1;</code></pre>
+</figure>
+
+<p>
+  Larger targets allow larger most-common-value lists and histograms and use a larger sample, at the
+  cost of more analysis time and catalog space. Use extended statistics for cross-column
+  dependencies, multivariate common values, or distinct counts. Increasing an unrelated global
+  target cannot fix missing correlation knowledge by itself.
+</p>
+
+<h2 id="checkpoints"><span class="num">06.</span> Checkpoints and WAL performance overview</h2>
+<p class="lead">
+  WAL protects durability and checkpoints bound recovery work. Operational tuning aims to avoid
+  bursty writes while preserving the required durability and recovery objectives.
+</p>
+
+<ul class="clean">
+  <li>
+    <code>checkpoint_timeout</code> bounds time between automatic checkpoints. A longer interval can
+    mean more crash-recovery work.
+  </li>
+  <li>
+    <code>max_wal_size</code> is a soft WAL-size threshold that can trigger checkpoints. It is not a
+    strict disk-space cap.
+  </li>
+  <li>
+    <code>checkpoint_completion_target</code>, default 0.9, spreads checkpoint writes across most of
+    the interval. Lowering it usually creates a sharper I/O burst.
+  </li>
+  <li>
+    Frequent requested checkpoints suggest WAL volume is reaching the threshold or explicit
+    checkpoints are occurring. Compare timed and requested counters, WAL rate and storage latency.
+  </li>
+  <li>
+    <code>wal_compression</code> can reduce full-page-image WAL volume at a CPU cost. Measure both.
+  </li>
+  <li>
+    Relaxing <code>synchronous_commit</code> can reduce commit wait for selected transactions but
+    changes the window in which recently acknowledged transactions can be lost after an OS crash. It
+    does not make the database inconsistent. Use only with an explicit durability decision.
+  </li>
+</ul>
+
+<div class="note">
+  <strong>Keep durability decisions separate from ordinary tuning</strong>
+  <p>
+    Never disable <code>fsync</code> or use unsafe storage behavior to win a benchmark on a durable
+    production system. Topic 8 explains WAL, checkpoints and crash recovery in depth. Here the
+    operational rule is to observe WAL rate, checkpoint cause, write/sync time, disk capacity and
+    recovery requirements together.
+  </p>
+</div>
+
+<h2 id="connections"><span class="num">07.</span> Connection model, backend cost and pooling</h2>
+<p class="lead">
+  PostgreSQL starts a separate server process for each accepted client connection. Connections are
+  useful sessions, but active SQL concurrency must be bounded by what CPU, memory and storage can
+  serve efficiently.
+</p>
+
+<p>
+  Each backend has process and session state, can allocate private executor memory, participates in
+  shared structures, and adds scheduling work. Idle connections are cheaper than active heavy
+  queries but are not free. Hundreds of clients all becoming active can multiply
+  <code>work_mem</code>, lock contention and CPU run queues at once.
+</p>
+
+<p>
+  <code>max_connections</code> is a hard server admission limit, not a target concurrency. Raising
+  it also increases some shared resource allocations and can convert a clean connection rejection
+  into host-wide memory pressure and timeouts. Keep emergency slots through
+  <code>reserved_connections</code> and <code>superuser_reserved_connections</code> as appropriate,
+  and test the actual administrative path.
+</p>
+
+<div class="key">
+  <strong>Separate client concurrency from database concurrency</strong>
+  <p>
+    An application can support thousands of connected users while allowing only a measured number of
+    concurrent PostgreSQL server connections. A pool absorbs short bursts into a bounded queue.
+    Queueing at a visible pool is safer than letting every request consume backend memory and
+    compete inside the database.
+  </p>
+</div>
+
+<ul class="clean">
+  <li>
+    Size pools across all application instances, jobs, consoles and replicas, not per instance.
+  </li>
+  <li>Reserve capacity for migrations, monitoring, autovacuum and emergency administration.</li>
+  <li>Use finite pool-acquisition and statement timeouts aligned with the request deadline.</li>
+  <li>
+    Monitor pool wait time and queue length. A pool can protect PostgreSQL while exposing demand.
+  </li>
+  <li>Avoid one large pool per tenant or role without calculating the total server connections.</li>
+</ul>
+
+<h2 id="pgbouncer"><span class="num">08.</span> PgBouncer modes and compatibility</h2>
+<p class="lead">
+  PgBouncer is a lightweight connection pooler. Its pool mode decides when a PostgreSQL server
+  connection may be reassigned to another client, which also decides which session features remain
+  safe.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>Server connection released</th>
+        <th>Tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Session</td>
+        <td>When the client disconnects</td>
+        <td>Best compatibility, least multiplexing for long-lived clients</td>
+      </tr>
+      <tr>
+        <td>Transaction</td>
+        <td>When the transaction finishes</td>
+        <td>Strong multiplexing; application must not depend on session state</td>
+      </tr>
+      <tr>
+        <td>Statement</td>
+        <td>When one statement finishes</td>
+        <td>Most restrictive; multi-statement transactions are disallowed</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  In transaction pooling, consecutive transactions from one client can run on different server
+  backends. Session-level <code>SET</code>, <code>LISTEN</code>, session advisory locks, holdable
+  cursors, and temporary tables that preserve rows cannot be assumed to follow the client.
+  Transaction-local state such as <code>SET LOCAL</code> remains tied to its transaction.
+</p>
+
+<p>
+  PgBouncer can support protocol-level named prepared statements in transaction and statement modes
+  when <code>max_prepared_statements</code> is nonzero. SQL-level <code>PREPARE</code>,
+  <code>EXECUTE</code> and <code>DEALLOCATE</code> do not receive that tracking and remain
+  incompatible with transaction pooling. Confirm client driver behavior and the deployed PgBouncer
+  version. DDL that changes prepared result types may require a planned <code>RECONNECT</code>.
+</p>
+
+<div class="warn">
+  <strong>Transaction pooling changes session semantics by design</strong>
+  <p>
+    Do not select it only because it supports more clients. Inventory application features, test
+    migrations and drivers, set <code>application_name</code>, verify authentication and TLS, and
+    observe <code>SHOW POOLS</code> plus <code>SHOW STATS</code>. Session pooling still avoids
+    repeated PostgreSQL connection setup, but does not reduce steady server connections for
+    long-lived clients.
+  </p>
+</div>
+
+<h2 id="monitoring-model">
+  <span class="num">09.</span> Monitoring semantics and safe observation
+</h2>
+<p class="lead">
+  PostgreSQL exposes current activity and cumulative counters. Know whether a value is a live state,
+  a counter since reset, a transaction-scoped snapshot, or an optional timing metric before drawing
+  conclusions.
+</p>
+
+<ul class="clean">
+  <li>
+    <code>pg_stat_activity</code> is current per-process state. It is not a historical query log.
+  </li>
+  <li>
+    Cumulative views such as <code>pg_stat_database</code> describe totals since
+    <code>stats_reset</code>. Compare rates over equal intervals.
+  </li>
+  <li>
+    Statistics fetched inside a transaction can be cached for consistency. Run monitoring queries in
+    short transactions so repeated reads can see fresh values.
+  </li>
+  <li>
+    I/O timing columns remain zero unless <code>track_io_timing</code> is enabled, and mixed periods
+    before and after enabling it require caution.
+  </li>
+  <li>
+    Access is permission-sensitive. Use <code>pg_read_all_stats</code> for an appropriate monitoring
+    role instead of making tools superusers.
+  </li>
+  <li>
+    Resetting statistics removes the baseline. Record the reset time and preserve monitoring data
+    externally before intentional resets.
+  </li>
+</ul>
+
+<h2 id="activity-locks"><span class="num">10.</span> Activity, locks and wait events</h2>
+<p class="lead">
+  Start an incident by separating active CPU/I/O work, lock waits, client waits and idle
+  transactions. The <code>state</code> and <code>wait_event</code> columns answer different
+  questions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Find long-running or waiting sessions</b></figcaption>
+  <pre><code>SELECT pid,
+       usename,
+       application_name,
+       client_addr,
+       state,
+       wait_event_type,
+       wait_event,
+       now() - query_start AS query_age,
+       now() - xact_start AS transaction_age,
+       backend_xid,
+       backend_xmin,
+       left(query, 160) AS query
+FROM pg_stat_activity
+WHERE pid &lt;&gt; pg_backend_pid()
+ORDER BY query_start NULLS LAST;</code></pre>
+</figure>
+
+<p>
+  <code>state = 'active'</code> means the backend is executing a query, but a non-null wait event
+  means it is currently waiting somewhere. <code>idle in transaction</code> is operationally
+  dangerous because it can retain locks and an old snapshot even though no statement is executing.
+  <code>ClientRead</code> usually means PostgreSQL is waiting for the client to send more work, not
+  that storage reads are slow.
+</p>
+
+<figure class="code">
+  <figcaption><b>Link blocked sessions to blockers</b></figcaption>
+  <pre><code>SELECT blocked.pid AS blocked_pid,
+       blocked.wait_event_type,
+       blocked.wait_event,
+       blocker.pid AS blocker_pid,
+       blocker.state AS blocker_state,
+       now() - blocker.xact_start AS blocker_xact_age,
+       left(blocked.query, 120) AS blocked_query,
+       left(blocker.query, 120) AS blocker_query
+FROM pg_stat_activity AS blocked
+CROSS JOIN LATERAL
+     unnest(pg_blocking_pids(blocked.pid)) AS b(blocker_pid)
+JOIN pg_stat_activity AS blocker
+  ON blocker.pid = b.blocker_pid;</code></pre>
+</figure>
+
+<p>
+  <code>pg_locks</code> provides lockable-object detail and granted status, while
+  <code>pg_blocking_pids()</code> handles blocker relationships, including wait-queue effects, more
+  reliably than a simplistic self-join. Termination is a last step: identify the owner, business
+  effect, transaction and rollback cost. Prefer fixing transaction scope, stable lock order and
+  timeouts.
+</p>
+
+<h2 id="cumulative-stats"><span class="num">11.</span> Database, I/O and checkpoint statistics</h2>
+<p class="lead">
+  Cumulative views answer cluster and database trend questions. Convert counters into interval rates
+  and pair them with workload volume.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>View</th>
+        <th>Useful signals</th>
+        <th>Interpretation caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>pg_stat_database</code></td>
+        <td>commits, rollbacks, blocks, tuples, temp bytes, deadlocks, session time</td>
+        <td>Database-wide totals can hide one expensive statement</td>
+      </tr>
+      <tr>
+        <td><code>pg_stat_io</code></td>
+        <td>reads, writes, extends, evictions, reuse and timing by backend/object/context</td>
+        <td>Cluster-wide and version-dependent; not every I/O path is represented</td>
+      </tr>
+      <tr>
+        <td><code>pg_stat_bgwriter</code></td>
+        <td>background-writer cleaning, limits and buffer allocation</td>
+        <td>Current releases separate checkpoint work</td>
+      </tr>
+      <tr>
+        <td><code>pg_stat_checkpointer</code></td>
+        <td>timed/requested checkpoints, write/sync time and buffers</td>
+        <td>Use only where the server version provides this view</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Database workload and spill overview</b></figcaption>
+  <pre><code>SELECT datname,
+       xact_commit,
+       xact_rollback,
+       blks_read,
+       blks_hit,
+       temp_files,
+       pg_size_pretty(temp_bytes) AS temp_written,
+       deadlocks,
+       stats_reset
+FROM pg_stat_database
+WHERE datname IS NOT NULL
+ORDER BY temp_bytes DESC;</code></pre>
+</figure>
+
+<p>
+  A block hit percentage from <code>blks_hit / (blks_hit + blks_read)</code> describes PostgreSQL
+  shared-buffer activity, not the OS cache and not physical-device reads. A high percentage does not
+  prove queries are efficient. Use <code>pg_stat_io</code> to distinguish backend types and I/O
+  contexts, and use host telemetry for device-level latency and saturation.
+</p>
+
+<div class="note">
+  <strong>Version-aware checkpoint views</strong>
+  <p>
+    PostgreSQL 17 and later expose <code>pg_stat_checkpointer</code> separately. In PostgreSQL 16
+    and earlier, checkpoint counters such as requested/timed checkpoints and checkpoint write/sync
+    time are in <code>pg_stat_bgwriter</code>. Monitoring SQL and dashboards must be matched to the
+    server's major version.
+  </p>
+</div>
+
+<h2 id="pg-stat-statements">
+  <span class="num">12.</span> Finding expensive SQL with pg_stat_statements
+</h2>
+<p class="lead">
+  <code>pg_stat_statements</code> groups structurally equivalent statements and accumulates planning
+  and execution metrics. It helps rank total workload cost, average cost, calls, I/O and
+  variability.
+</p>
+
+<figure class="code">
+  <figcaption><b>One-time server and database setup</b></figcaption>
+  <pre><code># postgresql.conf, then restart because shared memory is required
+shared_preload_libraries = 'pg_stat_statements'
+compute_query_id = on
+
+-- Run in every database where the view should be available.
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;</code></pre>
+</figure>
+
+<p>
+  The library tracks across the cluster, while the SQL extension objects are installed per database.
+  Entries are keyed by database, user, query identifier and top-level status. Literal constants are
+  normalized, so a representative query text can contain placeholders. <code>queryid</code> is
+  valuable for joining telemetry but is not guaranteed stable across PostgreSQL major versions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Rank statements by total execution demand</b></figcaption>
+  <pre><code>SELECT queryid,
+       calls,
+       round(total_exec_time::numeric, 1) AS total_exec_ms,
+       round(mean_exec_time::numeric, 2) AS mean_exec_ms,
+       round((total_exec_time / NULLIF(sum(total_exec_time) OVER (), 0)
+              * 100)::numeric, 2) AS exec_share_pct,
+       rows,
+       shared_blks_read,
+       temp_blks_written,
+       left(query, 180) AS sample_query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;</code></pre>
+</figure>
+
+<ul class="clean">
+  <li><strong>Total time:</strong> best starting point for overall capacity savings.</li>
+  <li><strong>Mean time:</strong> finds individually slow calls but can hide tail latency.</li>
+  <li><strong>Calls:</strong> a tiny query can dominate CPU through extreme frequency.</li>
+  <li>
+    <strong>Rows:</strong> relate returned/affected rows to calls and application expectations.
+  </li>
+  <li>
+    <strong>Shared blocks:</strong> reveal cache and read demand; timing needs I/O timing enabled.
+  </li>
+  <li><strong>Temporary blocks:</strong> reveal spill volume by statement family.</li>
+  <li><strong>WAL bytes:</strong> reveal write amplification for modifying statements.</li>
+  <li>
+    <strong>Standard deviation:</strong> large variation suggests skew, cache, locks, plans or
+    parameter-dependent behavior needing traces or logs.
+  </li>
+</ul>
+
+<p>
+  Planning columns remain zero unless <code>pg_stat_statements.track_planning</code> is enabled.
+  That option can add noticeable contention for frequently planned identical queries, so enable it
+  after evaluating overhead. Track reset time and query-entry deallocations from
+  <code>pg_stat_statements_info</code>. Reset only with a deliberate measurement window.
+</p>
+
+<h2 id="slow-query-workflow"><span class="num">13.</span> A repeatable slow-query workflow</h2>
+<p class="lead">
+  Query tuning starts with the exact workload context and ends with production verification. It is
+  not a contest to make EXPLAIN display an index.
+</p>
+
+<ol class="clean">
+  <li>
+    <strong>Define impact:</strong> endpoint/job, time window, p95/p99, timeout rate, users, and
+    SLO.
+  </li>
+  <li>
+    <strong>Check waits:</strong> determine whether time is in a pool queue, lock, client, I/O, or
+    execution.
+  </li>
+  <li>
+    <strong>Identify the statement family:</strong> use trace context, logs, query ID and
+    <code>pg_stat_statements</code>.
+  </li>
+  <li>
+    <strong>Reproduce context:</strong> representative parameters, role, search path, prepared-plan
+    behavior, data volume, statistics and relevant settings.
+  </li>
+  <li>
+    <strong>Capture the plan safely:</strong> start with <code>EXPLAIN</code>; use
+    <code>EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS)</code> only when execution is safe.
+  </li>
+  <li>
+    <strong>Find the first cause:</strong> earliest major estimate error, excessive rows/width,
+    repeated loops, bad access path, spill, or lock.
+  </li>
+  <li>
+    <strong>Change one cause:</strong> SQL, index, statistics, data model, transaction scope, or a
+    scoped configuration.
+  </li>
+  <li>
+    <strong>Compare:</strong> result correctness, plan, buffers, temp I/O, WAL, latency under
+    concurrency, CPU and storage.
+  </li>
+  <li>
+    <strong>Roll out and watch:</strong> canary where possible, preserve rollback, and inspect fleet
+    and tail metrics.
+  </li>
+</ol>
+
+<div class="warn">
+  <strong>ANALYZE executes the statement</strong>
+  <p>
+    <code>EXPLAIN ANALYZE</code> on an <code>INSERT</code>, <code>UPDATE</code>,
+    <code>DELETE</code> or <code>MERGE</code> performs the write, fires triggers, waits for locks
+    and generates WAL. A transaction plus rollback can undo transactional database changes, but not
+    every external side effect.
+  </p>
+</div>
+
+<h2 id="logging"><span class="num">14.</span> Slow logging and auto_explain</h2>
+<p class="lead">
+  Statistics find aggregate offenders. Logs and traces preserve individual occurrences, parameters,
+  timing context and errors. Capture enough evidence without leaking data or overwhelming storage.
+</p>
+
+<ul class="clean">
+  <li>
+    <code>log_min_duration_statement = '250ms'</code> logs every completed statement at or above the
+    threshold. The default <code>-1</code> disables it; zero logs every duration.
+  </li>
+  <li>
+    <code>log_min_duration_sample</code> with <code>log_statement_sample_rate</code> samples
+    qualifying traffic when logging every query would be too expensive.
+  </li>
+  <li>
+    Include timestamp, process/session identity, database, user and application in
+    <code>log_line_prefix</code>. Use structured CSV or JSON logs when the pipeline supports them.
+  </li>
+  <li>
+    Parameter values and SQL can contain secrets or personal data. Apply access control, retention,
+    redaction and a deliberate <code>log_parameter_max_length_on_error</code> policy.
+  </li>
+  <li>
+    <code>log_temp_files</code> identifies large temporary files. Select a threshold that is useful
+    at production volume.
+  </li>
+</ul>
+
+<p>
+  <code>auto_explain</code> can log plans for statements crossing
+  <code>auto_explain.log_min_duration</code>. Load it only into intended sessions or through a
+  planned preload setting. <code>auto_explain.log_analyze = on</code> collects actual execution
+  detail, but per-node timing can affect every statement even when it is not eventually logged.
+  Sampling and <code>auto_explain.log_timing = off</code> can reduce overhead. Test overhead and log
+  volume before production rollout.
+</p>
+
+<h2 id="partitioning-basics"><span class="num">15.</span> Partitioning mental model and syntax</h2>
+<p class="lead">
+  A partitioned table is a logical parent whose rows are routed into physical child tables according
+  to partition bounds. Partitioning is primarily a data-management and pruning tool, not a universal
+  substitute for indexes.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Rule</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Range</td>
+        <td>Non-overlapping lower-inclusive, upper-exclusive ranges</td>
+        <td>Time-series retention and ordered key ranges</td>
+      </tr>
+      <tr>
+        <td>List</td>
+        <td>Explicit key values per partition</td>
+        <td>Small stable sets such as region or business category</td>
+      </tr>
+      <tr>
+        <td>Hash</td>
+        <td>Modulus and remainder distribute keys</td>
+        <td>Even spread when natural range/list grouping is unsuitable</td>
+      </tr>
+      <tr>
+        <td>Default</td>
+        <td>Rows not matching another partition</td>
+        <td>Operational safety net, monitored for unexpected routing</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Monthly range partitions with a default safety net</b></figcaption>
+  <pre><code>CREATE TABLE events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  occurred_at timestamptz NOT NULL,
+  tenant_id bigint NOT NULL,
+  payload jsonb NOT NULL,
+  PRIMARY KEY (occurred_at, event_id)
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE events_2026_07 PARTITION OF events
+FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+CREATE TABLE events_2026_08 PARTITION OF events
+FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+CREATE TABLE events_default PARTITION OF events DEFAULT;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>List and hash forms</b></figcaption>
+  <pre><code>CREATE TABLE invoices (
+  region text NOT NULL,
+  invoice_id bigint NOT NULL,
+  amount numeric(12,2) NOT NULL
+) PARTITION BY LIST (region);
+
+CREATE TABLE invoices_apac PARTITION OF invoices
+FOR VALUES IN ('IN', 'SG', 'JP');
+
+CREATE TABLE sessions (
+  tenant_id bigint NOT NULL,
+  session_id uuid NOT NULL,
+  data jsonb
+) PARTITION BY HASH (tenant_id);
+
+CREATE TABLE sessions_h0 PARTITION OF sessions
+FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+-- Create remainders 1, 2 and 3 as well.</code></pre>
+</figure>
+
+<p>
+  Inserts through the parent are routed to a matching leaf. If no partition matches and no default
+  exists, the insert fails. Updating a partition key can move a row between partitions and may
+  produce serialization failures when concurrent sessions see the movement.
+</p>
+
+<h2 id="partition-pruning"><span class="num">16.</span> Pruning, indexes and constraints</h2>
+<p class="lead">
+  Partition pruning removes child plans whose bounds cannot match the predicate. It is driven by
+  partition bounds, not by indexes, and can occur both while planning and during execution.
+</p>
+
+<figure class="code">
+  <figcaption><b>A predicate aligned with the partition key</b></figcaption>
+  <pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT tenant_id, count(*)
+FROM events
+WHERE occurred_at &gt;= TIMESTAMPTZ '2026-07-10 00:00:00+00'
+  AND occurred_at &lt;  TIMESTAMPTZ '2026-07-11 00:00:00+00'
+GROUP BY tenant_id;</code></pre>
+</figure>
+
+<p>
+  A prepared parameter, subquery result, or nested-loop parameter may become known only during
+  execution, so PostgreSQL can prune at plan initialization or repeatedly during execution.
+  <code>EXPLAIN</code> may report <code>Subplans Removed</code>; execution-time pruning can appear
+  as <code>(never executed)</code> or different loop counts.
+</p>
+
+<ul class="clean">
+  <li>
+    Functions or casts around the key can prevent the planner from proving the bound. Prefer direct,
+    type-correct range predicates where semantics allow.
+  </li>
+  <li>
+    An index on the partition key is not required for pruning. Add per-partition indexes for
+    selective access inside partitions.
+  </li>
+  <li>
+    Creating an index on the parent creates matching indexes on existing partitions and arranges
+    them for future partitions.
+  </li>
+  <li>
+    Parent <code>CREATE INDEX</code> does not support <code>CONCURRENTLY</code>. For a busy
+    hierarchy, create an invalid index on <code>ONLY</code> the parent, build child indexes
+    concurrently, then attach them.
+  </li>
+  <li>
+    A primary key or unique constraint on a partitioned table must include all partition-key columns
+    and use columns, not expressions, because PostgreSQL cannot enforce cross-partition uniqueness
+    with independent child indexes otherwise.
+  </li>
+  <li>Foreign keys and triggers need explicit operational testing across the hierarchy.</li>
+</ul>
+
+<h2 id="partition-operations"><span class="num">17.</span> Partition maintenance and lifecycle</h2>
+<p class="lead">
+  The major operational benefit of partitioning is treating a bounded slice as a table: prepare it,
+  load it, index it, attach it, detach it, archive it, or drop it.
+</p>
+
+<ol class="clean">
+  <li>Create future partitions before the first possible row arrives.</li>
+  <li>Apply owners, privileges, indexes, storage parameters and monitoring consistently.</li>
+  <li>Alert on rows entering a default partition and move them deliberately.</li>
+  <li>Analyze a newly loaded partition before serving plan-sensitive reads.</li>
+  <li>Test retention detach/drop locks and dependent objects before the production window.</li>
+  <li>Keep a catalog/runbook of bounds so gaps and overlaps are reviewed before deployment.</li>
+</ol>
+
+<p>
+  Attaching an existing table normally requires PostgreSQL to scan it while holding a strong lock to
+  verify the proposed bound. Add a matching validated <code>CHECK</code> constraint first so the
+  scan can often be avoided, then remove the redundant constraint after attachment if appropriate.
+  If a default partition exists, add a constraint proving it excludes the new range; otherwise the
+  default partition may be scanned under <code>ACCESS EXCLUSIVE</code> lock.
+</p>
+
+<figure class="code">
+  <figcaption><b>Prepare and attach a preloaded partition</b></figcaption>
+  <pre><code>CREATE TABLE events_2026_09 (LIKE events INCLUDING DEFAULTS
+                                        INCLUDING CONSTRAINTS
+                                        INCLUDING STORAGE);
+
+ALTER TABLE events_2026_09
+  ADD CONSTRAINT events_2026_09_bound
+  CHECK (occurred_at &gt;= TIMESTAMPTZ '2026-09-01 00:00:00+00'
+     AND occurred_at &lt;  TIMESTAMPTZ '2026-10-01 00:00:00+00');
+
+-- Load, validate, index and analyze before the short attach operation.
+ALTER TABLE events ATTACH PARTITION events_2026_09
+FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');</code></pre>
+</figure>
+
+<p>
+  <code>DETACH PARTITION CONCURRENTLY</code>, where its restrictions permit, reduces the parent lock
+  level but uses multiple transactions and cannot run inside a transaction block. Version and
+  hierarchy restrictions matter, so test the exact command. Detaching or dropping a whole old
+  partition avoids row-by-row delete work and the vacuum burden that follows a massive
+  <code>DELETE</code>.
+</p>
+
+<h2 id="partition-tradeoffs"><span class="num">18.</span> When partitioning helps or hurts</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Partitioning helps when</th>
+        <th>Partitioning hurts when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Most queries restrict a key that permits strong pruning</td>
+        <td>Queries usually touch every partition</td>
+      </tr>
+      <tr>
+        <td>Retention removes complete time/key ranges</td>
+        <td>There is no bounded lifecycle unit</td>
+      </tr>
+      <tr>
+        <td>Hot and cold slices need different storage or maintenance</td>
+        <td>All slices have identical access and maintenance</td>
+      </tr>
+      <tr>
+        <td>One partition's indexes fit cache better</td>
+        <td>A normal index already solves selective access</td>
+      </tr>
+      <tr>
+        <td>Bulk load/attach enables controlled ingestion</td>
+        <td>Added routing, DDL and monitoring complexity exceeds benefit</td>
+      </tr>
+      <tr>
+        <td>The partition count stays deliberate and bounded</td>
+        <td>One partition per small tenant creates thousands of children</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Too many surviving partitions increase planning time and memory. PostgreSQL can handle thousands
+  well when typical queries prune to a small subset, but that is not permission to create unlimited
+  children. Model future tenant count, retention periods and subpartition growth. Benchmark inserts,
+  point queries, broad reports, prepared statements and DDL at the expected partition count.
+</p>
+
+<div class="warn">
+  <strong>Partitioning is not sharding</strong>
+  <p>
+    Native partitions remain in one PostgreSQL cluster and share its CPU, memory, WAL, connection
+    limit and failure domain. Partitioning organizes local data. Sharding distributes data and
+    responsibility across servers, adding a different set of consistency and operational problems.
+  </p>
+</div>
+
+<h2 id="capacity"><span class="num">19.</span> Capacity planning</h2>
+<p class="lead">
+  Capacity planning connects business growth to resource demand and preserves headroom for bursts,
+  maintenance, failover and degraded operation.
+</p>
+
+<ol class="clean">
+  <li>
+    Forecast data rows, table/index bytes, WAL bytes, backups and logs over the planning horizon.
+  </li>
+  <li>
+    Measure peak and sustained transactions/s, query mix, concurrent active sessions and result
+    volume, not only daily averages.
+  </li>
+  <li>
+    Record CPU seconds, read/write bytes, IOPS, WAL and temporary bytes per business unit such as
+    1,000 orders.
+  </li>
+  <li>
+    Model memory as shared allocations plus backend/session memory, query operations, autovacuum,
+    maintenance, OS cache, kernel and safety margin.
+  </li>
+  <li>
+    Model storage for primary data, indexes, bloat allowance, <code>pg_wal</code>, temporary files,
+    snapshots/backups and growth during maintenance.
+  </li>
+  <li>
+    Load test at future data size and realistic skew. Small synthetic tables produce misleading
+    plans and cache behavior.
+  </li>
+  <li>
+    Test the degraded case: replica unavailable, backup running, autovacuum active, cache cold, or
+    one storage path slower.
+  </li>
+</ol>
+
+<p>
+  Alert on predicted exhaustion, not only current failure. Disk-space runway in days, WAL generation
+  rate, connection-pool saturation, oldest transaction, replica lag, vacuum backlog and CPU headroom
+  are leading indicators. Capacity also includes recovery time: a backup that cannot be restored
+  within the objective is not adequate capacity.
+</p>
+
+<h2 id="os-storage"><span class="num">20.</span> OS, storage and network observations</h2>
+<p class="lead">
+  PostgreSQL statistics explain database behavior; operating-system metrics confirm what the
+  hardware actually did. Correlate them on the same timeline.
+</p>
+
+<ul class="clean">
+  <li>
+    <strong>CPU:</strong> per-core utilization, run queue, context switches and steal time in
+    virtual environments. Separate user, system and I/O wait time.
+  </li>
+  <li>
+    <strong>Memory:</strong> available memory, page faults, reclaim, swap activity and OOM events.
+    Swap-in during database load is a serious latency warning.
+  </li>
+  <li>
+    <strong>Storage:</strong> read/write latency percentiles, operations/s, bandwidth, queue depth,
+    flush latency and device errors. Confirm filesystem and volume saturation.
+  </li>
+  <li>
+    <strong>Space:</strong> data filesystem, WAL filesystem, temporary space, inode use and snapshot
+    amplification. Keep emergency headroom and automatic growth alerts.
+  </li>
+  <li>
+    <strong>Network:</strong> throughput, retransmits, connection establishment and cross-zone
+    latency. Large result sets can make the client or network the bottleneck.
+  </li>
+</ul>
+
+<p>
+  Storage durability claims must cover power-loss behavior, write caches, barriers and the complete
+  stack. A fast benchmark does not prove durable <code>fsync</code>. For managed services, combine
+  provider metrics with PostgreSQL views and document which knobs are unavailable.
+</p>
+
+<h2 id="safe-rollout"><span class="num">21.</span> Safe tuning rollout and runbooks</h2>
+<p class="lead">
+  A performance change is a production change. It needs a hypothesis, owner, validation, rollback,
+  observation window and clear stop conditions.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Runbook field</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Problem and SLO</td>
+        <td>Checkout p99 is 1.8 s; target is below 750 ms</td>
+      </tr>
+      <tr>
+        <td>Evidence window</td>
+        <td>Peak 18:00-19:00 IST, query ID, waits and plan attached</td>
+      </tr>
+      <tr>
+        <td>Hypothesis</td>
+        <td>Wrong tenant estimate selects repeated inner scans</td>
+      </tr>
+      <tr>
+        <td>Change</td>
+        <td>Column statistics target 500 plus ANALYZE</td>
+      </tr>
+      <tr>
+        <td>Success</td>
+        <td>p99 below 750 ms, CPU no higher, same results</td>
+      </tr>
+      <tr>
+        <td>Stop/rollback</td>
+        <td>Errors, CPU +15%, new plan regression; restore target and analyze</td>
+      </tr>
+      <tr>
+        <td>Owner and duration</td>
+        <td>DB on-call, canary 30 minutes, full watch 24 hours</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ol class="clean">
+  <li>Capture configuration, plan and dashboard screenshots or exports before change.</li>
+  <li>Confirm whether the setting reloads, needs a new session, or needs restart.</li>
+  <li>Test syntax and startup in a non-production environment using the same major version.</li>
+  <li>Change one variable or one coherent change set with a known rollback.</li>
+  <li>Canary a role, session, replica, instance or traffic slice when semantics allow.</li>
+  <li>
+    Compare both target queries and guardrails such as CPU, memory, WAL, locks and other endpoints.
+  </li>
+  <li>Record the decision and remove temporary settings or instrumentation after the window.</li>
+</ol>
+
+<p>
+  Some settings apply at server start, some after reload, and some per session. Use
+  <code>pg_settings.context</code>, <code>pending_restart</code>, <code>source</code> and
+  <code>sourcefile</code> to verify the effective value and its origin. Do not assume editing a file
+  changed the running server.
+</p>
+
+<h2 id="mistakes"><span class="num">22.</span> Common mistakes and edge cases</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Raise every memory setting</td>
+        <td>Per-node, worker and session multiplication can exhaust RAM</td>
+        <td>Inventory concurrency and test scoped budgets</td>
+      </tr>
+      <tr>
+        <td>Set <code>effective_cache_size</code> as RAM allocation</td>
+        <td>It reserves nothing and only changes planner estimates</td>
+        <td>Estimate useful shared plus OS cache for the workload</td>
+      </tr>
+      <tr>
+        <td>Raise <code>max_connections</code> for pool exhaustion</td>
+        <td>Moves queueing into PostgreSQL and raises resource pressure</td>
+        <td>Bound server pools and fix leaks/long transactions</td>
+      </tr>
+      <tr>
+        <td>Optimize only the slowest single query</td>
+        <td>A frequent 2 ms query may consume more total CPU</td>
+        <td>Rank total time, mean, calls and tail impact</td>
+      </tr>
+      <tr>
+        <td>Read cumulative counters as instantaneous</td>
+        <td>Totals depend on uptime/reset length and workload volume</td>
+        <td>Calculate interval deltas and rates</td>
+      </tr>
+      <tr>
+        <td>Interpret every wait as a problem</td>
+        <td>Idle processes normally wait; event meaning depends on state</td>
+        <td>Filter by impact, duration, state and workload</td>
+      </tr>
+      <tr>
+        <td>Force index scans with cost settings</td>
+        <td>May regress many other queries and hide wrong estimates</td>
+        <td>Fix statistics, SQL and access paths first</td>
+      </tr>
+      <tr>
+        <td>Partition every large table</td>
+        <td>Size alone does not guarantee pruning or lifecycle benefit</td>
+        <td>Require an aligned access or retention pattern</td>
+      </tr>
+      <tr>
+        <td>Assume transaction pooling preserves sessions</td>
+        <td>The next transaction may use another backend</td>
+        <td>Inventory session features and test the driver</td>
+      </tr>
+      <tr>
+        <td>Reset statistics during an incident</td>
+        <td>Destroys the history needed for diagnosis</td>
+        <td>Export first and reset only for a planned window</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ul class="clean">
+  <li>
+    A connection can be <code>active</code> and waiting, so state alone does not prove CPU use.
+  </li>
+  <li>Session statistics and settings can behave differently through transaction pooling.</li>
+  <li>Statistics may lag or reset after restart depending on the facility and configuration.</li>
+  <li>
+    Generic prepared plans can hide tenant skew; compare representative custom and generic plans.
+  </li>
+  <li>A partition default can silently grow forever if no alert and migration process exists.</li>
+  <li>Failover capacity must handle the surviving topology, not only normal balanced traffic.</li>
+</ul>
+
+<h2 id="practice"><span class="num">23.</span> Practice questions</h2>
+<div class="qa">
+  <p class="q">
+    1. A host has 32 GB RAM, 150 active backends, <code>work_mem = 64MB</code>, and plans can have
+    four memory nodes. Why is 150 × 64 MB not a safe estimate?
+  </p>
+  <p class="a">
+    The allowance is per operation, not per backend. Several nodes, parallel processes and hash
+    multipliers can overlap. Add shared buffers, backend overhead, maintenance, OS cache and safety
+    margin. Measure actual concurrency and use scoped memory for known heavy jobs.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">2. The database hit ratio is 99.8 percent but CPU is saturated. What next?</p>
+  <p class="a">
+    A hit still performs work. Rank statements by total execution time and calls, inspect rows and
+    plans, check per-core CPU and active concurrency, and reduce unnecessary computation or query
+    frequency. Do not enlarge the cache based on this signal.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    3. p99 latency rose, throughput stayed flat and active requests doubled. What pattern does this
+    suggest?
+  </p>
+  <p class="a">
+    Queueing. Use pool wait, database wait events, locks, CPU run queue and storage latency to
+    locate the queue. More concurrency may worsen it.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    4. <code>pg_stat_activity</code> shows <code>state = active</code> and
+    <code>wait_event_type = Lock</code>. Is it using CPU?
+  </p>
+  <p class="a">
+    It is an active statement currently waiting for a lock. Find blockers with
+    <code>pg_blocking_pids()</code>, inspect transaction age and fix the blocking transaction rather
+    than treating the statement as CPU-bound.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">5. When is transaction pooling incompatible with an application?</p>
+  <p class="a">
+    When correctness depends on server-session state across transactions, such as arbitrary
+    <code>SET</code>, <code>LISTEN</code>, session advisory locks, holdable cursors, or persistent
+    temporary data. Inventory protocol-level prepared statement support separately from SQL PREPARE.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    6. A monthly partitioned table still scans all partitions for
+    <code>WHERE date(occurred_at) = $1</code>. What should you test?
+  </p>
+  <p class="a">
+    Test a type-correct half-open predicate directly on <code>occurred_at</code>. The expression may
+    prevent bounds from proving which partitions are impossible. Confirm pruning with EXPLAIN and
+    keep semantics such as time zone explicit.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    7. Requested checkpoints greatly outnumber timed checkpoints. What does it suggest?
+  </p>
+  <p class="a">
+    Checkpoints are being requested before the normal timeout, commonly because WAL reaches its soft
+    size threshold or explicit requests occur. Compare WAL generation, <code>max_wal_size</code>,
+    checkpoint write/sync time, storage headroom and recovery requirements.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">8. Why might raising a skewed column's statistics target help?</p>
+  <p class="a">
+    It can enlarge the sample, common-value list and histogram, improving selectivity and row
+    estimates. Verify the estimate error first, target only useful columns, run ANALYZE and compare
+    plans plus analysis overhead.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    9. How can a default partition make attaching the next monthly partition disruptive?
+  </p>
+  <p class="a">
+    PostgreSQL may scan the default partition under an ACCESS EXCLUSIVE lock to verify it contains
+    no rows for the new range. Keep the default small and add a constraint proving it excludes the
+    new bound before attachment.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    10. Why is <code>pg_stat_statements</code> mean time insufficient for tail latency?
+  </p>
+  <p class="a">
+    It aggregates executions and does not preserve each occurrence. Variability, skew, locks and
+    rare plans can hide behind the mean. Combine standard deviation with traces, slow logs and
+    representative plans.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">24.</span> Interview Q&amp;A</h2>
+<div class="qa">
+  <p class="q">Q: How do you approach PostgreSQL performance tuning?</p>
+  <p class="a">
+    I define the user impact and baseline, compare demand with latency and throughput, classify
+    execution versus waits, rank statement demand, inspect a representative plan, change one root
+    cause, and validate under realistic concurrency with rollback and guardrails.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is the difference between shared_buffers and effective_cache_size?</p>
+  <p class="a">
+    <code>shared_buffers</code> allocates PostgreSQL's shared block cache at startup.
+    <code>effective_cache_size</code> allocates nothing; it tells the planner how much shared plus
+    OS cache it can reasonably expect for cost estimation.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can work_mem cause an out-of-memory event?</p>
+  <p class="a">
+    It is a base allowance per sort, hash and similar operation. Multiple nodes, parallel workers
+    and concurrent sessions multiply it, while hashes can use <code>hash_mem_multiplier</code>.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why not set max_connections very high?</p>
+  <p class="a">
+    PostgreSQL uses a process per connection and sizes some shared resources from the limit. Too
+    many active backends multiply memory and scheduling contention. A bounded pool keeps server
+    concurrency near measured capacity while allowing more clients to wait safely.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Session versus transaction pooling?</p>
+  <p class="a">
+    Session pooling assigns a server connection until client disconnect and preserves normal session
+    semantics. Transaction pooling releases it at transaction end for greater multiplexing, but
+    state that must survive across transactions is unsafe unless explicitly supported.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does a PostgreSQL wait event tell you?</p>
+  <p class="a">
+    It tells what a backend is waiting on at that observation instant. Interpret it with state,
+    duration, query, transaction, blocker and workload impact. A normal idle backend also waits, so
+    the existence of an event is not itself a problem.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you use pg_stat_statements?</p>
+  <p class="a">
+    I record the measurement window and rank normalized statement families by total execution time,
+    then inspect calls, mean, variability, rows, blocks, temporary I/O and WAL. I connect a query ID
+    to traces or logs and obtain a safe representative plan.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is partition pruning?</p>
+  <p class="a">
+    The planner or executor proves from partition bounds and query predicates that some partitions
+    cannot contain matching rows, so those child plans are omitted. Indexes are separate and help
+    selective access inside partitions.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: When does table partitioning improve performance?</p>
+  <p class="a">
+    When common predicates prune to a small subset, indexes become more local, or operations can
+    manage complete slices through attach, detach or drop. It can hurt broad queries and planning
+    when too many partitions remain.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is your safest method for changing a planner cost?</p>
+  <p class="a">
+    First correct statistics and access paths. If hardware behavior still differs consistently, test
+    a session-scoped value across a representative query suite and concurrency, record plans and
+    resource metrics, then canary with a rollback rather than forcing one preferred plan.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">25.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Goal:</strong> meet latency, throughput, correctness, durability and cost targets.
+  </li>
+  <li><strong>Method:</strong> baseline, constrain, hypothesize, one change, compare, monitor.</li>
+  <li><strong>Latency:</strong> use p50/p95/p99; averages hide tails.</li>
+  <li><strong>Queueing:</strong> flat throughput plus rising latency/concurrency is a warning.</li>
+  <li><strong>shared_buffers:</strong> PostgreSQL block cache; leave room for OS and processes.</li>
+  <li><strong>effective_cache_size:</strong> planner estimate only; allocates no memory.</li>
+  <li><strong>work_mem:</strong> per operation, multiplied by nodes/workers/sessions.</li>
+  <li>
+    <strong>maintenance_work_mem:</strong> maintenance budget; account for worker concurrency.
+  </li>
+  <li><strong>huge pages:</strong> verify <code>huge_pages_status</code> after startup.</li>
+  <li><strong>I/O costs:</strong> relative planner units, not device milliseconds.</li>
+  <li><strong>Statistics:</strong> fix stale/skew/correlation estimates before forcing plans.</li>
+  <li><strong>Checkpoints:</strong> compare timed/requested, WAL rate and write/sync time.</li>
+  <li>
+    <strong>Connections:</strong> process per client; active concurrency is the expensive part.
+  </li>
+  <li><strong>Pooling:</strong> bound server connections; monitor pool wait and queue.</li>
+  <li><strong>PgBouncer:</strong> transaction mode forbids relying on persistent session state.</li>
+  <li><strong>Activity:</strong> combine state, wait event, query age and transaction age.</li>
+  <li>
+    <strong>Locks:</strong> use <code>pg_blocking_pids()</code> plus activity and lock detail.
+  </li>
+  <li><strong>Counters:</strong> calculate deltas/rates and preserve <code>stats_reset</code>.</li>
+  <li><strong>pg_stat_statements:</strong> total time, calls, mean, variability, I/O and WAL.</li>
+  <li><strong>Logging:</strong> threshold/sample safely; protect parameter data.</li>
+  <li><strong>Partitioning:</strong> require aligned pruning or lifecycle benefit.</li>
+  <li><strong>Pruning:</strong> driven by bounds, not indexes; can happen during execution.</li>
+  <li><strong>Default partition:</strong> monitor it and constrain it before new attachments.</li>
+  <li>
+    <strong>Capacity:</strong> test future size, peak mix, maintenance and degraded operation.
+  </li>
+  <li>
+    <strong>Rollout:</strong> effective setting, canary, guardrails, stop condition and rollback.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">26.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-resource.html"
+      >Resource consumption, memory, huge pages and I/O concurrency</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-query.html"
+      >Planner cost constants, effective cache size and statistics target</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/planner-stats.html"
+      >Statistics used by the planner</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-wal.html"
+      >WAL and checkpoint configuration</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-connection.html"
+      >Connection limits and reserved connection slots</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/app-postgres.html"
+      >PostgreSQL server process and connection handling</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/monitoring-stats.html"
+      >Activity, waits and cumulative statistics views</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/view-pg-locks.html">pg_locks view</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-info.html"
+      >Session information and pg_blocking_pids</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/pgstatstatements.html"
+      >pg_stat_statements setup, metrics and query identifiers</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-logging.html"
+      >Statement duration, sampling and log configuration</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/auto-explain.html"
+      >auto_explain configuration and overhead</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-partitioning.html"
+      >Declarative partitioning, pruning, indexes and maintenance</a
+    >
+  </li>
+  <li>
+    <a href="https://www.pgbouncer.org/config.html">Official PgBouncer configuration</a>
+  </li>
+  <li>
+    <a href="https://www.pgbouncer.org/features.html"
+      >Official PgBouncer pooling-mode feature map</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
