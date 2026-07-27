@@ -36,8 +36,8 @@
           "path": "postgresql/locking-concurrency"
         },
         {
-          "title": "Extensions and Specialized Features",
-          "path": "postgresql/extensions-specialized-features"
+          "title": "Performance Tuning and Operations",
+          "path": "postgresql/performance-tuning-operations"
         }
       ]
     }
