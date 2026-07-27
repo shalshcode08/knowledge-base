@@ -1,34 +1,104 @@
-## These file will include the topics that are needed to be added in docs.
+# Spring and Spring Boot Topics
 
-Topic 1 — SQL fundamentals (solid, not shaky)
-SELECT/INSERT/UPDATE/DELETE, all join types (inner, left, right, full, cross), GROUP BY/HAVING, aggregates, subqueries, DISTINCT. You probably have most of this — the goal here is no gaps, because everything above stands on it. Add UPSERT (INSERT ... ON CONFLICT) since it's Postgres-specific and heavily used.
+These topics are the next documentation category after Java and PostgreSQL. Each topic must be covered in depth, written in easy language, include practical examples, production considerations, common mistakes, and interview questions.
 
-Topic 2 — Advanced querying
-CTEs (WITH), recursive CTEs, window functions (ROW_NUMBER, RANK, LAG/LEAD, running totals), DISTINCT ON, lateral joins, CASE expressions. Window functions are the highest-ROI item here — underused and instantly impressive in interviews.
+## Daily schedule
 
-Topic 3 — Schema design & data modeling
-Normalization (1NF → 3NF) and when to deliberately denormalize, primary/foreign keys, constraints (CHECK, UNIQUE, NOT NULL), data types that matter (UUID, TIMESTAMPTZ vs TIMESTAMP, NUMERIC vs FLOAT, arrays, ENUM), and JSONB — when to use a column vs JSONB, and how to index inside it.
+- Day 1: Topics 1 to 4
+- Day 2: Topics 5 to 8
+- Day 3: Topics 9 to 12
 
-Topic 4 — Indexing (the big one)
-B-tree vs Hash vs GIN vs GiST vs BRIN, composite indexes and column order, partial indexes, covering indexes (INCLUDE), expression indexes. Critically: why an index gets ignored. This is where you go from "knows SQL" to "makes queries fast."
+Four topics must be completed each day. Every topic must use its own `codex/{feature-name}` branch and its own pull request. Do not combine multiple topics into one pull request.
 
-Topic 5 — EXPLAIN ANALYZE & query optimization
-Reading query plans, seq scan vs index scan vs bitmap scan, nested loop vs hash vs merge joins, spotting the difference between estimated and actual rows, work_mem effects. Pair this with Topic 4 — indexing without reading plans is guessing. This is the skill that pays off daily.
+## Day 1
 
-Topic 6 — Transactions, MVCC & isolation
-BEGIN/COMMIT/ROLLBACK, savepoints, the four isolation levels and the anomalies each prevents (dirty/non-repeatable/phantom reads), and Postgres's MVCC model — row versions, xmin/xmax. This connects straight to the MVCC/snapshot ideas from your OOP gotchas, so it'll land fast.
+### Topic 1 - Spring Core fundamentals
 
-Topic 7 — Locking & concurrency
-Row vs table locks, SELECT ... FOR UPDATE, FOR SHARE, deadlock detection, advisory locks, and SKIP LOCKED (how you build a reliable job queue on plain Postgres — a genuinely impressive thing to know).
+Status: Pending
 
-Topic 8 — Postgres internals: VACUUM, WAL, bloat
-Why UPDATE is really insert-plus-mark-dead, dead tuples, table/index bloat, VACUUM/autovacuum, and the write-ahead log (durability + crash recovery). This is where "uses Postgres" becomes "understands Postgres." Ties directly to the WAL concept from the distributed-systems projects.
+Cover the purpose of Spring, inversion of control, dependency injection, the IoC container, `ApplicationContext`, bean definitions, component scanning, constructor injection, bean scopes, bean lifecycle, lazy initialization, `@Primary`, `@Qualifier`, configuration classes, Java-based configuration, and circular dependency problems. Explain why constructor injection is preferred and include common interview questions.
 
-Topic 9 — Performance tuning & operations
-shared_buffers, work_mem, effective_cache_size, the connection model (process-per-connection) and why connection pooling / PgBouncer matters, pg_stat_statements to find slow queries, table partitioning for large tables.
+### Topic 2 - Spring Boot fundamentals
 
-Topic 10 — Replication & scaling
-Streaming replication, read replicas, replication lag, logical replication, and high-level HA/failover. This is the "scale it in production" tier.
+Status: Pending
 
-Topic 11 — Extensions & specialized features
-pg_trgm (fuzzy search), PostGIS (geospatial), full-text search (tsvector/tsquery), pgvector (embeddings — increasingly relevant). Pick based on what your work actually needs.
+Cover the purpose of Spring Boot, project structure, starters, dependency management, auto-configuration, conditional configuration, `SpringApplication`, embedded servers, configuration files, profiles, configuration precedence, `@ConfigurationProperties`, environment variables, startup lifecycle, application runners, DevTools, executable JAR files, and the differences between Spring Framework and Spring Boot.
+
+### Topic 3 - Spring MVC and REST APIs
+
+Status: Pending
+
+Cover the servlet request lifecycle, `DispatcherServlet`, controllers, request mappings, path variables, request parameters, headers, request and response bodies, DTOs, JSON serialization, validation, custom validators, global exception handling, `ProblemDetail`, response status codes, content negotiation, file upload and download, pagination, API versioning, idempotency, CORS, and production-quality REST API design.
+
+### Topic 4 - Spring JDBC and database access
+
+Status: Pending
+
+Cover JDBC problems solved by Spring, `DataSource`, connection pooling, HikariCP, `JdbcTemplate`, `NamedParameterJdbcTemplate`, row mappers, batch operations, generated keys, exception translation, transaction boundaries, PostgreSQL integration, query safety, resource management, testing database code, performance considerations, and when JDBC is preferable to an ORM.
+
+## Day 2
+
+### Topic 5 - JPA and Hibernate fundamentals
+
+Status: Pending
+
+Cover ORM concepts, JPA versus Hibernate, entities, identifiers, entity lifecycle states, persistence context, dirty checking, flushing, first-level cache, mappings, value types, relationships, owning sides, cascading, orphan removal, inheritance strategies, optimistic locking, pessimistic locking, JPQL, Criteria API, native SQL, and the differences between `persist`, `merge`, and `save`.
+
+### Topic 6 - Spring Data JPA
+
+Status: Pending
+
+Cover repository abstractions, repository interfaces, derived query methods, JPQL queries, native queries, named queries, projections, specifications, Query by Example, pagination, sorting, auditing, custom repositories, bulk updates, entity graphs, transactionality, locking, PostgreSQL-specific queries, and when repository abstractions should not be used.
+
+### Topic 7 - Transaction management
+
+Status: Pending
+
+Cover local transactions, Spring transaction abstractions, `@Transactional`, proxy-based behavior, propagation modes, isolation levels, read-only transactions, rollback rules, checked versus unchecked exceptions, self-invocation problems, transaction boundaries, nested transactions, savepoints, locking interactions, long-running transaction problems, connection pool effects, testing transactions, and patterns for external side effects.
+
+### Topic 8 - Spring Security
+
+Status: Pending
+
+Cover the security filter chain, authentication, authorization, `SecurityContext`, password storage, sessions, stateless security, JWT access and refresh tokens, method security, role and authority modeling, CSRF, CORS, OAuth 2.0, OpenID Connect, resource servers, login flows, logout, security headers, exception handling, testing security, common vulnerabilities, and production security practices.
+
+## Day 3
+
+### Topic 9 - Testing Spring applications
+
+Status: Pending
+
+Cover the testing pyramid, JUnit, Mockito, unit tests, slice tests, `@SpringBootTest`, context caching, MockMvc, WebTestClient, repository tests, transaction behavior in tests, Testcontainers with PostgreSQL, dynamic properties, security tests, integration tests, contract tests, fixture design, test isolation, avoiding brittle tests, and choosing the smallest useful Spring test context.
+
+### Topic 10 - Caching, scheduling, async processing, and events
+
+Status: Pending
+
+Cover Spring Cache, cache abstraction, cache keys, invalidation, TTL considerations, Redis integration, cache stampedes, `@Scheduled`, task scheduling, `@Async`, executors, thread pools, exception handling, application events, transactional events, domain events, retry patterns, idempotency, and when to move work to a durable message broker.
+
+### Topic 11 - Observability and production operations
+
+Status: Pending
+
+Cover Spring Boot Actuator, health indicators, readiness and liveness, metrics, Micrometer, logs, structured logging, correlation IDs, distributed tracing, configuration and secret management, graceful shutdown, startup probes, connection pool monitoring, thread dumps, heap diagnostics, error reporting, deployment concerns, containerization, and practical production troubleshooting.
+
+### Topic 12 - Spring internals and interview preparation
+
+Status: Pending
+
+Cover bean creation phases, bean post-processors, dependency resolution, proxies, JDK proxies versus CGLIB, AOP terminology, advice and pointcuts, annotation processing, auto-configuration internals, conditional annotations, startup events, circular references, `@Transactional` and `@Async` proxy limitations, common Spring Boot failure scenarios, debugging techniques, system-design connections, and comprehensive interview questions with answers.
+
+## Completion rules
+
+For each topic:
+
+1. Refresh the repository from `main` before starting.
+2. Create a new branch named `codex/{feature-name}`.
+3. Add only one topic in the pull request.
+4. Follow the existing application design without changing styling.
+5. Update the manifest and navigation for the new note.
+6. Write complete notes so the reader does not need another source for the topic.
+7. Run all defined tests without editing the tests.
+8. Verify the Git author and GitHub account required by `AGENTS.md`.
+9. Open a correctly named pull request.
+10. Change the topic status from `Pending` to `Completed` only after its pull request is merged.
