@@ -36,8 +36,8 @@
           "path": "postgresql/locking-concurrency"
         },
         {
-          "title": "PostgreSQL Internals: VACUUM, WAL and Bloat",
-          "path": "postgresql/vacuum-wal-bloat"
+          "title": "Performance Tuning and Operations",
+          "path": "postgresql/performance-tuning-operations"
         }
       ]
     }
