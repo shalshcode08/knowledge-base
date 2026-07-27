@@ -57,6 +57,10 @@
       "name": "Spring",
       "pages": [
         {
+          "title": "Spring Core Fundamentals",
+          "path": "spring/spring-core-fundamentals"
+        },
+        {
           "title": "Spring Boot Fundamentals",
           "path": "spring/spring-boot-fundamentals"
         },
