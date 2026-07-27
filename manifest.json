@@ -52,6 +52,15 @@
           "path": "postgresql/extensions-specialized-features"
         }
       ]
+    },
+    {
+      "name": "Spring",
+      "pages": [
+        {
+          "title": "Spring Core Fundamentals",
+          "path": "spring/spring-core-fundamentals"
+        }
+      ]
     }
   ]
 }
