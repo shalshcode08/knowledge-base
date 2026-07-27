@@ -1,0 +1,1673 @@
+<h1>PostgreSQL Extensions &amp; Specialized Features - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth, practical and interview-focused guide to the PostgreSQL extension lifecycle, trigram
+  fuzzy matching, full-text search, PostGIS spatial queries, and pgvector similarity search.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The specialized-feature mental model</h2>
+<p class="lead">
+  PostgreSQL is more than a fixed set of SQL features. Its extension system can install a coherent
+  package of types, functions, operators, casts, and index support into one database, while built-in
+  subsystems such as full-text search use the same extensible ideas.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of PostgreSQL as a workshop with a stable electrical system. An extension is not a loose
+    bag of tools left on the floor. It is a labeled machine whose parts, version, dependencies, and
+    removal are recorded by the database. <code>pg_trgm</code>, PostGIS, and pgvector install
+    different machines. Full-text search is already wired into the workshop, but you configure its
+    language pipeline for each job.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Starting feature</th>
+        <th>What it understands</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Misspellings, partial names, <code>LIKE</code>, or <code>ILIKE</code></td>
+        <td><code>pg_trgm</code></td>
+        <td>Shared three-character groups</td>
+      </tr>
+      <tr>
+        <td>Words, language normalization, phrases, relevance, and snippets</td>
+        <td>Full-text search</td>
+        <td>Parsed and normalized lexemes with positions</td>
+      </tr>
+      <tr>
+        <td>Points, lines, polygons, containment, intersection, or earth distance</td>
+        <td>PostGIS</td>
+        <td>Coordinate systems and spatial relationships</td>
+      </tr>
+      <tr>
+        <td>Semantic similarity between embeddings</td>
+        <td>pgvector</td>
+        <td>Distance between numeric vectors</td>
+      </tr>
+      <tr>
+        <td>Exact identifier, status, date, or number filtering</td>
+        <td>Ordinary PostgreSQL</td>
+        <td>Relational values and B-tree ordering</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Specialized retrieval still begins with relational correctness</strong>
+  <p>
+    Define tenant boundaries, authorization, lifecycle state, joins, and exact filters first. Then
+    use a specialized operator to produce or rank candidates. A vector, trigram, spatial, or
+    full-text index accelerates supported operators; it does not repair missing access control,
+    mismatched units, a wrong language configuration, or an incorrect distance metric.
+  </p>
+</div>
+
+<h2 id="extension-model"><span class="num">01.</span> What an extension is</h2>
+<p class="lead">
+  An extension is a database-level package whose member objects and installed version PostgreSQL
+  tracks as one logical unit.
+</p>
+
+<p>
+  The server installation supplies an extension control file, SQL installation and update scripts,
+  and sometimes a native shared library. <code>CREATE EXTENSION</code> runs the appropriate script
+  in the current database and records every member object. A package can contain types, functions,
+  operators, operator classes, casts, views, tables, text-search objects, and more.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>State</th>
+        <th>Where it exists</th>
+        <th>How to inspect it</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Package files are available</td>
+        <td>Database server host or managed-service image</td>
+        <td><code>pg_available_extensions</code></td>
+      </tr>
+      <tr>
+        <td>A particular version is available</td>
+        <td>Server extension directory</td>
+        <td><code>pg_available_extension_versions</code></td>
+      </tr>
+      <tr>
+        <td>Extension is installed</td>
+        <td>One specific database</td>
+        <td><code>pg_extension</code> or <code>\dx</code> in psql</td>
+      </tr>
+      <tr>
+        <td>Extension objects are usable</td>
+        <td>Schemas inside that database</td>
+        <td>Catalogs, <code>\dx+</code>, and object descriptions</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Inventory before installation</b></figcaption>
+  <pre><code>SELECT name, default_version, installed_version, comment
+FROM pg_available_extensions
+WHERE name IN ('pg_trgm', 'postgis', 'vector')
+ORDER BY name;
+
+SELECT name, version, installed, superuser, trusted, relocatable, schema
+FROM pg_available_extension_versions
+WHERE name = 'pg_trgm'
+ORDER BY version;
+
+SELECT e.extname, e.extversion, n.nspname AS target_schema, r.rolname AS owner
+FROM pg_extension AS e
+JOIN pg_namespace AS n ON n.oid = e.extnamespace
+JOIN pg_roles AS r ON r.oid = e.extowner
+ORDER BY e.extname;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Available is not installed</strong>
+  <p>
+    Installing an operating-system package, adding an extension to a container image, or enabling it
+    in a cloud control plane only makes its files available to the server. Run
+    <code>CREATE EXTENSION</code> separately in every database that needs its SQL objects.
+    Conversely, a logical dump can request an extension that the destination server does not have,
+    so restore preparation must include compatible package files.
+  </p>
+</div>
+
+<h2 id="extension-lifecycle"><span class="num">02.</span> Create, update, move, and drop</h2>
+<p class="lead">
+  Treat an extension version as application infrastructure: discover it, install deliberately,
+  validate it, upgrade through supported paths, and remove it only after inspecting dependents.
+</p>
+
+<figure class="code">
+  <figcaption><b>Core lifecycle commands</b></figcaption>
+  <pre><code>CREATE SCHEMA extensions;
+REVOKE CREATE ON SCHEMA extensions FROM PUBLIC;
+
+CREATE EXTENSION pg_trgm
+  WITH SCHEMA extensions
+  VERSION '1.6';
+
+ALTER EXTENSION pg_trgm UPDATE;
+ALTER EXTENSION pg_trgm UPDATE TO '1.6';
+
+-- Only succeeds when the extension declares itself relocatable.
+ALTER EXTENSION pg_trgm SET SCHEMA extensions;
+
+DROP EXTENSION pg_trgm;
+-- CASCADE also drops objects outside the extension that depend on its members.
+DROP EXTENSION pg_trgm CASCADE;</code></pre>
+</figure>
+
+<p>
+  <code>IF NOT EXISTS</code> prevents a duplicate-name error, but it does not prove that the
+  installed package has the desired version, schema, ownership, or definition. Migration tooling
+  should query and assert the resulting state. <code>CREATE EXTENSION ... CASCADE</code> may install
+  missing prerequisite extensions recursively at their default versions, which is convenient but
+  less explicit than a reviewed dependency plan.
+</p>
+
+<ol class="clean">
+  <li>Verify the exact package and versions available on every environment.</li>
+  <li>Create a secure target schema when the package permits schema selection.</li>
+  <li>Install with an explicit version when reproducibility matters.</li>
+  <li>Grant only the application privileges needed on the installed objects.</li>
+  <li>Record and test a supported update path before changing server packages.</li>
+  <li>Run the update in a maintenance window appropriate to its locks and data rewrites.</li>
+  <li>Validate the version, dependent objects, plans, and application behavior afterward.</li>
+</ol>
+
+<div class="warn">
+  <strong>Do not hand-edit extension members</strong>
+  <p>
+    PostgreSQL normally prevents dropping one member object independently. It may allow some
+    definition changes, but <code>pg_dump</code> represents the package mainly as
+    <code>CREATE EXTENSION</code>, not as independent definitions for every member. A local patch
+    can therefore disappear on restore or be overwritten by an update. Fix the package or use a
+    proper extension update script.
+  </p>
+</div>
+
+<h3 id="extension-dependencies">Dependencies, dump, and restore</h3>
+<p>
+  Objects that use an extension type or function depend on that member. Dropping without
+  <code>CASCADE</code> reports blockers. Dropping with <code>CASCADE</code> can remove application
+  columns, indexes, views, or functions, so read the dependency report rather than adding
+  <code>CASCADE</code> reflexively. A dump normally emits extension creation plus application
+  objects; the destination needs compatible extension files before restore.
+</p>
+
+<figure class="code">
+  <figcaption><b>Inspect member objects and dependencies</b></figcaption>
+  <pre><code>SELECT pg_describe_object(classid, objid, objsubid) AS member
+FROM pg_depend
+WHERE refclassid = 'pg_extension'::regclass
+  AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'vector')
+  AND deptype = 'e'
+ORDER BY 1;
+
+-- Ask PostgreSQL to report dependents safely. Run in a transaction and roll back.
+BEGIN;
+DROP EXTENSION vector;
+ROLLBACK;</code></pre>
+</figure>
+
+<h2 id="extension-security"><span class="num">03.</span> Privileges and extension security</h2>
+<p class="lead">
+  Installing code into the database is a supply-chain and privilege decision, not only a SQL
+  convenience.
+</p>
+
+<p>
+  Normally, the installer needs the privileges required by every command in the installation script,
+  which often means superuser. A control file can mark an extension as trusted. Then a non-superuser
+  with <code>CREATE</code> on the database may install it even when its script needs elevated
+  execution. Trusted describes an explicitly authored installation model; it does not mean every
+  extension from any source is safe.
+</p>
+
+<ul class="clean">
+  <li>Use packages from a reviewed source and pin artifacts or image versions.</li>
+  <li>
+    Review release notes, update scripts, native-code provenance, and supported PostgreSQL versions.
+  </li>
+  <li>Install into a schema where untrusted roles cannot create objects.</li>
+  <li>Do not put writable schemas before trusted schemas in privileged users' search paths.</li>
+  <li>Schema-qualify privileged function and operator references when practical.</li>
+  <li>Separate the migration owner from the runtime application role.</li>
+  <li>
+    Grant runtime roles only <code>USAGE</code>, <code>EXECUTE</code>, and table rights they need.
+  </li>
+  <li>Remember that native extensions run inside the database server process.</li>
+</ul>
+
+<div class="warn">
+  <strong>Target-schema attacks matter during installation</strong>
+  <p>
+    A carelessly written elevated installation or update script can resolve an unqualified name to a
+    hostile object placed earlier in <code>search_path</code>. Keep untrusted
+    <code>CREATE</code> privilege away from installation and dependency schemas. The same principle
+    applies to <code>SECURITY DEFINER</code> functions supplied by an extension.
+  </p>
+</div>
+
+<h2 id="pg-trgm"><span class="num">04.</span> pg_trgm and trigram thinking</h2>
+<p class="lead">
+  <code>pg_trgm</code> compares text by the three-character groups it contains, making it useful for
+  fuzzy spelling, partial strings, and indexed pattern matching.
+</p>
+
+<p>
+  PostgreSQL pads each word and extracts trigrams after ignoring non-word characters. Strings that
+  share many trigrams receive a higher score. This is character similarity, not linguistic meaning:
+  <code>automobile</code> and <code>car</code> are conceptually related but share few characters.
+</p>
+
+<figure class="code">
+  <figcaption><b>Enable and inspect trigram behavior</b></figcaption>
+  <pre><code>CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+SELECT show_trgm('PostgreSQL');
+SELECT similarity('postgres', 'postgress');          -- whole strings
+SELECT word_similarity('post', 'PostgreSQL guide'); -- best continuous extent
+SELECT strict_word_similarity('post', 'Post guide');</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Meaning</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>similarity(a, b)</code></td>
+        <td>Whole-string score from 0 to 1</td>
+        <td>Compare two names</td>
+      </tr>
+      <tr>
+        <td><code>a % b</code></td>
+        <td>Similarity exceeds session threshold</td>
+        <td>Indexed fuzzy candidate filter</td>
+      </tr>
+      <tr>
+        <td><code>a &lt;-&gt; b</code></td>
+        <td>Distance equal to 1 minus similarity</td>
+        <td>Nearest-neighbor ordering with GiST</td>
+      </tr>
+      <tr>
+        <td><code>a &lt;% b</code></td>
+        <td>Word similarity exceeds its threshold</td>
+        <td>Short query within longer text</td>
+      </tr>
+      <tr>
+        <td><code>a &lt;&lt;% b</code></td>
+        <td>Strict whole-word similarity exceeds threshold</td>
+        <td>Typo-tolerant word search</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="trigram-indexes">GIN, GiST, and indexed patterns</h3>
+<figure class="code">
+  <figcaption><b>Two trigram index strategies</b></figcaption>
+  <pre><code>CREATE INDEX customers_name_trgm_gin
+ON customers USING gin (full_name gin_trgm_ops);
+
+CREATE INDEX products_name_trgm_gist
+ON products USING gist (name gist_trgm_ops(siglen=32));
+
+SELECT customer_id, full_name, similarity(full_name, 'jon smth') AS score
+FROM customers
+WHERE full_name % 'jon smth'
+ORDER BY score DESC, customer_id
+LIMIT 20;
+
+SELECT product_id, name, name &lt;-&gt; 'wireles hedphones' AS distance
+FROM products
+ORDER BY name &lt;-&gt; 'wireles hedphones', product_id
+LIMIT 10;
+
+SELECT product_id, name
+FROM products
+WHERE name ILIKE '%headphone%';</code></pre>
+</figure>
+
+<p>
+  Both trigram operator classes support similarity and can accelerate <code>LIKE</code>,
+  <code>ILIKE</code>, regular-expression, and equality searches when the pattern yields usable
+  trigrams. GIN is commonly strong for filtering many matches. GiST supports distance-ordered
+  nearest-neighbor queries, and its signature length trades index precision against index size.
+  Always compare on representative data and the exact query shape.
+</p>
+
+<ul class="clean">
+  <li>A pattern with no extractable trigram can degenerate into scanning many index entries.</li>
+  <li>Very short queries have little trigram evidence and often produce weak selectivity.</li>
+  <li>Leading-wildcard patterns can benefit, unlike an ordinary B-tree prefix search.</li>
+  <li>Expression indexes must match the query expression, such as <code>lower(name)</code>.</li>
+  <li>GIN and GiST add write, WAL, cache, vacuum, and storage costs.</li>
+  <li>Use a deterministic tie-breaker after a similarity or distance expression.</li>
+</ul>
+
+<h3 id="trigram-tuning">Thresholds and a robust fuzzy-search pattern</h3>
+<figure class="code">
+  <figcaption><b>Scope thresholds to one transaction</b></figcaption>
+  <pre><code>BEGIN;
+SET LOCAL pg_trgm.similarity_threshold = 0.42;
+
+SELECT id, display_name, similarity(display_name, $1) AS score
+FROM people
+WHERE display_name % $1
+ORDER BY score DESC, id
+LIMIT 25;
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  Lower thresholds improve recall but produce more candidates and false positives. Higher thresholds
+  improve precision but miss more variations. Tune using labeled examples from the real language and
+  name distribution. Do not change a global threshold casually, because the same operator can then
+  mean something different across requests. A useful application often combines exact normalized
+  equality, prefix matching, and fuzzy fallback in that priority order.
+</p>
+
+<h2 id="fts-pipeline"><span class="num">05.</span> Full-text search pipeline</h2>
+<p class="lead">
+  PostgreSQL full-text search turns documents and queries into the same normalized lexeme language,
+  then matches those representations.
+</p>
+
+<ol class="clean">
+  <li>A parser splits input into token types such as words, numbers, URLs, and spaces.</li>
+  <li>A text-search configuration maps each token type to an ordered dictionary list.</li>
+  <li>
+    The first dictionary that recognizes a token emits normalized lexemes or removes a stop word.
+  </li>
+  <li><code>to_tsvector</code> stores sorted lexemes, positions, and optional weights.</li>
+  <li>A query constructor produces a normalized <code>tsquery</code>.</li>
+  <li>The <code>@@</code> operator tests the document vector against the query.</li>
+  <li>Ranking and highlighting use the matched query plus vector or original text.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>See parsing and dictionary effects</b></figcaption>
+  <pre><code>SELECT alias, description, token
+FROM ts_debug('english', 'Running PostgreSQL databases in 2026');
+
+SELECT to_tsvector(
+  'english',
+  'The striped cats were running past databases'
+);
+-- Stop words can disappear; cats can become cat; running can become run.</code></pre>
+</figure>
+
+<p>
+  A parser identifies token shape but does not decide vocabulary. Dictionaries normalize tokens,
+  recognize stop words, stem language forms, apply synonyms, or match thesaurus phrases. The
+  configuration connects parser output types to dictionary chains. Use the same explicit
+  configuration on both document and query sides. Relying on
+  <code>default_text_search_config</code> makes behavior environment-dependent.
+</p>
+
+<div class="note">
+  <strong>Full-text search is not substring search</strong>
+  <p>
+    It searches normalized tokens and lexemes. It is excellent for words, phrase order, and
+    relevance, but it does not naturally find an arbitrary character fragment inside a word. Use
+    <code>pg_trgm</code> for misspelled or partial tokens, and use full-text search for
+    language-aware documents.
+  </p>
+</div>
+
+<h2 id="fts-vectors"><span class="num">06.</span> Building tsvector documents</h2>
+<p class="lead">
+  A stored search vector makes the document pipeline explicit, reusable, and indexable.
+</p>
+
+<figure class="code">
+  <figcaption><b>Weighted generated search column</b></figcaption>
+  <pre><code>CREATE TABLE articles (
+    article_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title text NOT NULL,
+    summary text,
+    body text NOT NULL,
+    published_at timestamptz,
+    search_document tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(summary, '')), 'B') ||
+        setweight(to_tsvector('english', coalesce(body, '')), 'D')
+    ) STORED
+);
+
+CREATE INDEX articles_search_document_gin
+ON articles USING gin (search_document);</code></pre>
+</figure>
+
+<p>
+  Weights <code>A</code> through <code>D</code> label lexemes by importance; they do not filter by
+  themselves. Ranking functions can assign larger numeric weights to title matches than body
+  matches. <code>coalesce</code> is essential because one null input can otherwise turn a combined
+  document into null. A stored generated column stays synchronized without application discipline.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Storage design</th>
+        <th>Benefit</th>
+        <th>Cost or risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Expression GIN index</td>
+        <td>No extra visible vector column</td>
+        <td>Query expression must match; recomputed on writes</td>
+      </tr>
+      <tr>
+        <td>Stored generated <code>tsvector</code></td>
+        <td>Always synchronized and easy to query</td>
+        <td>Stored bytes and write-time computation</td>
+      </tr>
+      <tr>
+        <td>Trigger-maintained vector</td>
+        <td>Can support more custom logic</td>
+        <td>More moving parts and trigger-order concerns</td>
+      </tr>
+      <tr>
+        <td>Build vector during every read</td>
+        <td>Simple for tiny or rare workloads</td>
+        <td>Repeated CPU and usually no matching index</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="fts-queries"><span class="num">07.</span> Constructing safe tsquery values</h2>
+<p class="lead">
+  Choose a query constructor from the user experience instead of passing arbitrary user text into
+  strict query syntax.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Constructor</th>
+        <th>Input behavior</th>
+        <th>Use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>plainto_tsquery</code></td>
+        <td>Normalizes words and joins survivors with AND</td>
+        <td>Simple search box</td>
+      </tr>
+      <tr>
+        <td><code>phraseto_tsquery</code></td>
+        <td>Preserves lexeme order and stop-word gaps</td>
+        <td>Phrase search</td>
+      </tr>
+      <tr>
+        <td><code>websearch_to_tsquery</code></td>
+        <td>Accepts quoted phrases, OR, and minus syntax; never raises a syntax error</td>
+        <td>Web-style user input</td>
+      </tr>
+      <tr>
+        <td><code>to_tsquery</code></td>
+        <td>Requires explicit query operators and supports prefix labels</td>
+        <td>Trusted advanced syntax built by code</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Boolean, phrase, prefix, and weight semantics</b></figcaption>
+  <pre><code>SELECT to_tsquery('english', 'database &amp; (index | indexing) &amp; !mysql');
+SELECT phraseto_tsquery('english', 'query optimization');
+SELECT websearch_to_tsquery('english', '"query plan" OR optimizer -mysql');
+SELECT to_tsquery('english', 'postgr:*');
+SELECT to_tsquery('english', 'postgres:AB');
+
+-- Core operators inside a tsquery:
+-- &amp; means AND, | means OR, ! means NOT.
+-- &lt;-&gt; means immediately followed by.
+-- &lt;3&gt; means positions differ by exactly three.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Parameterization and query parsing solve different problems</strong>
+  <p>
+    Bind raw user input as a SQL parameter to prevent SQL injection. Also choose a tolerant query
+    constructor so punctuation does not become invalid <code>tsquery</code> syntax.
+    <code>to_tsquery</code> is appropriate when trusted code deliberately constructs its operator
+    grammar, not as the default parser for an open search box.
+  </p>
+</div>
+
+<h2 id="fts-ranking"><span class="num">08.</span> Matching, ranking, and highlighting</h2>
+<figure class="code">
+  <figcaption><b>Search once, rank, and create a snippet</b></figcaption>
+  <pre><code>WITH input AS (
+    SELECT websearch_to_tsquery('english', $1) AS query
+)
+SELECT
+    a.article_id,
+    a.title,
+    ts_rank_cd(
+      ARRAY[0.05, 0.1, 0.4, 1.0]::real[],
+      a.search_document,
+      input.query,
+      32
+    ) AS rank,
+    ts_headline(
+      'english',
+      a.body,
+      input.query,
+      'StartSel=&lt;mark&gt;, StopSel=&lt;/mark&gt;, MaxFragments=2, MaxWords=24'
+    ) AS snippet
+FROM articles AS a
+CROSS JOIN input
+WHERE a.search_document @@ input.query
+  AND a.published_at IS NOT NULL
+ORDER BY rank DESC, a.published_at DESC, a.article_id
+LIMIT 20;</code></pre>
+</figure>
+
+<p>
+  <code>ts_rank</code> scores frequency and weights. <code>ts_rank_cd</code> uses cover density and
+  therefore needs positional information to reward close groups of matches. Normalization flags
+  adjust scores for factors such as document length; they do not make the score a probability. Use
+  rank to order matches, not as a universal relevance number comparable across unrelated queries.
+</p>
+
+<ul class="clean">
+  <li>Put <code>@@</code> in <code>WHERE</code> so the GIN index can find candidates.</li>
+  <li>Rank the candidate set, not every row in the table.</li>
+  <li>Add business signals carefully, such as freshness or popularity, after text relevance.</li>
+  <li>Use deterministic tie-breakers for repeatable pagination.</li>
+  <li>Sanitize or safely render <code>ts_headline</code> output before placing it in HTML.</li>
+  <li>Limit source length or generate snippets only after selecting a bounded candidate set.</li>
+</ul>
+
+<h3 id="fts-indexes">GIN versus GiST for full-text search</h3>
+<p>
+  GIN is the preferred full-text index in most workloads because it stores lexemes as keys and
+  points to matching rows. GiST stores lossy signatures, can produce false matches that require
+  rechecking, and can use included columns for some covering designs. GIN updates can accumulate in
+  a pending list when fast update is enabled, so write bursts and cleanup still need monitoring.
+  Neither index stores relevance ordering, so PostgreSQL normally finds matches and then sorts by
+  rank.
+</p>
+
+<h2 id="fts-languages"><span class="num">09.</span> Language, dictionaries, and maintenance</h2>
+<p class="lead">
+  Text-search quality is a data-model choice. One configuration rarely fits every language, code
+  token, product identifier, and proper name.
+</p>
+
+<ul class="clean">
+  <li>Use <code>simple</code> when stemming is unwanted and exact normalized tokens matter.</li>
+  <li>Use a language configuration when its stemming and stop-word rules match the content.</li>
+  <li>Store or derive a document language and route each row to a deliberate configuration.</li>
+  <li>Test domain vocabulary, abbreviations, hyphenation, URLs, emails, and product codes.</li>
+  <li>
+    Use synonym, Ispell, Snowball, or thesaurus dictionaries only with versioned review and tests.
+  </li>
+  <li>Rebuild stored vectors and relevant indexes when configuration behavior changes.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Inspect configuration mappings</b></figcaption>
+  <pre><code>SELECT * FROM ts_token_type('default');
+SELECT * FROM ts_parse('default', 'Email admin@example.com about PostgreSQL 18');
+SELECT * FROM ts_debug('simple', 'Databases database DATABASE');
+SELECT get_current_ts_config();</code></pre>
+</figure>
+
+<h2 id="postgis-model"><span class="num">10.</span> PostGIS spatial mental model</h2>
+<p class="lead">
+  PostGIS adds spatial types and operators, but every correct query still depends on what the
+  coordinates mean.
+</p>
+
+<figure class="code">
+  <figcaption><b>Install and define constrained spatial columns</b></figcaption>
+  <pre><code>CREATE EXTENSION postgis;
+
+CREATE TABLE places (
+    place_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name text NOT NULL,
+    location geometry(Point, 4326) NOT NULL
+);
+
+CREATE TABLE service_areas (
+    area_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name text NOT NULL,
+    boundary geometry(MultiPolygon, 4326) NOT NULL
+);
+
+CREATE INDEX places_location_gist ON places USING gist (location);
+CREATE INDEX service_areas_boundary_gist ON service_areas USING gist (boundary);</code></pre>
+</figure>
+
+<p>
+  A geometry has a shape and an SRID, a spatial reference identifier. The SRID tells software which
+  coordinate reference system interprets the numbers. Longitude and latitude in WGS 84 commonly use
+  SRID 4326. Those coordinates are angular degrees, not flat meters. A projected coordinate system
+  can provide locally meaningful linear units.
+</p>
+
+<div class="warn">
+  <strong>ST_SetSRID labels; ST_Transform calculates</strong>
+  <p>
+    <code>ST_SetSRID</code> assigns metadata without changing coordinate numbers. Use it only when
+    the numbers already use that reference system and merely lack the label.
+    <code>ST_Transform</code> converts coordinates between reference systems. Relabeling the wrong
+    coordinates makes valid-looking but false spatial data.
+  </p>
+</div>
+
+<h3 id="geometry-geography">Geometry versus geography</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Model and units</th>
+        <th>Best fit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>geometry</code></td>
+        <td>Planar calculations in the SRID's coordinate units</td>
+        <td>Rich operations, local projected analysis, maps</td>
+      </tr>
+      <tr>
+        <td><code>geography</code></td>
+        <td>Geodetic earth model; distance and area commonly use meters</td>
+        <td>Global lon/lat data and earth-surface distance</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Geography makes common earth-distance questions easier but supports a smaller function set and can
+  cost more CPU. Geometry is not inaccurate by definition; it is accurate when the selected
+  projection fits the location and analysis. Choose from geographic extent, required operations,
+  accuracy, units, and workload, not from a rule that one type is always better.
+</p>
+
+<h2 id="postgis-queries"><span class="num">11.</span> Spatial predicates and distance queries</h2>
+<p class="lead">
+  Ask the topological relationship you mean, and use index-aware predicates to restrict candidates
+  before expensive exact calculations.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Function</th>
+        <th>Question</th>
+        <th>Boundary detail</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ST_Intersects(a, b)</code></td>
+        <td>Do they share any point?</td>
+        <td>Broad relationship, commonly index-aware</td>
+      </tr>
+      <tr>
+        <td><code>ST_Contains(a, b)</code></td>
+        <td>Is B inside A with interior overlap?</td>
+        <td>A point only on A's boundary is not contained</td>
+      </tr>
+      <tr>
+        <td><code>ST_Covers(a, b)</code></td>
+        <td>Is every point of B in A?</td>
+        <td>Includes boundary cases and is often easier operationally</td>
+      </tr>
+      <tr>
+        <td><code>ST_Within(a, b)</code></td>
+        <td>Is A within B?</td>
+        <td>Inverse orientation of contains</td>
+      </tr>
+      <tr>
+        <td><code>ST_DWithin(a, b, d)</code></td>
+        <td>Are they no farther apart than d?</td>
+        <td>Index-aware radius filter</td>
+      </tr>
+      <tr>
+        <td><code>ST_Distance(a, b)</code></td>
+        <td>What is their exact distance?</td>
+        <td>Calculation alone is not a selective radius predicate</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Point-in-polygon and radius search</b></figcaption>
+  <pre><code>-- Longitude is X; latitude is Y.
+WITH input AS (
+    SELECT ST_SetSRID(ST_MakePoint($1, $2), 4326) AS point
+)
+SELECT a.area_id, a.name
+FROM service_areas AS a
+CROSS JOIN input
+WHERE ST_Covers(a.boundary, input.point);
+
+-- Cast both sides to geography so the radius is meters.
+WITH input AS (
+    SELECT ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography AS point
+)
+SELECT
+    p.place_id,
+    p.name,
+    ST_Distance(p.location::geography, input.point) AS distance_m
+FROM places AS p
+CROSS JOIN input
+WHERE ST_DWithin(p.location::geography, input.point, $3)
+ORDER BY distance_m, p.place_id
+LIMIT 50;</code></pre>
+</figure>
+
+<p>
+  If radius search is frequent, index the same stored type or expression used by the predicate.
+  Repeatedly casting an indexed geometry column to geography will not use a plain geometry index as
+  if the expressions were identical. A dedicated geography column or expression GiST index can make
+  the design explicit.
+</p>
+
+<figure class="code">
+  <figcaption><b>Expression index and nearest-neighbor candidates</b></figcaption>
+  <pre><code>CREATE INDEX places_location_geography_gist
+ON places USING gist ((location::geography));
+
+-- Geometry KNN ordering uses the GiST distance operator.
+SELECT place_id, name
+FROM places
+ORDER BY location &lt;-&gt; ST_SetSRID(ST_MakePoint($1, $2), 4326)
+LIMIT 20;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Bounding boxes are candidate filters</strong>
+  <p>
+    GiST often narrows rows by bounding boxes, after which PostGIS rechecks the exact shape
+    relationship. A complex polygon can overlap a candidate's box without intersecting the actual
+    shape. Expect rechecks, and simplify or subdivide very large geometries only after measuring the
+    workload and preserving required accuracy.
+  </p>
+</div>
+
+<h3 id="postgis-validity">Validity, dimensions, and edge cases</h3>
+<ul class="clean">
+  <li>
+    Validate imported polygons with <code>ST_IsValid</code>; predicates on invalid shapes are
+    unsafe.
+  </li>
+  <li>
+    Do not assume longitude-latitude order from a client library; verify its coordinate convention.
+  </li>
+  <li>
+    Most common predicates are 2D even when values carry Z; use explicit 3D functions when needed.
+  </li>
+  <li>Empty geometry, null geometry, geometry collections, and antimeridian cases need tests.</li>
+  <li>Ensure both geometry operands have compatible SRIDs before comparison.</li>
+  <li>
+    Use <code>ST_MakeValid</code> as a reviewed repair, not as proof that the repaired meaning is
+    correct.
+  </li>
+</ul>
+
+<h2 id="pgvector-model"><span class="num">12.</span> pgvector types and distance metrics</h2>
+<p class="lead">
+  pgvector stores numeric embeddings beside relational data and supplies exact and approximate
+  nearest-neighbor search.
+</p>
+
+<figure class="code">
+  <figcaption><b>Schema and distance operators</b></figcaption>
+  <pre><code>CREATE EXTENSION vector;
+
+CREATE TABLE document_chunks (
+    chunk_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id bigint NOT NULL,
+    document_id bigint NOT NULL,
+    content text NOT NULL,
+    embedding_model text NOT NULL,
+    embedding vector(1536) NOT NULL,
+    UNIQUE (tenant_id, document_id, chunk_id)
+);
+
+SELECT
+    embedding &lt;-&gt; $1::vector AS l2_distance,
+    embedding &lt;#&gt; $1::vector AS negative_inner_product,
+    embedding &lt;=&gt; $1::vector AS cosine_distance,
+    embedding &lt;+&gt; $1::vector AS l1_distance
+FROM document_chunks
+LIMIT 1;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Operator</th>
+        <th>Use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Euclidean or L2 distance</td>
+        <td><code>&lt;-&gt;</code></td>
+        <td>Straight-line distance in vector space</td>
+      </tr>
+      <tr>
+        <td>Negative inner product</td>
+        <td><code>&lt;#&gt;</code></td>
+        <td>Maximum inner product through ascending index order</td>
+      </tr>
+      <tr>
+        <td>Cosine distance</td>
+        <td><code>&lt;=&gt;</code></td>
+        <td>Direction similarity; similarity is 1 minus distance</td>
+      </tr>
+      <tr>
+        <td>L1 or taxicab distance</td>
+        <td><code>&lt;+&gt;</code></td>
+        <td>Sum of absolute coordinate differences</td>
+      </tr>
+      <tr>
+        <td>Hamming or Jaccard distance</td>
+        <td>Bit-vector operators</td>
+        <td>Binary signatures</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Choose the metric recommended by the embedding model and keep preprocessing identical for stored
+  and query vectors. Never compare vectors from incompatible models as though they shared one
+  coordinate space. Store model name, dimensionality assumptions, normalization policy, and
+  generation version so migrations are observable.
+</p>
+
+<h3 id="pgvector-types">Dense, half-precision, binary, and sparse values</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Representation</th>
+        <th>Reason to choose it</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>vector(n)</code></td>
+        <td>Dense single-precision values</td>
+        <td>Normal default for dense model embeddings</td>
+      </tr>
+      <tr>
+        <td><code>halfvec(n)</code></td>
+        <td>Dense half-precision values</td>
+        <td>Smaller storage and larger indexable dimensions with precision tradeoff</td>
+      </tr>
+      <tr>
+        <td><code>bit(n)</code></td>
+        <td>Binary vector</td>
+        <td>Hamming, Jaccard, or binary-quantized candidate search</td>
+      </tr>
+      <tr>
+        <td><code>sparsevec(n)</code></td>
+        <td>Only nonzero positions and values</td>
+        <td>High-dimensional data with few nonzero elements</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A fixed dimension such as <code>vector(1536)</code> lets the type reject mismatched input early.
+  An unconstrained <code>vector</code> column can hold several dimensions, but an approximate
+  expression or partial index must still target compatible dimensions. Current pgvector index limits
+  differ by type and index method, so verify the deployed extension version before selecting a
+  model. Reducing precision, binary-quantizing, indexing subvectors, or reducing dimensions can
+  lower memory, but each can change retrieval quality and should be followed by exact re-ranking
+  when the design requires it.
+</p>
+
+<div class="warn">
+  <strong>Distance is not a confidence probability</strong>
+  <p>
+    A cosine similarity of 0.82 does not mean an answer is 82 percent correct. Its distribution
+    depends on the model, corpus, chunking, and task. Evaluate retrieval with labeled queries,
+    measures such as recall at k and ranking quality, plus end-to-end application outcomes.
+  </p>
+</div>
+
+<h2 id="pgvector-exact"><span class="num">13.</span> Exact nearest-neighbor search</h2>
+<p class="lead">
+  Without an approximate index, pgvector compares the query vector with every eligible row and
+  returns the true nearest rows under the chosen metric.
+</p>
+
+<figure class="code">
+  <figcaption><b>Exact tenant-scoped search</b></figcaption>
+  <pre><code>SELECT
+    chunk_id,
+    document_id,
+    content,
+    embedding &lt;=&gt; $1::vector AS distance
+FROM document_chunks
+WHERE tenant_id = $2
+  AND embedding_model = $3
+ORDER BY embedding &lt;=&gt; $1::vector, chunk_id
+LIMIT 20;</code></pre>
+</figure>
+
+<p>
+  Exact search is the correctness baseline. It can be fast enough for a small filtered corpus,
+  offline evaluation, or a moderate table with parallel scanning. It also tells you whether an
+  approximate configuration meets recall targets. The query must order directly by a supported
+  distance operator in ascending order and include <code>LIMIT</code> for an approximate
+  nearest-neighbor index to be considered later.
+</p>
+
+<h2 id="pgvector-hnsw"><span class="num">14.</span> HNSW indexes</h2>
+<p class="lead">
+  HNSW builds a multilayer proximity graph. It usually offers a strong speed-recall tradeoff at the
+  price of memory, build time, and write maintenance.
+</p>
+
+<figure class="code">
+  <figcaption><b>Build and tune HNSW</b></figcaption>
+  <pre><code>CREATE INDEX document_chunks_embedding_hnsw
+ON document_chunks
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+BEGIN;
+SET LOCAL hnsw.ef_search = 100;
+SELECT chunk_id, content, embedding &lt;=&gt; $1::vector AS distance
+FROM document_chunks
+WHERE tenant_id = $2
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 20;
+COMMIT;</code></pre>
+</figure>
+
+<ul class="clean">
+  <li><code>m</code> controls graph connectivity; larger values use more memory and build work.</li>
+  <li>
+    <code>ef_construction</code> enlarges the build candidate list and can improve index quality.
+  </li>
+  <li>
+    <code>hnsw.ef_search</code> enlarges the query candidate list, improving recall at more cost.
+  </li>
+  <li>HNSW does not need a training step and can be created before rows exist.</li>
+  <li>Create one operator-class index for each distance metric that must be accelerated.</li>
+  <li>
+    Large builds benefit when the graph fits in <code>maintenance_work_mem</code>, within safe RAM
+    limits.
+  </li>
+</ul>
+
+<h2 id="pgvector-ivfflat"><span class="num">15.</span> IVFFlat indexes</h2>
+<p class="lead">
+  IVFFlat clusters existing vectors into lists, then searches selected lists instead of the entire
+  table.
+</p>
+
+<figure class="code">
+  <figcaption><b>Build and tune IVFFlat</b></figcaption>
+  <pre><code>-- Build after representative data exists.
+CREATE INDEX document_chunks_embedding_ivfflat
+ON document_chunks
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+BEGIN;
+SET LOCAL ivfflat.probes = 10;
+SELECT chunk_id, content, embedding &lt;=&gt; $1::vector AS distance
+FROM document_chunks
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 20;
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  More lists reduce candidates per list and can improve query speed, but too many lists for too
+  little data produce poor results. More probes search more lists and improve recall at higher
+  latency. Setting probes to the number of lists approaches exact search and can make the planner
+  choose a different plan. Rebuild after major data-distribution changes when measured recall
+  deteriorates.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>HNSW</th>
+        <th>IVFFlat</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Structure</td>
+        <td>Multilayer neighbor graph</td>
+        <td>Clustered inverted lists</td>
+      </tr>
+      <tr>
+        <td>Training data</td>
+        <td>Not required</td>
+        <td>Representative rows required before build</td>
+      </tr>
+      <tr>
+        <td>Typical query tradeoff</td>
+        <td>Better speed-recall, more memory</td>
+        <td>Lighter build, workload-sensitive tuning</td>
+      </tr>
+      <tr>
+        <td>Main query knob</td>
+        <td><code>hnsw.ef_search</code></td>
+        <td><code>ivfflat.probes</code></td>
+      </tr>
+      <tr>
+        <td>Main build knobs</td>
+        <td><code>m</code>, <code>ef_construction</code></td>
+        <td><code>lists</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="pgvector-filtering"><span class="num">16.</span> Filtering approximate vector search</h2>
+<p class="lead">
+  Approximate indexes usually retrieve vector candidates first and apply ordinary filters to those
+  candidates, so selective filters can leave fewer than the requested number of rows.
+</p>
+
+<figure class="code">
+  <figcaption><b>Relational indexes and iterative scans</b></figcaption>
+  <pre><code>CREATE INDEX document_chunks_tenant_model_idx
+ON document_chunks (tenant_id, embedding_model);
+
+BEGIN;
+SET LOCAL hnsw.iterative_scan = strict_order;
+SET LOCAL hnsw.ef_search = 100;
+
+SELECT chunk_id, content, embedding &lt;=&gt; $1::vector AS distance
+FROM document_chunks
+WHERE tenant_id = $2
+  AND embedding_model = $3
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 20;
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  Iterative scanning can continue deeper into the approximate index until it finds enough filtered
+  results or reaches configured limits. Relaxed ordering can improve recall or performance while
+  allowing slight distance disorder; a materialized outer re-sort can restore strict presentation
+  order. Alternatives include exact search after a highly selective B-tree filter, partitioning by a
+  stable coarse key, partial vector indexes for a few important categories, or retrieving a larger
+  candidate set and applying filters afterward. Tenant and authorization predicates must remain in
+  the database query, never only in application post-processing.
+</p>
+
+<h3 id="pgvector-maintenance">Build, vacuum, monitoring, and recall</h3>
+<ul class="clean">
+  <li>Use <code>pg_stat_progress_create_index</code> to observe supported build phases.</li>
+  <li>Use concurrent index operations when uptime requires them and accept their extra work.</li>
+  <li>
+    Monitor table and index size, WAL, cache behavior, build memory, query latency, and dead tuples.
+  </li>
+  <li>HNSW vacuum can be expensive; pgvector documents reindexing before vacuum as one option.</li>
+  <li>Compare approximate results to exact results regularly on a sampled, labeled query set.</li>
+  <li>
+    Track recall separately by tenant, filter shape, corpus size, and embedding-model version.
+  </li>
+  <li>Null vectors are not indexed; zero vectors are not indexed for cosine distance.</li>
+</ul>
+
+<h2 id="application-patterns">
+  <span class="num">17.</span> Application patterns and hybrid retrieval
+</h2>
+<p class="lead">
+  Strong search systems use each feature for the signal it models and combine bounded candidate sets
+  deliberately.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Pipeline</th>
+        <th>Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Type-ahead names</td>
+        <td>Exact normalized match, prefix, trigram fallback</td>
+        <td>Fast common path with typo tolerance</td>
+      </tr>
+      <tr>
+        <td>Document search</td>
+        <td>Full-text filter and rank, then metadata rules</td>
+        <td>Language-aware words plus business constraints</td>
+      </tr>
+      <tr>
+        <td>Semantic retrieval</td>
+        <td>Tenant filter, vector candidates, optional reranker</td>
+        <td>Meaning beyond shared words</td>
+      </tr>
+      <tr>
+        <td>Hybrid search</td>
+        <td>Bounded FTS and vector candidates, normalized rank fusion</td>
+        <td>Lexical precision plus semantic recall</td>
+      </tr>
+      <tr>
+        <td>Nearby search</td>
+        <td><code>ST_DWithin</code> filter, then exact distance order</td>
+        <td>Index-aware radius with meaningful ordering</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Raw scores from different systems are not directly comparable. Full-text rank, trigram similarity,
+  vector distance, and spatial distance have different scales and meanings. Combine them through
+  calibrated rules, rank fusion, or a trained reranker evaluated on labeled data. Keep candidate
+  limits large enough for recall but bounded enough for predictable latency.
+</p>
+
+<h2 id="migrations-operations">
+  <span class="num">18.</span> Migrations and production operations
+</h2>
+<ol class="clean">
+  <li>
+    Inventory managed-service support, package versions, PostgreSQL compatibility, and replicas.
+  </li>
+  <li>Install package files everywhere before restoring or running database migrations.</li>
+  <li>Create or update the extension in its own reviewed migration.</li>
+  <li>Add nullable columns or new structures first when a large backfill is required.</li>
+  <li>Backfill in bounded batches while measuring WAL, locks, replication lag, and autovacuum.</li>
+  <li>Build large indexes concurrently where availability requires it.</li>
+  <li>
+    Validate exact counts, nulls, SRIDs, vector dimensions, language routing, and index validity.
+  </li>
+  <li>Deploy read paths behind a controlled rollout and compare plans and quality metrics.</li>
+  <li>Retire old columns or indexes only after rollback windows and dependents are clear.</li>
+</ol>
+
+<div class="note">
+  <strong>Extension version and data version are different</strong>
+  <p>
+    Updating pgvector code does not regenerate embeddings. Updating PostGIS does not correct a
+    mislabeled SRID. Changing a text-search dictionary does not automatically recreate previously
+    stored vectors. Track package version, derived-data version, model or configuration version, and
+    index build state independently.
+  </p>
+</div>
+
+<h3 id="observability">What to measure</h3>
+<ul class="clean">
+  <li>
+    <code>EXPLAIN (ANALYZE, BUFFERS)</code> plans with representative parameters and warm/cold
+    context.
+  </li>
+  <li>Latency percentiles, rows examined, rows returned, buffers, temporary I/O, and sort work.</li>
+  <li>
+    Index size, scans, tuples read and fetched, update volume, WAL, bloat, and vacuum behavior.
+  </li>
+  <li>
+    Search quality: precision, recall, zero-result rate, reformulation rate, and task success.
+  </li>
+  <li>
+    Spatial data quality: invalid shapes, unexpected SRIDs, empty values, and coordinate bounds.
+  </li>
+  <li>
+    Vector quality: model drift, dimension failures, nulls, norms, and approximate recall at k.
+  </li>
+  <li>
+    Extension inventory and version differences across primary, replicas, staging, and restore
+    targets.
+  </li>
+</ul>
+
+<h2 id="performance"><span class="num">19.</span> Performance reasoning</h2>
+<p class="lead">
+  A specialized index is useful when its supported operator removes enough work to repay its storage
+  and maintenance cost.
+</p>
+
+<ul class="clean">
+  <li>Write the indexed operator in the form required by its operator class.</li>
+  <li>
+    Keep types, casts, configurations, SRIDs, and distance metrics identical to the index
+    definition.
+  </li>
+  <li>Use selective relational filters and ordinary indexes alongside specialized retrieval.</li>
+  <li>Expect lossy indexes or bounding boxes to recheck exact conditions.</li>
+  <li>Do not force an index when a sequential scan is cheaper for a large result fraction.</li>
+  <li>Measure index build and write cost, not only one read benchmark.</li>
+  <li>
+    Test real distributions: short text, common lexemes, dense cities, skewed tenants, and filtered
+    vectors.
+  </li>
+  <li>Use stable limits and tie-breakers; avoid unbounded ranking of an entire corpus.</li>
+</ul>
+
+<h2 id="mistakes"><span class="num">20.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Assuming package installation enables every database</td>
+        <td>Extensions are installed per database</td>
+        <td>Run and verify <code>CREATE EXTENSION</code> in each target</td>
+      </tr>
+      <tr>
+        <td>Using <code>DROP EXTENSION ... CASCADE</code> casually</td>
+        <td>Dependent application objects can be dropped</td>
+        <td>Inspect dependencies and use a reviewed retirement plan</td>
+      </tr>
+      <tr>
+        <td>Expecting trigram search to understand meaning</td>
+        <td>It compares characters</td>
+        <td>Use vectors for semantic similarity</td>
+      </tr>
+      <tr>
+        <td>Passing user input to <code>to_tsquery</code></td>
+        <td>User punctuation can become strict syntax</td>
+        <td>Use bound input with web or plain query constructors</td>
+      </tr>
+      <tr>
+        <td>Generating vectors with a different FTS configuration</td>
+        <td>Document and query lexemes no longer align</td>
+        <td>Specify the same configuration explicitly</td>
+      </tr>
+      <tr>
+        <td>Calling <code>ST_Distance</code> alone for radius filtering</td>
+        <td>It may calculate distance broadly</td>
+        <td>Filter with index-aware <code>ST_DWithin</code></td>
+      </tr>
+      <tr>
+        <td>Treating SRID 4326 geometry distance as meters</td>
+        <td>Its coordinates are degrees</td>
+        <td>Use suitable geography or projected geometry</td>
+      </tr>
+      <tr>
+        <td>Using <code>ST_SetSRID</code> to convert coordinates</td>
+        <td>It only changes the label</td>
+        <td>Use <code>ST_Transform</code> for conversion</td>
+      </tr>
+      <tr>
+        <td>Adding an approximate vector index and expecting identical results</td>
+        <td>Approximation trades recall for speed</td>
+        <td>Measure against exact search and tune</td>
+      </tr>
+      <tr>
+        <td>Using the wrong vector operator class</td>
+        <td>The index metric differs from query semantics</td>
+        <td>Match model, operator, and index operator class</td>
+      </tr>
+      <tr>
+        <td>Post-filtering tenant access in application code</td>
+        <td>Can leak candidates and reduce result count</td>
+        <td>Enforce authorization in the SQL query</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="practice"><span class="num">21.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>
+    Inventory three extensions across development and production. Report available version,
+    installed version, schema, owner, relocatability, and whether an update path exists.
+  </li>
+  <li>
+    Build a typo-tolerant people search. Compare GIN filtering with GiST nearest-neighbor ordering
+    for ten real misspellings and explain threshold selection.
+  </li>
+  <li>
+    Create a weighted generated <code>tsvector</code> for title, tags, summary, and body. Implement
+    plain, phrase, and web-style queries with safe highlighting.
+  </li>
+  <li>
+    Explain every token in <code>ts_debug</code> output for a sentence containing an email, number,
+    hyphenated term, stop words, and inflected words.
+  </li>
+  <li>
+    Model stores and delivery zones in PostGIS. Answer point-in-zone, stores within 5 km, and five
+    nearest stores while stating types, SRIDs, units, and indexes.
+  </li>
+  <li>
+    Load a labeled vector dataset. Compare exact, HNSW, and IVFFlat latency and recall at 10 across
+    three tuning values and two metadata filters.
+  </li>
+  <li>
+    Design a hybrid document search that fuses full-text and vector candidates without treating raw
+    scores as directly comparable.
+  </li>
+  <li>
+    Write a zero-downtime plan to change embedding model and dimension while old reads remain
+    available and rollback stays possible.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">22.</span> Interview questions and answers</h2>
+<div class="qa">
+  <p class="q">Q: What is the difference between an available and installed extension?</p>
+  <p class="a">
+    Available means the server can see compatible control and script files. Installed means
+    <code>CREATE EXTENSION</code> has loaded and registered that package in one database. Check
+    <code>pg_available_extensions</code> for the first state and <code>pg_extension</code> for the
+    second.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why is CREATE EXTENSION better than running a vendor SQL file manually?</p>
+  <p class="a">
+    PostgreSQL records member objects, version, owner, schema, and dependencies as one unit. It can
+    update through packaged scripts, drop the group coherently, and represent it correctly during
+    dump and restore. Loose objects lose that lifecycle contract.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is a trusted extension?</p>
+  <p class="a">
+    Its control metadata permits a non-superuser with database <code>CREATE</code> privilege to
+    install it even when elevated script execution is required. It is an intentionally secured
+    packaging mode, not a blanket statement that arbitrary third-party code is harmless.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: GIN or GiST for pg_trgm?</p>
+  <p class="a">
+    Both support trigram similarity and pattern operators. GIN is often strong for filtering all
+    matches. GiST supports distance-ordered nearest-neighbor retrieval such as
+    <code>ORDER BY column &lt;-&gt; query LIMIT k</code>. Benchmark the actual read and write
+    workload.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How is full-text search different from ILIKE?</p>
+  <p class="a">
+    <code>ILIKE</code> compares a case-insensitive character pattern. Full-text search parses typed
+    tokens, normalizes them through language dictionaries, supports Boolean and phrase queries,
+    preserves positions and weights, ranks relevance, and can generate highlighted snippets.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why store tsvector in a generated column?</p>
+  <p class="a">
+    It computes the document representation when source columns change, keeps it synchronized
+    without application logic, and gives a stable target for a GIN index. The tradeoffs are stored
+    bytes and write-time computation.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What are parser, dictionary, and configuration roles in FTS?</p>
+  <p class="a">
+    The parser identifies token types. Dictionaries recognize and normalize tokens or remove stop
+    words. A configuration chooses the parser and maps each token type to an ordered dictionary
+    chain. Both document and query must use compatible configuration behavior.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why prefer websearch_to_tsquery for an open search box?</p>
+  <p class="a">
+    It accepts familiar quoted-phrase, OR, and minus syntax and is designed not to raise syntax
+    errors on raw input. SQL parameters are still required. <code>to_tsquery</code> is better when
+    trusted code intentionally builds strict query grammar.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Geometry or geography in PostGIS?</p>
+  <p class="a">
+    Geometry uses planar calculations and the coordinate units of its SRID, supporting the broadest
+    operation set. Geography models positions on earth and commonly returns or accepts meters for
+    distance. Choose from geographic extent, projection, accuracy, operations, and cost.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: ST_SetSRID versus ST_Transform?</p>
+  <p class="a">
+    <code>ST_SetSRID</code> labels existing coordinate numbers with a reference system.
+    <code>ST_Transform</code> calculates new coordinate numbers in another reference system. Using
+    the former as conversion silently corrupts spatial meaning.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why use ST_DWithin before ST_Distance?</p>
+  <p class="a">
+    <code>ST_DWithin</code> expresses a radius predicate and includes an index-aware bounding-box
+    candidate check. After it narrows the rows, calculate exact distance for returned values or
+    ordering. Units still depend on geometry SRID or geography semantics.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Exact versus approximate vector search?</p>
+  <p class="a">
+    Exact search compares all eligible vectors and returns the true nearest neighbors under the
+    metric. HNSW and IVFFlat search selected candidates, trading some recall for lower latency.
+    Exact results are the baseline used to evaluate approximate recall.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: HNSW versus IVFFlat?</p>
+  <p class="a">
+    HNSW uses a proximity graph, requires no training data, and usually gives a stronger
+    speed-recall tradeoff with higher memory and build cost. IVFFlat clusters existing data into
+    lists, has a lighter structure, and depends strongly on representative training data, list
+    count, and probe count.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can an approximate vector query return too few filtered rows?</p>
+  <p class="a">
+    The index may select a limited vector candidate set before applying the ordinary filter. Many
+    candidates can then be rejected. Increase search effort, use iterative scans, improve relational
+    indexing, partition or use partial indexes carefully, or choose exact search for a highly
+    selective subset.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How would you evaluate semantic search?</p>
+  <p class="a">
+    Build representative labeled queries and relevance judgments. Measure exact retrieval quality,
+    approximate recall at k, latency percentiles, behavior under filters, zero-result and task
+    success rates, and model or corpus slices. Do not interpret one raw distance threshold as a
+    universal confidence score.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">23.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Available:</strong> files exist on server; <strong>installed:</strong> objects exist in
+    one database.
+  </li>
+  <li>
+    <strong>Inventory:</strong> <code>pg_available_extensions</code>, versions view,
+    <code>pg_extension</code>.
+  </li>
+  <li>
+    <strong>Lifecycle:</strong> create, validate, update through scripts, inspect dependents, drop
+    carefully.
+  </li>
+  <li>
+    <strong>Security:</strong> reviewed source, secure schema, controlled search path, least
+    privilege.
+  </li>
+  <li>
+    <strong>pg_trgm:</strong> character similarity, typo tolerance, partial patterns, indexed
+    <code>ILIKE</code>.
+  </li>
+  <li>
+    <strong>Trigram GIN:</strong> filtering; <strong>trigram GiST:</strong> distance-ordered top k.
+  </li>
+  <li>
+    <strong>FTS pipeline:</strong> parser, token type, dictionaries, configuration, vector, query.
+  </li>
+  <li>
+    <strong>FTS match:</strong> <code>tsvector @@ tsquery</code>; use explicit matching
+    configuration.
+  </li>
+  <li><strong>User queries:</strong> plain, phrase, or web constructor; bind parameters.</li>
+  <li>
+    <strong>FTS index:</strong> GIN is normally preferred; ranking still needs candidate sorting.
+  </li>
+  <li>
+    <strong>PostGIS geometry:</strong> planar units from SRID; <strong>geography:</strong> earth
+    model and meters.
+  </li>
+  <li><strong>SRID:</strong> set labels coordinates; transform converts coordinates.</li>
+  <li>
+    <strong>Radius:</strong> <code>ST_DWithin</code> filter, then distance calculation and order.
+  </li>
+  <li><strong>Spatial GiST:</strong> candidate bounding boxes plus exact predicate recheck.</li>
+  <li><strong>pgvector exact:</strong> perfect recall baseline under the chosen metric.</li>
+  <li><strong>HNSW:</strong> graph, no training, tune <code>ef_search</code>.</li>
+  <li><strong>IVFFlat:</strong> clusters, build after data, tune lists and probes.</li>
+  <li>
+    <strong>Filtering ANN:</strong> relational indexes, iterative scans, partitions, or exact subset
+    search.
+  </li>
+  <li>
+    <strong>Quality:</strong> evaluate labeled examples; raw rank, similarity, and distance are
+    different scales.
+  </li>
+  <li>
+    <strong>Operations:</strong> version packages, derived data, configuration, models, and indexes
+    separately.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">24.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-createextension.html"
+      >PostgreSQL CREATE EXTENSION</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-alterextension.html"
+      >PostgreSQL ALTER EXTENSION</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-dropextension.html"
+      >PostgreSQL DROP EXTENSION</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/extend-extensions.html"
+      >Packaging and securing extension objects</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/view-pg-available-extensions.html"
+      >Available extension catalog view</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/pgtrgm.html">Official pg_trgm documentation</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/textsearch.html"
+      >PostgreSQL full-text search</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/textsearch-controls.html"
+      >Text-search documents, queries, ranking, and highlighting</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/textsearch-indexes.html"
+      >Preferred full-text index types</a
+    >
+  </li>
+  <li>
+    <a href="https://postgis.net/docs/en/postgis-en.html">Official PostGIS manual</a>
+  </li>
+  <li>
+    <a href="https://postgis.net/docs/en/using_postgis_dbmanagement.html"
+      >PostGIS data management and geometry versus geography</a
+    >
+  </li>
+  <li>
+    <a href="https://postgis.net/docs/en/using_postgis_query.html"
+      >PostGIS spatial queries and indexes</a
+    >
+  </li>
+  <li>
+    <a href="https://postgis.net/docs/en/ST_DWithin.html">PostGIS ST_DWithin</a>
+  </li>
+  <li>
+    <a href="https://github.com/pgvector/pgvector">Official pgvector project documentation</a>
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

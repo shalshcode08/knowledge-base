@@ -34,6 +34,10 @@
         {
           "title": "Locking and Concurrency",
           "path": "postgresql/locking-concurrency"
+        },
+        {
+          "title": "Extensions and Specialized Features",
+          "path": "postgresql/extensions-specialized-features"
         }
       ]
     }
