@@ -1,0 +1,1194 @@
+<h1>Spring MVC and REST APIs - Complete Notes</h1>
+<p class="subtitle">
+  A complete guide to the servlet request lifecycle, DispatcherServlet, annotated controllers,
+  request and response binding, DTOs, validation, error contracts, HTTP semantics, pagination,
+  versioning, idempotency, file handling, CORS, and production-quality API design.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The Spring MVC mental model</h2>
+<p class="lead">
+  Spring MVC is a request-routing and adaptation pipeline on the Servlet stack. It maps an HTTP
+  request to an application method, converts wire data into Java values, invokes the method, and
+  converts the result back into an HTTP response.
+</p>
+
+<p>
+  The controller should translate between HTTP and an application use case. It should not contain
+  database queries, transaction choreography, pricing rules, or remote-client details. A focused
+  controller validates the transport contract, calls a service, and maps the outcome to an HTTP
+  contract.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of an airport. The front controller is air-traffic control. Handler mappings identify the
+    correct runway, argument resolvers prepare the arriving request, the controller performs the
+    scheduled handoff, and message converters prepare the departing response. Business services are
+    the destination operations, not the control tower.
+  </p>
+</div>
+
+<div class="key">
+  <strong>HTTP is part of the design</strong>
+  <p>
+    A REST endpoint is not only a Java method exposed over the network. Method semantics, status
+    codes, headers, cache behavior, idempotency, media types, and error bodies form a contract with
+    clients.
+  </p>
+</div>
+
+<h2 id="servlet-stack"><span class="num">01.</span> Servlet stack and request lifecycle</h2>
+<p class="lead">
+  The servlet container accepts network traffic and creates Servlet API request and response
+  objects. Spring MVC runs inside that container.
+</p>
+
+<ol class="clean">
+  <li>A client sends an HTTP request to the server.</li>
+  <li>The servlet container accepts the connection and applies container-level processing.</li>
+  <li>Servlet filters run around the request.</li>
+  <li>The request reaches Spring's <code>DispatcherServlet</code>.</li>
+  <li>A handler mapping finds the matching controller method.</li>
+  <li>A handler adapter resolves method arguments and invokes the method.</li>
+  <li>The application service performs the use case.</li>
+  <li>The return value is handled, often through an HTTP message converter.</li>
+  <li>Exception resolvers translate failures when necessary.</li>
+  <li>The response passes back through filters and the container writes it to the client.</li>
+</ol>
+
+<p>
+  A traditional servlet request is normally handled by one container thread. Blocking database or
+  network calls occupy that thread until completion. Set timeouts, bound thread and connection
+  pools, and avoid unbounded blocking work.
+</p>
+
+<h2 id="dispatcher-servlet"><span class="num">02.</span> DispatcherServlet and front controller</h2>
+<p class="lead">
+  <code>DispatcherServlet</code> implements the front-controller pattern: one central servlet
+  coordinates request processing through specialized delegates.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Delegate</th>
+        <th>Responsibility</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>HandlerMapping</code></td>
+        <td>Find the handler for the request</td>
+      </tr>
+      <tr>
+        <td><code>HandlerAdapter</code></td>
+        <td>Invoke a handler using its programming model</td>
+      </tr>
+      <tr>
+        <td><code>HandlerMethodArgumentResolver</code></td>
+        <td>Create controller method arguments</td>
+      </tr>
+      <tr>
+        <td><code>HandlerMethodReturnValueHandler</code></td>
+        <td>Interpret controller return values</td>
+      </tr>
+      <tr>
+        <td><code>HttpMessageConverter</code></td>
+        <td>Read and write HTTP bodies</td>
+      </tr>
+      <tr>
+        <td><code>HandlerExceptionResolver</code></td>
+        <td>Map exceptions to responses</td>
+      </tr>
+      <tr>
+        <td><code>ViewResolver</code></td>
+        <td>Resolve server-rendered views when used</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Spring Boot registers the MVC infrastructure when the servlet web stack is present and conditions
+  match. Applications usually customize it through <code>WebMvcConfigurer</code> rather than
+  replacing the complete MVC configuration.
+</p>
+
+<div class="warn">
+  <strong>Use @EnableWebMvc carefully in Spring Boot</strong>
+  <p>
+    It imports full MVC configuration and can replace Boot's MVC auto-configuration. Implement
+    <code>WebMvcConfigurer</code> for targeted customization unless complete control is intentional.
+  </p>
+</div>
+
+<h2 id="controllers"><span class="num">03.</span> Controllers and REST controllers</h2>
+<p class="lead">
+  <code>@Controller</code> marks an MVC component. <code>@RestController</code> combines controller
+  behavior with <code>@ResponseBody</code> semantics.
+</p>
+
+<figure class="code">
+  <figcaption><b>A focused REST controller</b></figcaption>
+  <pre><code>@RestController
+@RequestMapping("/api/orders")
+final class OrderController {
+    private final OrderApplicationService orders;
+
+    OrderController(OrderApplicationService orders) {
+        this.orders = orders;
+    }
+
+    @GetMapping("/{orderId}")
+    OrderResponse get(@PathVariable UUID orderId) {
+        return OrderResponse.from(orders.get(orderId));
+    }
+}</code></pre>
+</figure>
+
+<p>
+  <code>@RestController</code> return values normally go through message conversion instead of view
+  resolution. Constructor injection makes the required use case explicit and keeps controller tests
+  simple.
+</p>
+
+<h3 id="controller-boundary">Keep the boundary thin</h3>
+<ul class="clean">
+  <li>Parse and validate HTTP inputs.</li>
+  <li>Map transport DTOs to application commands.</li>
+  <li>Invoke one clear application use case.</li>
+  <li>Map the result to a response DTO and HTTP status.</li>
+  <li>Delegate cross-cutting error formatting to controller advice.</li>
+</ul>
+
+<h2 id="request-mapping"><span class="num">04.</span> Request mappings</h2>
+<p class="lead">
+  A mapping can match path, HTTP method, parameters, headers, consumed media types, and produced
+  media types.
+</p>
+
+<figure class="code">
+  <figcaption><b>Specific method mapping</b></figcaption>
+  <pre><code>@PostMapping(
+    consumes = MediaType.APPLICATION_JSON_VALUE,
+    produces = MediaType.APPLICATION_JSON_VALUE
+)
+ResponseEntity&lt;OrderResponse&gt; create(
+    @Valid @RequestBody CreateOrderRequest request
+) {
+    Order order = orders.create(request.toCommand());
+    URI location = URI.create("/api/orders/" + order.id());
+    return ResponseEntity.created(location)
+        .body(OrderResponse.from(order));
+}</code></pre>
+</figure>
+
+<p>
+  Prefer <code>@GetMapping</code>, <code>@PostMapping</code>, <code>@PutMapping</code>,
+  <code>@PatchMapping</code>, and <code>@DeleteMapping</code> over a method-level
+  <code>@RequestMapping</code> without an HTTP method. Explicit method semantics reduce accidental
+  matches.
+</p>
+
+<h3 id="path-patterns">Path design</h3>
+<ul class="clean">
+  <li>Use nouns for resources: <code>/orders/{id}</code>.</li>
+  <li>Use hierarchy only when it expresses real containment: <code>/orders/{id}/items</code>.</li>
+  <li>Avoid deeply nested paths that require unrelated identifiers.</li>
+  <li>Use stable opaque identifiers rather than mutable names when identity matters.</li>
+  <li>Use an action subresource only for a real command that does not fit CRUD cleanly.</li>
+</ul>
+
+<h2 id="request-inputs"><span class="num">05.</span> Request input annotations</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Annotation</th>
+        <th>Source</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@PathVariable</code></td>
+        <td>Matched URI path segment</td>
+        <td>Resource identity</td>
+      </tr>
+      <tr>
+        <td><code>@RequestParam</code></td>
+        <td>Query string or form parameter</td>
+        <td>Filtering, pagination, simple form data</td>
+      </tr>
+      <tr>
+        <td><code>@RequestHeader</code></td>
+        <td>HTTP header</td>
+        <td>Conditional request or client metadata</td>
+      </tr>
+      <tr>
+        <td><code>@CookieValue</code></td>
+        <td>Cookie</td>
+        <td>Explicit cookie contract</td>
+      </tr>
+      <tr>
+        <td><code>@RequestBody</code></td>
+        <td>Message-converted body</td>
+        <td>JSON or another structured representation</td>
+      </tr>
+      <tr>
+        <td><code>@RequestPart</code></td>
+        <td>Multipart part</td>
+        <td>File plus structured metadata</td>
+      </tr>
+      <tr>
+        <td><code>@ModelAttribute</code></td>
+        <td>Bound request parameters</td>
+        <td>Forms and query objects</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Filter and pagination inputs</b></figcaption>
+  <pre><code>@GetMapping
+PageResponse&lt;OrderSummary&gt; search(
+    @RequestParam(required = false) OrderStatus status,
+    @RequestParam(defaultValue = "0") @Min(0) int page,
+    @RequestParam(defaultValue = "20") @Min(1) @Max(100) int size
+) {
+    return OrderSummaryPage.from(orders.search(status, page, size));
+}</code></pre>
+</figure>
+
+<p>
+  Conversion failures are client errors, not server errors. A malformed UUID, unknown enum, or
+  non-numeric page value should produce a stable 400 response through centralized error handling.
+</p>
+
+<h2 id="dto"><span class="num">06.</span> Request and response DTOs</h2>
+<p class="lead">
+  Transport DTOs protect the API contract from persistence and domain implementation details.
+</p>
+
+<figure class="code">
+  <figcaption><b>Request DTO with transport validation</b></figcaption>
+  <pre><code>public record CreateOrderRequest(
+    @NotNull UUID customerId,
+    @NotEmpty List&lt;@Valid OrderItemRequest&gt; items,
+    @Size(max = 500) String note
+) {
+    CreateOrderCommand toCommand() {
+        return new CreateOrderCommand(customerId, items, note);
+    }
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Response DTO</b></figcaption>
+  <pre><code>public record OrderResponse(
+    UUID id,
+    String status,
+    BigDecimal total,
+    Instant createdAt
+) {
+    static OrderResponse from(Order order) {
+        return new OrderResponse(
+            order.id(),
+            order.status().name(),
+            order.total().amount(),
+            order.createdAt()
+        );
+    }
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Do not expose JPA entities directly</strong>
+  <p>
+    Entity relationships can trigger lazy queries, cycles, oversized JSON, accidental field
+    exposure, and API changes when the schema changes. DTOs make loading, security, versioning, and
+    compatibility deliberate.
+  </p>
+</div>
+
+<h2 id="message-conversion"><span class="num">07.</span> HTTP message conversion and JSON</h2>
+<p class="lead">
+  <code>HttpMessageConverter</code> implementations turn request bodies into Java objects and Java
+  return values into response bodies.
+</p>
+
+<p>
+  Converter selection uses the Java target type, request <code>Content-Type</code>, client
+  <code>Accept</code> header, controller mapping constraints, and available converters. JSON support
+  commonly uses Jackson in Spring Boot web applications.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Header</th>
+        <th>Meaning</th>
+        <th>Typical failure</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Content-Type</code></td>
+        <td>Format of the request body</td>
+        <td>415 Unsupported Media Type</td>
+      </tr>
+      <tr>
+        <td><code>Accept</code></td>
+        <td>Response formats the client accepts</td>
+        <td>406 Not Acceptable</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Define time, number, enum, null, and unknown-field behavior intentionally. Public APIs should not
+  inherit accidental serializer settings. Use ISO-8601 timestamps with an offset or UTC instant and
+  decimal types for exact monetary values.
+</p>
+
+<h2 id="validation"><span class="num">08.</span> Bean Validation</h2>
+<p class="lead">
+  Validation checks the shape and local constraints of incoming data before the use case runs.
+</p>
+
+<figure class="code">
+  <figcaption><b>Nested validation</b></figcaption>
+  <pre><code>public record OrderItemRequest(
+    @NotNull UUID productId,
+    @Min(1) @Max(1000) int quantity
+) {}
+
+@PostMapping
+OrderResponse create(@Valid @RequestBody CreateOrderRequest request) {
+    return OrderResponse.from(orders.create(request.toCommand()));
+}</code></pre>
+</figure>
+
+<p>
+  <code>@Valid</code> triggers cascaded validation of the body and nested values. Direct constraints
+  on controller method parameters can trigger method validation. Current Spring MVC can report
+  body-object validation and method validation through different exception types, so global error
+  handling should cover both.
+</p>
+
+<h3 id="validation-layers">Validation belongs at multiple layers</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Example rule</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Transport DTO</td>
+        <td>Required field, string length, numeric range</td>
+      </tr>
+      <tr>
+        <td>Application or domain</td>
+        <td>Order can be cancelled only before shipment</td>
+      </tr>
+      <tr>
+        <td>Database</td>
+        <td>Unique key, foreign key, non-null invariant</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Do not perform a database lookup inside a simple field validator for every element. Cross-record
+  business rules belong in an application service with a transaction and a concurrency-safe database
+  constraint where applicable.
+</p>
+
+<h3 id="custom-validator">Custom class-level validator</h3>
+<figure class="code">
+  <figcaption><b>Cross-field date rule</b></figcaption>
+  <pre><code>@ValidDateRange
+public record ReportRequest(
+    @NotNull LocalDate from,
+    @NotNull LocalDate to
+) {}
+
+final class DateRangeValidator
+        implements ConstraintValidator&lt;ValidDateRange, ReportRequest&gt; {
+
+    public boolean isValid(
+            ReportRequest value,
+            ConstraintValidatorContext context) {
+        return value == null
+            || value.from() == null
+            || value.to() == null
+            || !value.to().isBefore(value.from());
+    }
+}</code></pre>
+</figure>
+
+<h2 id="responses"><span class="num">09.</span> Return values and ResponseEntity</h2>
+<p class="lead">
+  Return a body directly when the status and headers are fixed. Use
+  <code>ResponseEntity&lt;T&gt;</code> when the endpoint controls status or headers.
+</p>
+
+<figure class="code">
+  <figcaption><b>Create response with Location header</b></figcaption>
+  <pre><code>@PostMapping
+ResponseEntity&lt;OrderResponse&gt; create(
+        @Valid @RequestBody CreateOrderRequest request) {
+    Order created = orders.create(request.toCommand());
+    URI location = ServletUriComponentsBuilder
+        .fromCurrentRequest()
+        .path("/{id}")
+        .buildAndExpand(created.id())
+        .toUri();
+
+    return ResponseEntity.created(location)
+        .body(OrderResponse.from(created));
+}</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>200 OK</td>
+        <td>Successful response with representation</td>
+      </tr>
+      <tr>
+        <td>201 Created</td>
+        <td>Resource created, usually with Location</td>
+      </tr>
+      <tr>
+        <td>202 Accepted</td>
+        <td>Work accepted but not completed</td>
+      </tr>
+      <tr>
+        <td>204 No Content</td>
+        <td>Successful response with no body</td>
+      </tr>
+      <tr>
+        <td>400 Bad Request</td>
+        <td>Malformed syntax, conversion, or validation</td>
+      </tr>
+      <tr>
+        <td>401 Unauthorized</td>
+        <td>Authentication required or invalid</td>
+      </tr>
+      <tr>
+        <td>403 Forbidden</td>
+        <td>Authenticated caller lacks permission</td>
+      </tr>
+      <tr>
+        <td>404 Not Found</td>
+        <td>Resource does not exist or is intentionally concealed</td>
+      </tr>
+      <tr>
+        <td>409 Conflict</td>
+        <td>Request conflicts with current resource state</td>
+      </tr>
+      <tr>
+        <td>412 Precondition Failed</td>
+        <td>Conditional update precondition failed</td>
+      </tr>
+      <tr>
+        <td>422 Unprocessable Content</td>
+        <td>Well-formed input violates semantic rules</td>
+      </tr>
+      <tr>
+        <td>500 Internal Server Error</td>
+        <td>Unexpected server failure</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="errors"><span class="num">10.</span> Global error handling and ProblemDetail</h2>
+<p class="lead">
+  Errors need a stable machine-readable contract, a useful human explanation, and a correlation
+  identifier for support.
+</p>
+
+<p>
+  Spring supports RFC 9457 problem details through <code>ProblemDetail</code>. Standard fields
+  include type, title, status, detail, and instance. Extra properties can carry safe structured
+  fields such as validation errors or a trace identifier.
+</p>
+
+<figure class="code">
+  <figcaption><b>Central domain exception mapping</b></figcaption>
+  <pre><code>@RestControllerAdvice
+class ApiExceptionHandler {
+
+    @ExceptionHandler(OrderNotFoundException.class)
+    ResponseEntity&lt;ProblemDetail&gt; handleNotFound(
+            OrderNotFoundException ex,
+            HttpServletRequest request) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.NOT_FOUND,
+            "The requested order does not exist"
+        );
+        problem.setTitle("Order not found");
+        problem.setType(URI.create("https://api.example/problems/order-not-found"));
+        problem.setInstance(URI.create(request.getRequestURI()));
+        problem.setProperty("orderId", ex.orderId());
+        return ResponseEntity.status(problem.getStatus()).body(problem);
+    }
+}</code></pre>
+</figure>
+
+<h3 id="validation-errors">Validation error shape</h3>
+<figure class="code">
+  <figcaption><b>Stable field error payload</b></figcaption>
+  <pre><code>{
+  "type": "https://api.example/problems/validation",
+  "title": "Request validation failed",
+  "status": 400,
+  "detail": "One or more fields are invalid",
+  "instance": "/api/orders",
+  "errors": [
+    {
+      "field": "items[0].quantity",
+      "code": "Min",
+      "message": "must be greater than or equal to 1"
+    }
+  ],
+  "traceId": "8f0b31a6"
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Do not leak internals</strong>
+  <p>
+    Never return stack traces, SQL, table names, class names, secrets, or raw upstream responses to
+    public clients. Log internal context with the same trace identifier and return a safe contract.
+  </p>
+</div>
+
+<p>
+  Handle known domain and framework failures specifically. Keep a final unexpected-error handler,
+  but do not convert every exception into 200 or 400. A server bug is still a 500 and must remain
+  observable.
+</p>
+
+<h2 id="http-semantics"><span class="num">11.</span> HTTP method semantics</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Safe</th>
+        <th>Idempotent</th>
+        <th>Typical meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>GET</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Read a representation</td>
+      </tr>
+      <tr>
+        <td>HEAD</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Read response metadata without body</td>
+      </tr>
+      <tr>
+        <td>POST</td>
+        <td>No</td>
+        <td>Not inherently</td>
+        <td>Create subordinate resource or execute command</td>
+      </tr>
+      <tr>
+        <td>PUT</td>
+        <td>No</td>
+        <td>Yes</td>
+        <td>Replace resource at known URI</td>
+      </tr>
+      <tr>
+        <td>PATCH</td>
+        <td>No</td>
+        <td>Depends on patch semantics</td>
+        <td>Apply partial modification</td>
+      </tr>
+      <tr>
+        <td>DELETE</td>
+        <td>No</td>
+        <td>Yes</td>
+        <td>Remove resource state</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Idempotent means repeating the same request has the same intended effect, not that every response
+  byte or status must be identical. Repeating a DELETE may return 204 first and 404 later while the
+  resource remains deleted.
+</p>
+
+<h2 id="put-patch"><span class="num">12.</span> PUT, PATCH, and lost updates</h2>
+<p class="lead">Partial updates must distinguish "field absent" from "field present with null."</p>
+
+<p>
+  A normal Java nullable property cannot represent all patch states by itself. Use a documented
+  patch media type, explicit wrapper, JSON Merge Patch, JSON Patch, or command-specific endpoint.
+  Validate the final state after applying the patch.
+</p>
+
+<h3 id="conditional-update">Optimistic HTTP concurrency</h3>
+<figure class="code">
+  <figcaption><b>ETag-based update concept</b></figcaption>
+  <pre><code>GET /api/orders/42
+ETag: "v7"
+
+PUT /api/orders/42
+If-Match: "v7"
+
+// If current version is no longer v7:
+HTTP/1.1 412 Precondition Failed</code></pre>
+</figure>
+
+<p>
+  Conditional requests prevent one client from silently overwriting another client's update. Map the
+  HTTP version token to an application or persistence version deliberately.
+</p>
+
+<h2 id="pagination"><span class="num">13.</span> Pagination, sorting, and filtering</h2>
+<p class="lead">Every collection endpoint needs a bounded result size and deterministic order.</p>
+
+<figure class="code">
+  <figcaption><b>Page response contract</b></figcaption>
+  <pre><code>public record PageResponse&lt;T&gt;(
+    List&lt;T&gt; items,
+    int page,
+    int size,
+    long totalElements,
+    int totalPages
+) {}</code></pre>
+</figure>
+
+<p>
+  Offset pagination is easy and supports page numbers, but deep offsets become expensive and results
+  can shift during concurrent writes. Cursor or keyset pagination uses the last ordered key and is
+  stronger for large changing feeds.
+</p>
+
+<ul class="clean">
+  <li>Enforce a maximum page size.</li>
+  <li>Allow only a whitelist of sortable fields.</li>
+  <li>Add a unique tie-breaker to every sort, such as <code>createdAt,id</code>.</li>
+  <li>Do not pass raw property or SQL fragments from clients to the database.</li>
+  <li>Document whether totals are exact, approximate, or omitted.</li>
+  <li>Encode cursor state so clients do not construct invalid cursors.</li>
+</ul>
+
+<h2 id="content-negotiation"><span class="num">14.</span> Content negotiation</h2>
+<p class="lead">
+  Content negotiation selects a representation that the client accepts and the server can produce.
+</p>
+
+<p>
+  Spring MVC checks the <code>Accept</code> header by default. Controller <code>produces</code> and
+  <code>consumes</code> constraints make supported media types explicit. Prefer header-based
+  negotiation. Path extensions can create ambiguous routing and security problems.
+</p>
+
+<figure class="code">
+  <figcaption><b>Versioned vendor media type example</b></figcaption>
+  <pre><code>@GetMapping(
+    path = "/{id}",
+    produces = "application/vnd.example.order-v2+json"
+)
+OrderV2Response getV2(@PathVariable UUID id) {
+    return OrderV2Response.from(orders.get(id));
+}</code></pre>
+</figure>
+
+<h2 id="versioning"><span class="num">15.</span> API versioning and compatibility</h2>
+<p class="lead">
+  Version only when an incompatible contract change cannot be introduced additively.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>Benefit</th>
+        <th>Tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>URI, such as <code>/v2/orders</code></td>
+        <td>Visible and easy to route</td>
+        <td>Version becomes part of resource URI</td>
+      </tr>
+      <tr>
+        <td>Media type</td>
+        <td>Versions representation explicitly</td>
+        <td>Harder for humans and some tooling</td>
+      </tr>
+      <tr>
+        <td>Custom header</td>
+        <td>Keeps paths stable</td>
+        <td>Less standard and less visible</td>
+      </tr>
+      <tr>
+        <td>Query parameter</td>
+        <td>Simple to test</td>
+        <td>Can interact poorly with caches</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Adding an optional response field is often compatible for tolerant clients. Renaming a field,
+  changing meaning, removing an enum value, or making an optional request field required can be
+  breaking. Maintain contract tests and publish a deprecation and retirement policy.
+</p>
+
+<h2 id="idempotency"><span class="num">16.</span> Idempotency for unsafe operations</h2>
+<p class="lead">
+  Networks retry. A client can lose the response even when the server committed the operation.
+</p>
+
+<p>
+  For payment, order, or booking creation, accept an idempotency key scoped to the caller and
+  operation. Atomically store the key, a fingerprint of the request, operation status, and final
+  response. A repeated matching request returns the stored result. A reused key with different input
+  is rejected.
+</p>
+
+<figure class="code">
+  <figcaption><b>Idempotent create contract</b></figcaption>
+  <pre><code>POST /api/orders
+Idempotency-Key: 64f7d828-9ce0-4fcb-a3f2-a6524fb874d2
+
+// Server transaction:
+// 1. Insert unique (client_id, idempotency_key).
+// 2. Create order exactly once.
+// 3. Store status and response reference.
+// 4. Commit.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>An in-memory map is not enough</strong>
+  <p>
+    It is lost on restart, differs across instances, and races under concurrency. Use durable shared
+    storage and a unique constraint. Define retention and in-progress retry behavior.
+  </p>
+</div>
+
+<h2 id="files"><span class="num">17.</span> File upload and download</h2>
+<p class="lead">
+  Files are untrusted, potentially large inputs. Validate limits and stream data where possible.
+</p>
+
+<figure class="code">
+  <figcaption><b>Multipart upload with metadata</b></figcaption>
+  <pre><code>@PostMapping(
+    path = "/attachments",
+    consumes = MediaType.MULTIPART_FORM_DATA_VALUE
+)
+AttachmentResponse upload(
+    @Valid @RequestPart("metadata") AttachmentMetadata metadata,
+    @RequestPart("file") MultipartFile file
+) {
+    return attachments.store(metadata, file);
+}</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>Set request and per-file size limits.</li>
+  <li>Do not trust the supplied filename or content type.</li>
+  <li>Generate storage keys and prevent path traversal.</li>
+  <li>Scan files where the risk model requires it.</li>
+  <li>Store large objects outside the application filesystem when deployments are ephemeral.</li>
+  <li>Stream downloads and support cache or range semantics when appropriate.</li>
+  <li>Set safe <code>Content-Disposition</code> and response content type.</li>
+</ul>
+
+<h2 id="cors"><span class="num">18.</span> CORS</h2>
+<p class="lead">
+  CORS is a browser policy that controls which origins may read cross-origin responses. It is not
+  authentication or authorization.
+</p>
+
+<p>
+  Browsers send a preflight request for certain cross-origin operations. Spring MVC can process
+  preflight, simple, and actual CORS requests using handler-level or global configuration.
+</p>
+
+<figure class="code">
+  <figcaption><b>Explicit global CORS configuration</b></figcaption>
+  <pre><code>@Configuration
+class WebConfiguration implements WebMvcConfigurer {
+
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/api/**")
+            .allowedOrigins("https://app.example.com")
+            .allowedMethods("GET", "POST", "PUT", "DELETE")
+            .allowedHeaders("Content-Type", "Authorization", "Idempotency-Key")
+            .exposedHeaders("Location", "ETag")
+            .allowCredentials(true)
+            .maxAge(1800);
+    }
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Credentials increase trust</strong>
+  <p>
+    Use a finite origin allowlist when cookies or other credentials are allowed. A permissive CORS
+    response does not grant server authorization by itself, but it can expose authenticated browser
+    data to an untrusted origin when configured badly.
+  </p>
+</div>
+
+<h2 id="filters-interceptors"><span class="num">19.</span> Filters, interceptors, and advice</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mechanism</th>
+        <th>Boundary</th>
+        <th>Good use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Servlet filter</td>
+        <td>Raw servlet request and response</td>
+        <td>Security chain, correlation ID, request wrapping</td>
+      </tr>
+      <tr>
+        <td>Handler interceptor</td>
+        <td>Mapped MVC handler</td>
+        <td>Handler-aware timing or locale behavior</td>
+      </tr>
+      <tr>
+        <td><code>ResponseBodyAdvice</code></td>
+        <td>Before response body conversion</td>
+        <td>Focused response-body policy</td>
+      </tr>
+      <tr>
+        <td><code>@ControllerAdvice</code></td>
+        <td>Across selected controllers</td>
+        <td>Error mapping and shared binding concerns</td>
+      </tr>
+      <tr>
+        <td>Service AOP</td>
+        <td>Application method boundary</td>
+        <td>Transactions and method security</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Do not read a large request body in a logging filter without size limits and redaction. Servlet
+  streams are normally one-shot unless wrapped. Log metadata by default and sample safe bodies only
+  under an explicit policy.
+</p>
+
+<h2 id="async"><span class="num">20.</span> Asynchronous request handling</h2>
+<p class="lead">
+  Servlet async support can release the container thread while application work completes elsewhere.
+</p>
+
+<p>
+  Spring MVC supports return types such as <code>Callable</code>, <code>DeferredResult</code>, and
+  streaming response forms. This does not make blocking libraries non-blocking. Work still consumes
+  threads in the configured executor. Define timeouts, cancellation behavior, executor capacity, and
+  observability.
+</p>
+
+<p>
+  For long durable jobs, return 202 with a job resource, persist job state, and process through a
+  durable worker mechanism. Keeping one HTTP connection open for minutes is not a reliable job
+  queue.
+</p>
+
+<h2 id="security"><span class="num">21.</span> Security at the web boundary</h2>
+<ul class="clean">
+  <li>Authenticate and authorize on the server for every protected operation.</li>
+  <li>Validate resource ownership, not only broad roles.</li>
+  <li>Keep CORS, CSRF, authentication, and authorization as separate concepts.</li>
+  <li>Apply request size, header size, and multipart limits.</li>
+  <li>Use HTTPS and secure proxy-header configuration.</li>
+  <li>Do not accept arbitrary sort fields, class names, URLs, or file paths.</li>
+  <li>Prevent mass assignment by mapping explicit request DTO fields.</li>
+  <li>Rate-limit costly and abuse-sensitive operations at a suitable boundary.</li>
+  <li>Return safe errors and keep detailed evidence in protected logs.</li>
+</ul>
+
+<h2 id="testing"><span class="num">22.</span> Testing controllers</h2>
+<p class="lead">
+  Controller tests should verify the HTTP contract: mapping, conversion, validation, status,
+  headers, body, and error shape.
+</p>
+
+<figure class="code">
+  <figcaption><b>MockMvc contract test</b></figcaption>
+  <pre><code>@WebMvcTest(OrderController.class)
+class OrderControllerTest {
+
+    @Autowired MockMvc mvc;
+    @MockBean OrderApplicationService orders;
+
+    @Test
+    void rejectsEmptyItems() throws Exception {
+        mvc.perform(post("/api/orders")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"customerId":"6b6c0c98-f7d1-48ef-9435-4a532daff4ee",
+                     "items":[]}
+                    """))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.type")
+                .value("https://api.example/problems/validation"));
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Use unit tests for mapping helpers and business services, MVC slice tests for the HTTP layer, and
+  a smaller number of full integration tests for security, serialization, database, and deployment
+  wiring. Test the actual error contract, not only the status.
+</p>
+
+<h2 id="production-checklist"><span class="num">23.</span> Production API checklist</h2>
+<ul class="clean">
+  <li>Use resource-oriented paths and explicit HTTP methods.</li>
+  <li>Keep controllers thin and use request and response DTOs.</li>
+  <li>Validate input shape, domain rules, and database invariants at the right layers.</li>
+  <li>Return correct statuses, headers, and stable RFC 9457 error bodies.</li>
+  <li>Bound collection sizes, file sizes, timeouts, pools, and response payloads.</li>
+  <li>Use deterministic pagination and whitelist filter and sort fields.</li>
+  <li>Protect unsafe retryable operations with durable idempotency.</li>
+  <li>Use optimistic concurrency for update conflicts when clients can race.</li>
+  <li>Configure a finite CORS policy and enforce server-side authorization.</li>
+  <li>Document compatibility, versioning, deprecation, and error contracts.</li>
+  <li>Emit trace identifiers, metrics, structured logs, and safe diagnostics.</li>
+  <li>Test mappings, validation, serialization, security, and failure responses.</li>
+</ul>
+
+<h2 id="mistakes"><span class="num">24.</span> Common mistakes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Failure</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Returning entities</td>
+        <td>Leaks fields and triggers uncontrolled loading</td>
+        <td>Map explicit response DTOs</td>
+      </tr>
+      <tr>
+        <td>Business logic in controllers</td>
+        <td>Hard-to-test and duplicated use cases</td>
+        <td>Delegate to application services</td>
+      </tr>
+      <tr>
+        <td>Returning 200 for every result</td>
+        <td>Clients cannot use HTTP semantics</td>
+        <td>Choose status codes by outcome</td>
+      </tr>
+      <tr>
+        <td>One generic catch-all 400 handler</td>
+        <td>Server bugs look like client errors</td>
+        <td>Map known failures and preserve 500</td>
+      </tr>
+      <tr>
+        <td>Unbounded list endpoint</td>
+        <td>Memory and database exhaustion</td>
+        <td>Require bounded pagination</td>
+      </tr>
+      <tr>
+        <td>Wildcard credentialed CORS</td>
+        <td>Untrusted origins can access sensitive browser data</td>
+        <td>Use a finite allowlist</td>
+      </tr>
+      <tr>
+        <td>In-memory idempotency keys</td>
+        <td>Duplicates across restarts and instances</td>
+        <td>Use durable unique storage</td>
+      </tr>
+      <tr>
+        <td>PATCH with ordinary nullable fields</td>
+        <td>Absent and explicit null are confused</td>
+        <td>Use explicit patch semantics</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="interview"><span class="num">25.</span> Interview questions and answers</h2>
+
+<h3 id="qa-1">What is DispatcherServlet?</h3>
+<p>
+  It is Spring MVC's front controller. It coordinates handler mapping, handler invocation, argument
+  resolution, return-value processing, message conversion, exception resolution, and view handling.
+</p>
+
+<h3 id="qa-2">What is the difference between @Controller and @RestController?</h3>
+<p>
+  <code>@Controller</code> participates in MVC and commonly returns view names unless response-body
+  behavior is selected. <code>@RestController</code> combines <code>@Controller</code> and
+  <code>@ResponseBody</code>, so return values normally become response bodies.
+</p>
+
+<h3 id="qa-3">How does @RequestBody work?</h3>
+<p>
+  MVC selects an <code>HttpMessageConverter</code> using the target Java type and request media
+  type, reads the body, deserializes it, and optionally validates the resulting object.
+</p>
+
+<h3 id="qa-4">Why use DTOs instead of entities?</h3>
+<p>
+  DTOs define a stable transport contract, limit accepted and exposed fields, avoid lazy-loading and
+  object-cycle problems, and decouple API evolution from persistence design.
+</p>
+
+<h3 id="qa-5">What is the difference between @Valid and @Validated?</h3>
+<p>
+  Both can trigger validation. <code>@Valid</code> is the Jakarta standard and supports cascaded
+  validation. Spring's <code>@Validated</code> also supports validation groups and is used in
+  additional Spring validation scenarios. Exact MVC method-validation behavior depends on where
+  constraints are declared.
+</p>
+
+<h3 id="qa-6">Filter versus interceptor?</h3>
+<p>
+  A filter runs at the Servlet boundary and can wrap raw requests and responses. An interceptor runs
+  after MVC maps a handler and can access handler metadata. Security is normally implemented in the
+  filter chain.
+</p>
+
+<h3 id="qa-7">What is content negotiation?</h3>
+<p>
+  It is selecting a response representation compatible with what the client accepts and the server
+  can produce. Spring MVC uses the <code>Accept</code> header by default and available message
+  converters.
+</p>
+
+<h3 id="qa-8">How do you make POST creation safe to retry?</h3>
+<p>
+  Accept an idempotency key, atomically claim it in durable shared storage, bind it to a request
+  fingerprint, store the operation result, and return that result for matching retries.
+</p>
+
+<h3 id="qa-9">CORS versus CSRF?</h3>
+<p>
+  CORS controls whether browser JavaScript may read a cross-origin response. CSRF protects a server
+  from unwanted state-changing requests made with automatically attached credentials. One does not
+  replace the other.
+</p>
+
+<h3 id="qa-10">Offset versus cursor pagination?</h3>
+<p>
+  Offset pagination supports page numbers but deep offsets cost more and concurrent changes can
+  shift results. Cursor pagination continues after a stable ordered key and is stronger for large,
+  changing datasets.
+</p>
+
+<h2 id="practice"><span class="num">26.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>Design CRUD endpoints for orders and justify every method and status code.</li>
+  <li>Create nested request validation and return a stable list of field errors.</li>
+  <li>Implement ProblemDetail mappings for not found, conflict, and unexpected failure.</li>
+  <li>Add deterministic offset pagination, then redesign it with a cursor.</li>
+  <li>Protect an update with ETag and <code>If-Match</code>.</li>
+  <li>Design durable idempotency for order creation under concurrent duplicate requests.</li>
+  <li>Upload a file safely with metadata, size limits, and generated storage keys.</li>
+  <li>Write MockMvc tests for media type, validation, status, headers, and error body.</li>
+</ol>
+
+<h2 id="cheatsheet"><span class="num">27.</span> One-screen cheat sheet</h2>
+<div class="key">
+  <strong>MVC and REST rules</strong>
+  <ul class="clean">
+    <li><code>DispatcherServlet</code> coordinates the MVC request pipeline.</li>
+    <li>Controllers translate HTTP and delegate business work.</li>
+    <li>Mappings match path, method, headers, parameters, and media types.</li>
+    <li>Message converters read request bodies and write response bodies.</li>
+    <li>DTOs protect API contracts from domain and persistence details.</li>
+    <li>Validate transport shape, domain rules, and storage invariants separately.</li>
+    <li>Use correct status codes, headers, and stable ProblemDetail responses.</li>
+    <li>Bound and deterministically order every collection endpoint.</li>
+    <li>Use durable idempotency and optimistic concurrency where retries or races matter.</li>
+    <li>CORS is a browser read policy, not authorization.</li>
+    <li>Test the complete HTTP contract, including failures.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">28.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >DispatcherServlet</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-requestmapping.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Annotated request mappings</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-validation.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring MVC validation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-rest-exceptions.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >REST error responses and ProblemDetail</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/web/webmvc-cors.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring MVC CORS</a
+    >
+  </li>
+</ul>

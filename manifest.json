@@ -52,6 +52,15 @@
           "path": "postgresql/extensions-specialized-features"
         }
       ]
+    },
+    {
+      "name": "Spring",
+      "pages": [
+        {
+          "title": "Spring MVC and REST APIs",
+          "path": "spring/spring-mvc-rest-apis"
+        }
+      ]
     }
   ]
 }
