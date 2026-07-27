@@ -1,0 +1,993 @@
+<h1>Spring Core Fundamentals - Complete Notes</h1>
+<p class="subtitle">
+  A complete mental model of Spring's IoC container, dependency injection, beans, configuration,
+  scopes, lifecycle, component scanning, dependency selection, extension points, and common
+  interview traps.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The Spring Core mental model</h2>
+<p class="lead">
+  Spring Core is an object factory plus an object graph assembler. Your classes describe what they
+  need, configuration describes which objects exist, and the container creates and connects them.
+</p>
+
+<p>
+  In plain Java, an object often creates or locates its collaborators. A service might call
+  <code>new PostgresOrderRepository()</code> directly. That service now controls both business
+  behavior and infrastructure construction. In Spring, the service declares an
+  <code>OrderRepository</code> dependency, and the container supplies a configured implementation.
+  The business class stays focused on business behavior.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a restaurant kitchen. A chef declares the station and ingredients needed for a dish.
+    The kitchen manager assigns a prepared station and supplies ingredients. The chef does not build
+    an oven, negotiate with suppliers, or search every cupboard during each order. Spring plays the
+    kitchen-manager role for application objects.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Meaning</th>
+        <th>Question it answers</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>IoC</td>
+        <td>Framework controls creation and wiring</td>
+        <td>Who assembles the application?</td>
+      </tr>
+      <tr>
+        <td>DI</td>
+        <td>Dependencies are supplied from outside</td>
+        <td>How does an object receive collaborators?</td>
+      </tr>
+      <tr>
+        <td>Bean</td>
+        <td>An object managed by the container</td>
+        <td>Which objects receive Spring services?</td>
+      </tr>
+      <tr>
+        <td>Bean definition</td>
+        <td>Metadata used to create a bean</td>
+        <td>How should the bean be constructed?</td>
+      </tr>
+      <tr>
+        <td>ApplicationContext</td>
+        <td>The commonly used IoC container API</td>
+        <td>Where is the managed object graph held?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Spring does not replace object-oriented design</strong>
+  <p>
+    Dependency injection magnifies the design you give it. Small classes with clear responsibilities
+    become easy to assemble and test. A large class with hidden state remains difficult even after
+    adding <code>@Component</code>.
+  </p>
+</div>
+
+<h2 id="ioc-di"><span class="num">01.</span> Inversion of Control and dependency injection</h2>
+<p class="lead">
+  IoC is the broad principle. Dependency injection is Spring's primary technique for implementing
+  it.
+</p>
+
+<p>
+  Control is inverted because application objects no longer control the construction or lookup of
+  their dependencies. They expose constructor parameters, factory-method parameters, or properties.
+  The container resolves those requirements from its bean definitions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Tightly coupled construction</b></figcaption>
+  <pre><code>public final class CheckoutService {
+    private final PaymentGateway gateway =
+        new StripePaymentGateway(System.getenv("STRIPE_KEY"));
+
+    public Receipt checkout(Order order) {
+        return gateway.charge(order);
+    }
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Constructor injection</b></figcaption>
+  <pre><code>public final class CheckoutService {
+    private final PaymentGateway gateway;
+
+    public CheckoutService(PaymentGateway gateway) {
+        this.gateway = gateway;
+    }
+
+    public Receipt checkout(Order order) {
+        return gateway.charge(order);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The second class is ordinary Java. It does not import Spring. Production configuration can supply
+  a real gateway, while a unit test can supply a fake. This is dependency inversion as well as
+  dependency injection: high-level policy depends on an abstraction rather than a concrete remote
+  client.
+</p>
+
+<h3 id="di-styles">Constructor, setter, and field injection</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Style</th>
+        <th>Best use</th>
+        <th>Main tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Constructor</td>
+        <td>Required dependencies</td>
+        <td>Dependencies are explicit and object can be immutable</td>
+      </tr>
+      <tr>
+        <td>Setter</td>
+        <td>Truly optional or reconfigurable dependency</td>
+        <td>Object may exist temporarily in an incomplete state</td>
+      </tr>
+      <tr>
+        <td>Field</td>
+        <td>Rare framework integration cases</td>
+        <td>Hidden dependency, reflection required, weak testability</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="note">
+  <strong>Why constructor injection is the default</strong>
+  <p>
+    The compiler forces callers to provide every required collaborator. Fields can be final. Tests
+    instantiate the class without starting Spring. A constructor with too many parameters also
+    exposes a class that probably has too many responsibilities.
+  </p>
+</div>
+
+<h2 id="container"><span class="num">02.</span> BeanFactory and ApplicationContext</h2>
+<p class="lead">
+  <code>BeanFactory</code> defines the basic container contract.
+  <code>ApplicationContext</code> builds on it with the features most applications need.
+</p>
+
+<p>
+  <code>ApplicationContext</code> creates, configures, and assembles beans from configuration
+  metadata. It also integrates event publication, internationalization, resource loading,
+  environment and profile support, annotation processing, and AOP infrastructure. Application code
+  normally lets Spring Boot create the context instead of constructing it manually.
+</p>
+
+<figure class="code">
+  <figcaption><b>A small standalone annotation-based context</b></figcaption>
+  <pre><code>try (var context =
+         new AnnotationConfigApplicationContext(AppConfiguration.class)) {
+    CheckoutService service = context.getBean(CheckoutService.class);
+    service.checkout(sampleOrder());
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Do not turn the context into a service locator</strong>
+  <p>
+    Calling <code>applicationContext.getBean(...)</code> throughout business code hides dependencies
+    and couples the code to Spring. Prefer constructor injection. Programmatic lookup is appropriate
+    mainly in framework integration, bootstrapping, or genuinely dynamic selection.
+  </p>
+</div>
+
+<h3 id="configuration-metadata">Sources of configuration metadata</h3>
+<ul class="clean">
+  <li>Annotated component classes discovered through classpath scanning.</li>
+  <li><code>@Configuration</code> classes containing <code>@Bean</code> factory methods.</li>
+  <li>XML bean definitions, still supported for legacy and special integration needs.</li>
+  <li>Programmatic bean registration for frameworks and dynamic infrastructure.</li>
+</ul>
+
+<h2 id="bean-definitions"><span class="num">03.</span> Bean definitions and bean identity</h2>
+<p class="lead">A bean definition is a recipe. The bean is the object created from that recipe.</p>
+
+<p>
+  Definition metadata can include the bean class or factory method, constructor arguments,
+  properties, scope, lazy behavior, initialization and destruction callbacks, qualifiers, and
+  dependencies. A singleton definition normally produces one object per container, not one object
+  per JVM.
+</p>
+
+<figure class="code">
+  <figcaption><b>Explicit Java configuration</b></figcaption>
+  <pre><code>@Configuration
+class BillingConfiguration {
+
+    @Bean
+    PaymentGateway paymentGateway(BillingProperties properties) {
+        return new StripePaymentGateway(properties.apiKey());
+    }
+
+    @Bean
+    CheckoutService checkoutService(PaymentGateway gateway) {
+        return new CheckoutService(gateway);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  By default, a <code>@Bean</code> method name becomes the bean name. Component scanning derives a
+  name such as <code>checkoutService</code> from <code>CheckoutService</code>. Prefer dependency
+  resolution by type. Use names and qualifiers only when the domain genuinely has multiple
+  candidates.
+</p>
+
+<h3 id="factory-bean">FactoryBean is not an ordinary factory bean</h3>
+<p>
+  A class implementing <code>FactoryBean&lt;T&gt;</code> is managed by Spring, but a normal lookup
+  returns the product <code>T</code>. Prefixing the bean name with <code>&amp;</code> asks for the
+  factory object itself. Frameworks use this extension point to build objects that need complex
+  creation logic, such as proxies.
+</p>
+
+<h2 id="component-scanning"><span class="num">04.</span> Stereotypes and component scanning</h2>
+<p class="lead">
+  Component scanning finds candidate classes and registers bean definitions. It does not scan the
+  entire JVM automatically.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Annotation</th>
+        <th>Intent</th>
+        <th>Extra meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@Component</code></td>
+        <td>General managed component</td>
+        <td>Base stereotype</td>
+      </tr>
+      <tr>
+        <td><code>@Service</code></td>
+        <td>Application or domain service</td>
+        <td>Communicates architectural role</td>
+      </tr>
+      <tr>
+        <td><code>@Repository</code></td>
+        <td>Persistence component</td>
+        <td>Participates in exception translation</td>
+      </tr>
+      <tr>
+        <td><code>@Controller</code></td>
+        <td>Spring MVC controller</td>
+        <td>Web request handling semantics</td>
+      </tr>
+      <tr>
+        <td><code>@Configuration</code></td>
+        <td>Source of bean definitions</td>
+        <td>Declares configuration intent</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Scanned components with constructor injection</b></figcaption>
+  <pre><code>@Repository
+final class JdbcOrderRepository implements OrderRepository {
+    // persistence implementation
+}
+
+@Service
+final class OrderService {
+    private final OrderRepository orders;
+
+    OrderService(OrderRepository orders) {
+        this.orders = orders;
+    }
+}</code></pre>
+</figure>
+
+<p>
+  A single constructor does not need <code>@Autowired</code>. With several constructors, mark the
+  intended injectable constructor or make the choice unambiguous. Keep the main application class in
+  a root package so its default scan covers subpackages without accidentally scanning unrelated
+  code.
+</p>
+
+<div class="warn">
+  <strong>Scanning is registration, not architecture</strong>
+  <p>
+    Package every class deliberately. Broad scans can pull test fixtures, optional adapters, or
+    duplicate implementations into the context. Use explicit imports or narrow scan boundaries for
+    modular applications.
+  </p>
+</div>
+
+<h2 id="java-configuration"><span class="num">05.</span> Java configuration and @Bean methods</h2>
+<p class="lead">
+  Component scanning is convenient for classes you own. <code>@Bean</code> is ideal for third-party
+  classes and explicit infrastructure assembly.
+</p>
+
+<figure class="code">
+  <figcaption><b>Configuring a third-party client</b></figcaption>
+  <pre><code>@Configuration(proxyBeanMethods = false)
+class ClientConfiguration {
+
+    @Bean
+    FraudClient fraudClient(FraudProperties properties) {
+        return FraudClient.builder()
+            .baseUrl(properties.baseUrl())
+            .connectTimeout(properties.connectTimeout())
+            .build();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  With <code>proxyBeanMethods = false</code>, direct Java calls between <code>@Bean</code> methods
+  are ordinary calls and may create extra objects. Prefer method-parameter injection as shown above.
+  Full configuration proxying can intercept calls between bean methods to preserve container
+  semantics, but explicit parameter injection is clearer and avoids unnecessary proxying.
+</p>
+
+<h3 id="import">@Import and modular configuration</h3>
+<p>
+  <code>@Import</code> composes known configuration classes without expanding a component scan. This
+  supports feature modules with explicit boundaries. A module can publish one configuration class
+  while keeping internal implementation packages unscanned by consumers.
+</p>
+
+<h2 id="resolution"><span class="num">06.</span> How dependency resolution works</h2>
+<p class="lead">
+  Spring primarily resolves injection points by assignable type, then uses qualifiers and priority
+  metadata to disambiguate candidates.
+</p>
+
+<figure class="code">
+  <figcaption><b>Two implementations create ambiguity</b></figcaption>
+  <pre><code>interface MessageSender {
+    void send(Message message);
+}
+
+@Component
+class EmailSender implements MessageSender { /* ... */ }
+
+@Component
+class SmsSender implements MessageSender { /* ... */ }</code></pre>
+</figure>
+
+<p>
+  Injecting one <code>MessageSender</code> now fails with a
+  <code>NoUniqueBeanDefinitionException</code>. Spring should not guess which business channel is
+  correct.
+</p>
+
+<h3 id="primary">@Primary</h3>
+<p>
+  <code>@Primary</code> marks a default candidate when several beans match one value injection
+  point. It is useful when one implementation is the application-wide default, but it should not
+  hide domain decisions that belong in explicit orchestration.
+</p>
+
+<h3 id="qualifier">@Qualifier</h3>
+<figure class="code">
+  <figcaption><b>Semantic qualification</b></figcaption>
+  <pre><code>@Component
+@Qualifier("transactional")
+class TransactionalEmailSender implements MessageSender { /* ... */ }
+
+@Service
+class ReceiptService {
+    ReceiptService(@Qualifier("transactional") MessageSender sender) {
+        this.sender = sender;
+    }
+}</code></pre>
+</figure>
+
+<p>
+  A qualifier narrows candidates; it is not merely a bean-name lookup. Custom qualifier annotations
+  make intent type-safe and reusable. For example, <code>@TransactionalChannel</code> is clearer
+  than repeating a string across the codebase.
+</p>
+
+<h3 id="collections">Injecting all implementations</h3>
+<p>
+  Inject <code>List&lt;Validator&gt;</code>, <code>Set&lt;Handler&gt;</code>, or
+  <code>Map&lt;String, Handler&gt;</code> when the application intentionally composes every matching
+  strategy. Use <code>@Order</code> or <code>Ordered</code> when iteration order has meaning.
+</p>
+
+<h2 id="optional-lazy"><span class="num">07.</span> Optional, lazy, and provider dependencies</h2>
+<p class="lead">
+  Different injection forms express different lifecycle and availability requirements.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Form</th>
+        <th>Meaning</th>
+        <th>Use carefully because</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Optional&lt;T&gt;</code></td>
+        <td>Zero or one candidate</td>
+        <td>Optional infrastructure can spread branching logic</td>
+      </tr>
+      <tr>
+        <td><code>ObjectProvider&lt;T&gt;</code></td>
+        <td>Lazy or repeated programmatic retrieval</td>
+        <td>It introduces container-aware lookup</td>
+      </tr>
+      <tr>
+        <td><code>@Lazy T</code></td>
+        <td>Inject a proxy and resolve target later</td>
+        <td>Failures move from startup to first use</td>
+      </tr>
+      <tr>
+        <td><code>List&lt;T&gt;</code></td>
+        <td>All matching candidates</td>
+        <td>Every discovered bean joins the behavior</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Default eager singleton creation makes startup a useful validation phase. The application fails
+  early when wiring is invalid. Use laziness for measured startup or lifecycle reasons, not to hide
+  broken dependency graphs.
+</p>
+
+<h2 id="scopes"><span class="num">08.</span> Bean scopes</h2>
+<p class="lead">Scope answers how long a bean instance lives and which callers share it.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Scope</th>
+        <th>Instance boundary</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>singleton</td>
+        <td>One per bean definition per container</td>
+        <td>Stateless services and shared infrastructure</td>
+      </tr>
+      <tr>
+        <td>prototype</td>
+        <td>New instance for each container retrieval</td>
+        <td>Stateful helper that Spring creates</td>
+      </tr>
+      <tr>
+        <td>request</td>
+        <td>One per HTTP request</td>
+        <td>Request-specific context</td>
+      </tr>
+      <tr>
+        <td>session</td>
+        <td>One per HTTP session</td>
+        <td>Session state, used sparingly</td>
+      </tr>
+      <tr>
+        <td>application</td>
+        <td>One per ServletContext</td>
+        <td>Web-application shared state</td>
+      </tr>
+      <tr>
+        <td>websocket</td>
+        <td>One per WebSocket session</td>
+        <td>WebSocket conversation state</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>Singleton does not mean thread-safe</strong>
+  <p>
+    A singleton service is shared by concurrent requests. Prefer immutable configuration and local
+    variables. Mutable request data in fields creates races. Spring controls lifetime, not the
+    correctness of concurrent access.
+  </p>
+</div>
+
+<h3 id="scope-mismatch">Shorter-lived dependency inside a singleton</h3>
+<p>
+  Injecting a prototype directly into a singleton resolves the prototype only while the singleton is
+  created. It does not create a new prototype on every method call. Use
+  <code>ObjectProvider</code>, method injection, or a scoped proxy when repeated contextual lookup
+  is truly required.
+</p>
+
+<h2 id="lifecycle"><span class="num">09.</span> Bean lifecycle</h2>
+<p class="lead">
+  Bean creation is a pipeline. Understanding the pipeline explains why proxies, annotation
+  processing, and lifecycle callbacks behave as they do.
+</p>
+
+<ol class="clean">
+  <li>Load and register bean definitions.</li>
+  <li>Run bean-factory post-processors that may change definitions.</li>
+  <li>Instantiate the bean through a constructor or factory method.</li>
+  <li>Populate dependencies and aware callbacks.</li>
+  <li>Run bean post-processors before initialization.</li>
+  <li>Run initialization callbacks.</li>
+  <li>Run bean post-processors after initialization, possibly returning a proxy.</li>
+  <li>Expose the ready bean for use.</li>
+  <li>On context shutdown, run destruction callbacks for eligible scopes.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Portable lifecycle callbacks</b></figcaption>
+  <pre><code>@Component
+final class PricingCache {
+
+    @PostConstruct
+    void load() {
+        // validate configuration or warm bounded state
+    }
+
+    @PreDestroy
+    void close() {
+        // release owned resources
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Alternatives include <code>InitializingBean</code>, <code>DisposableBean</code>, and
+  <code>@Bean(initMethod = "...", destroyMethod = "...")</code>. Annotations or explicit bean
+  methods avoid coupling domain classes to Spring interfaces.
+</p>
+
+<div class="warn">
+  <strong>Prototype destruction is different</strong>
+  <p>
+    Spring creates and configures prototype objects but does not automatically manage their complete
+    destruction lifecycle. The caller holding the object must release resources. Avoid placing
+    expensive owned resources inside prototype beans without a clear cleanup design.
+  </p>
+</div>
+
+<h2 id="post-processors"><span class="num">10.</span> Container extension points</h2>
+<p class="lead">
+  Post-processors let infrastructure alter definitions or wrap objects without changing business
+  classes.
+</p>
+
+<h3 id="factory-post-processor">BeanFactoryPostProcessor</h3>
+<p>
+  A bean-factory post-processor works on bean definitions before normal beans are instantiated.
+  Property placeholder resolution and configuration-class processing use this phase. It should not
+  eagerly fetch ordinary beans because doing so can bypass later processing.
+</p>
+
+<h3 id="bean-post-processor">BeanPostProcessor</h3>
+<p>
+  A bean post-processor sees bean instances around initialization. Annotation support and many
+  auto-proxy mechanisms build on this extension point. The object returned after processing may be a
+  proxy rather than the original instance.
+</p>
+
+<div class="key">
+  <strong>Why this matters in interviews</strong>
+  <p>
+    <code>@Autowired</code>, lifecycle annotations, transactions, caching, security, and async
+    behavior are not magic keywords interpreted by Java. Registered infrastructure examines bean
+    metadata and often creates proxies around eligible managed objects.
+  </p>
+</div>
+
+<h2 id="proxies"><span class="num">11.</span> Proxies and the managed-bean boundary</h2>
+<p class="lead">
+  Spring can return a proxy that implements cross-cutting behavior around method calls.
+</p>
+
+<p>
+  A proxy stands between the caller and target. It can start a transaction, check authorization,
+  consult a cache, record metrics, or schedule asynchronous work before delegating. Calls must pass
+  through the proxy for proxy advice to run.
+</p>
+
+<figure class="code">
+  <figcaption><b>The self-invocation trap</b></figcaption>
+  <pre><code>@Service
+class ImportService {
+
+    void importAll() {
+        importOne(); // direct call on this, bypasses proxy interception
+    }
+
+    @Transactional
+    public void importOne() {
+        // expected transaction advice may not run on self-invocation
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The clean fix is usually to move the advised operation to another focused bean and inject it.
+  Self-injecting a proxy makes the class harder to reason about and often signals mixed
+  responsibilities.
+</p>
+
+<h2 id="circular-dependencies"><span class="num">12.</span> Circular dependencies</h2>
+<p class="lead">
+  A cycle means A needs B while B needs A. Constructor injection exposes the cycle immediately.
+</p>
+
+<figure class="code">
+  <figcaption><b>A design cycle</b></figcaption>
+  <pre><code>@Service
+class OrderService {
+    OrderService(InventoryService inventory) { /* ... */ }
+}
+
+@Service
+class InventoryService {
+    InventoryService(OrderService orders) { /* ... */ }
+}</code></pre>
+</figure>
+
+<p>
+  The container cannot construct either object first. Setter injection or laziness can defer some
+  cycles, but that treats the symptom. Better fixes include extracting shared policy, introducing a
+  one-way port, publishing an event for a secondary reaction, or combining responsibilities that
+  were incorrectly split.
+</p>
+
+<div class="warn">
+  <strong>A cycle is architectural feedback</strong>
+  <p>
+    Do not enable circular references globally just to make startup pass. Ask which dependency
+    direction represents the real business flow.
+  </p>
+</div>
+
+<h2 id="profiles-environment">
+  <span class="num">13.</span> Environment, properties, and profiles
+</h2>
+<p class="lead">
+  Spring Core exposes an <code>Environment</code> containing profiles and property sources.
+</p>
+
+<p>
+  <code>@Profile</code> conditionally registers a component or configuration for selected
+  environments. Profiles are useful for coarse environment-specific object graphs, such as a local
+  fake adapter versus a production integration. They should not become a substitute for ordinary
+  typed configuration.
+</p>
+
+<figure class="code">
+  <figcaption><b>Profile-specific adapter</b></figcaption>
+  <pre><code>@Configuration
+@Profile("local")
+class LocalPaymentConfiguration {
+
+    @Bean
+    PaymentGateway paymentGateway() {
+        return new FakePaymentGateway();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Keep secrets outside source control. Validate required values at startup. Prefer structured
+  configuration binding in Spring Boot for groups of related properties instead of scattering
+  string-based <code>@Value</code> expressions through business code.
+</p>
+
+<h2 id="events-resources"><span class="num">14.</span> Events, resources, and messages</h2>
+<p class="lead">
+  <code>ApplicationContext</code> provides useful infrastructure beyond object construction.
+</p>
+
+<h3 id="events">Application events</h3>
+<p>
+  A publisher can emit a domain-relevant application event without knowing every in-process
+  listener. Events reduce direct coupling, but ordinary listeners run synchronously by default. They
+  are not automatically durable, retried, or delivered across services.
+</p>
+
+<h3 id="resources">Resource abstraction</h3>
+<p>
+  Spring's <code>Resource</code> provides a common API for classpath files, filesystem files, URLs,
+  and other resource locations. Code can consume an <code>InputStream</code> without hard-coding
+  where the resource lives.
+</p>
+
+<h3 id="messages">MessageSource</h3>
+<p>
+  <code>MessageSource</code> resolves messages by code and locale. It supports internationalized
+  user-facing text. Do not use localization bundles as a general configuration database.
+</p>
+
+<h2 id="testing"><span class="num">15.</span> Testing Spring-managed designs</h2>
+<p class="lead">Most business classes should be testable without a Spring context.</p>
+
+<figure class="code">
+  <figcaption><b>Fast unit test enabled by constructor injection</b></figcaption>
+  <pre><code>@Test
+void declinesWhenGatewayRejectsPayment() {
+    PaymentGateway gateway = order -&gt; PaymentResult.declined("limit");
+    CheckoutService service = new CheckoutService(gateway);
+
+    Receipt receipt = service.checkout(sampleOrder());
+
+    assertThat(receipt.status()).isEqualTo(DECLINED);
+}</code></pre>
+</figure>
+
+<p>
+  Start an <code>ApplicationContext</code> when the test is specifically about configuration,
+  scanning, profiles, proxies, or integration. A context test is slower and can hide unclear class
+  design behind framework setup.
+</p>
+
+<h2 id="mistakes"><span class="num">16.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it hurts</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Field injection everywhere</td>
+        <td>Dependencies are hidden and fields cannot be final</td>
+        <td>Use constructor injection</td>
+      </tr>
+      <tr>
+        <td>Mutable data in singleton fields</td>
+        <td>Concurrent requests race</td>
+        <td>Keep services stateless or synchronize deliberately</td>
+      </tr>
+      <tr>
+        <td>Calling <code>getBean</code> in business logic</td>
+        <td>Creates service-locator coupling</td>
+        <td>Inject the required abstraction</td>
+      </tr>
+      <tr>
+        <td>Using <code>@Primary</code> to hide domain choices</td>
+        <td>Wrong implementation can be selected silently</td>
+        <td>Use semantic qualifiers or explicit orchestration</td>
+      </tr>
+      <tr>
+        <td>Making every object a bean</td>
+        <td>Domain values gain unnecessary container lifecycle</td>
+        <td>Manage services and infrastructure, create values normally</td>
+      </tr>
+      <tr>
+        <td>Using <code>@Lazy</code> to repair cycles</td>
+        <td>Moves design failure to runtime</td>
+        <td>Break the dependency cycle</td>
+      </tr>
+      <tr>
+        <td>Expecting proxy advice on self-calls</td>
+        <td>Call never crosses the proxy</td>
+        <td>Move the boundary to another bean</td>
+      </tr>
+      <tr>
+        <td>Broad component scanning</td>
+        <td>Unexpected beans and collisions appear</td>
+        <td>Use clear package and module boundaries</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="design-guidelines"><span class="num">17.</span> Production design guidelines</h2>
+<ul class="clean">
+  <li>Keep singleton services stateless unless shared state is explicitly synchronized.</li>
+  <li>Inject interfaces at boundaries where implementations genuinely vary.</li>
+  <li>Do not create an interface for every class without a substitution or boundary reason.</li>
+  <li>
+    Use constructor injection for required collaborators and validate configuration at startup.
+  </li>
+  <li>Keep configuration near the module it assembles, with explicit public entry points.</li>
+  <li>Prefer one direction of dependency flow and treat cycles as design defects.</li>
+  <li>
+    Keep domain values and entities as ordinary objects unless container services are required.
+  </li>
+  <li>Know when a returned bean is a proxy and which calls cross that proxy.</li>
+  <li>Use eager startup validation by default, then optimize measured startup bottlenecks.</li>
+  <li>Shut contexts down gracefully so destruction callbacks can release owned resources.</li>
+</ul>
+
+<h2 id="debugging"><span class="num">18.</span> Debugging container failures</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Exception or symptom</th>
+        <th>Likely cause</th>
+        <th>First check</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>NoSuchBeanDefinitionException</code></td>
+        <td>No candidate was registered</td>
+        <td>Scan boundary, profile, condition, and configuration import</td>
+      </tr>
+      <tr>
+        <td><code>NoUniqueBeanDefinitionException</code></td>
+        <td>Several candidates match</td>
+        <td>Use a qualifier, primary, or explicit collection</td>
+      </tr>
+      <tr>
+        <td><code>BeanCurrentlyInCreationException</code></td>
+        <td>Circular dependency or early lookup</td>
+        <td>Draw the constructor dependency graph</td>
+      </tr>
+      <tr>
+        <td>Annotation appears ignored</td>
+        <td>Object was not created by Spring or call bypassed proxy</td>
+        <td>Find who constructed the object and who invoked the method</td>
+      </tr>
+      <tr>
+        <td>Wrong implementation injected</td>
+        <td>Broad primary or qualifier mismatch</td>
+        <td>List candidate definitions and injection metadata</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="interview"><span class="num">19.</span> Interview questions and answers</h2>
+
+<h3 id="qa-1">What is the difference between IoC and DI?</h3>
+<p>
+  IoC is the broad principle that control of creation and flow moves from application objects to a
+  framework or container. DI is a concrete IoC technique where an object's dependencies are supplied
+  through constructors, factory methods, or properties.
+</p>
+
+<h3 id="qa-2">What is a Spring bean?</h3>
+<p>
+  It is an object whose creation, configuration, assembly, and lifecycle are managed by a Spring IoC
+  container. An ordinary object does not become a bean merely because its class has a familiar name.
+</p>
+
+<h3 id="qa-3">BeanFactory versus ApplicationContext?</h3>
+<p>
+  <code>BeanFactory</code> defines basic bean-container behavior. <code>ApplicationContext</code>
+  extends it with application-oriented services such as events, messages, resources, environment
+  support, and convenient integration with post-processors and AOP.
+</p>
+
+<h3 id="qa-4">Why prefer constructor injection?</h3>
+<p>
+  Required dependencies are explicit, fields can be final, invalid objects cannot be created
+  accidentally, tests require no reflection or container, and excessive dependencies reveal
+  responsibility problems.
+</p>
+
+<h3 id="qa-5">Is a Spring singleton global?</h3>
+<p>
+  No. It is normally one instance per bean definition per IoC container. Multiple contexts can each
+  have their own instance. It also has no automatic thread-safety guarantee.
+</p>
+
+<h3 id="qa-6">What happens when two beans implement the same interface?</h3>
+<p>
+  A single-value injection point is ambiguous unless selection metadata resolves it. Use
+  <code>@Qualifier</code> for semantic selection, <code>@Primary</code> for a true default, or
+  inject a collection when all implementations are intended.
+</p>
+
+<h3 id="qa-7">Why can self-invocation bypass @Transactional?</h3>
+<p>
+  Proxy-based advice runs when a caller invokes the proxy. A method calling another method on
+  <code>this</code> makes a direct target call and never crosses the proxy boundary.
+</p>
+
+<h3 id="qa-8">Does prototype scope mean a new object on every method call?</h3>
+<p>
+  No. It means a new object for each container retrieval or resolution. If one prototype is injected
+  into a singleton during construction, that singleton keeps the same injected instance.
+</p>
+
+<h3 id="qa-9">How should circular dependencies be fixed?</h3>
+<p>
+  Identify the incorrect dependency direction. Extract shared policy, introduce a port, move an
+  operation to a focused service, or use an event for a secondary reaction. Laziness and setters can
+  hide the cycle but rarely improve the design.
+</p>
+
+<h3 id="qa-10">When should @Bean be preferred over @Component?</h3>
+<p>
+  Use <code>@Bean</code> when configuring a third-party class, when construction needs explicit
+  factory logic, or when a module should expose deliberate configuration. Use scanned components for
+  application classes you own when scanning makes the module clearer.
+</p>
+
+<h2 id="practice"><span class="num">20.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>
+    Refactor a service that constructs a repository into constructor-injected ports and adapters.
+  </li>
+  <li>Create two notification senders and select one with a custom qualifier annotation.</li>
+  <li>Inject all validators as an ordered list and explain who controls ordering.</li>
+  <li>Demonstrate why a prototype injected directly into a singleton is reused.</li>
+  <li>Write a context test that proves a profile selects a fake adapter.</li>
+  <li>Draw the lifecycle stages where bean-factory and bean post-processors run.</li>
+  <li>Break a circular dependency without using setter injection or <code>@Lazy</code>.</li>
+  <li>Reproduce a self-invocation proxy failure and fix it by extracting a bean.</li>
+</ol>
+
+<h2 id="cheatsheet"><span class="num">21.</span> One-screen cheat sheet</h2>
+<div class="key">
+  <strong>Core rules</strong>
+  <ul class="clean">
+    <li>IoC decides who controls assembly; DI decides how collaborators arrive.</li>
+    <li>A bean is an object managed by an <code>ApplicationContext</code>.</li>
+    <li>Use constructor injection for required dependencies.</li>
+    <li>
+      Resolve by type, qualify deliberate alternatives, and use primary only for a true default.
+    </li>
+    <li>Singleton means one per definition per container, not thread-safe and not JVM-global.</li>
+    <li>Prototype means new per retrieval, not new per method call.</li>
+    <li>Use <code>@Bean</code> for explicit or third-party construction.</li>
+    <li>Post-processors power much of Spring's annotation and proxy behavior.</li>
+    <li>Proxy advice requires a call through the proxy.</li>
+    <li>Constructor cycles usually reveal an architectural problem.</li>
+    <li>Unit-test business objects without Spring whenever possible.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">22.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/introduction.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring IoC container and beans</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Dependency injection</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/factory-scopes.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Bean scopes</a
+    >
+  </li>
+</ul>

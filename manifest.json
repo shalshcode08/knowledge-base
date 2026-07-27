@@ -57,6 +57,10 @@
       "name": "Spring",
       "pages": [
         {
+          "title": "Spring Core Fundamentals",
+          "path": "spring/spring-core-fundamentals"
+        },
+        {
           "title": "Spring MVC and REST APIs",
           "path": "spring/spring-mvc-rest-apis"
         }
