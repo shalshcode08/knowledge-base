@@ -61,6 +61,10 @@
           "path": "spring/spring-core-fundamentals"
         },
         {
+          "title": "Spring Boot Fundamentals",
+          "path": "spring/spring-boot-fundamentals"
+        },
+        {
           "title": "Spring MVC and REST APIs",
           "path": "spring/spring-mvc-rest-apis"
         }

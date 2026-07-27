@@ -1,0 +1,871 @@
+<h1>Spring Boot Fundamentals - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to Spring Boot project structure, starters,
+  auto-configuration, dependency management, startup, external configuration, profiles, embedded
+  servers, executable archives, DevTools, diagnostics, and production-ready foundations.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The Spring Boot mental model</h2>
+<p class="lead">
+  Spring Boot is an opinionated application bootstrap layer on top of the Spring Framework. It
+  chooses sensible defaults from the classpath and configuration, then backs away when the
+  application supplies an explicit choice.
+</p>
+
+<p>
+  Spring Framework provides the IoC container, dependency injection, web framework, transactions,
+  data access, testing, and integration foundations. Spring Boot makes those pieces faster to
+  assemble into a runnable application. It manages compatible dependency versions, provides starter
+  dependency groups, applies conditional auto-configuration, embeds common servers, and adds
+  operational features.
+</p>
+
+<div class="analogy">
+  <p>
+    Spring Framework is a professional workshop full of tools. Spring Boot is a prepared workstation
+    where the commonly needed tools are compatible, connected, and placed within reach. You can
+    replace a tool or rearrange the station, but you do not spend the first day building the bench.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Spring Framework</th>
+        <th>Spring Boot</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Core programming and infrastructure model</td>
+        <td>Opinionated application assembly</td>
+      </tr>
+      <tr>
+        <td>IoC, MVC, transactions, data access, testing</td>
+        <td>Starters, dependency management, auto-configuration</td>
+      </tr>
+      <tr>
+        <td>Can be configured in many ways</td>
+        <td>Chooses strong defaults while remaining configurable</td>
+      </tr>
+      <tr>
+        <td>Does not require Spring Boot</td>
+        <td>Builds on Spring Framework</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Boot is not code generation</strong>
+  <p>
+    Your application still uses normal Java and Spring bean definitions. Auto-configuration is
+    ordinary conditional configuration supplied by libraries. You can inspect, override, or exclude
+    it.
+  </p>
+</div>
+
+<h2 id="project-creation"><span class="num">01.</span> Creating and structuring a project</h2>
+<p class="lead">
+  Start with the smallest dependency set that supports the application. Every starter expands the
+  classpath and can activate configuration.
+</p>
+
+<p>
+  Spring Initializr generates a Maven or Gradle project with selected dependencies, Java version,
+  packaging, coordinates, and a main class. It is a project generator, not a runtime requirement.
+  Review the generated build instead of treating it as hidden magic.
+</p>
+
+<figure class="code">
+  <figcaption><b>Typical package structure</b></figcaption>
+  <pre><code>com.example.orders
+├── OrdersApplication.java
+├── order
+│   ├── Order.java
+│   ├── OrderService.java
+│   └── OrderRepository.java
+├── checkout
+│   ├── CheckoutController.java
+│   └── CheckoutService.java
+└── infrastructure
+    └── payment
+        └── StripePaymentGateway.java</code></pre>
+</figure>
+
+<p>
+  Put the application class in a root package. The default component scan and several
+  auto-configuration package conventions begin there and include subpackages. Avoid the Java default
+  package because scanning becomes broad and tool behavior becomes surprising.
+</p>
+
+<h3 id="layer-package">Package by feature or layer?</h3>
+<p>
+  Package-by-feature keeps related controller, service, model, and persistence code together and
+  gives modules a clearer boundary. Package-by-layer can be understandable in a small application,
+  but large global <code>controller</code>, <code>service</code>, and <code>repository</code>
+  packages often create weak cohesion.
+</p>
+
+<h2 id="main-annotation"><span class="num">02.</span> @SpringBootApplication</h2>
+<p class="lead">
+  The main annotation combines configuration, component scanning, and auto-configuration.
+</p>
+
+<figure class="code">
+  <figcaption><b>Minimal application entry point</b></figcaption>
+  <pre><code>@SpringBootApplication
+public class OrdersApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(OrdersApplication.class, args);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  <code>@SpringBootApplication</code> combines the intent of <code>@SpringBootConfiguration</code>,
+  <code>@EnableAutoConfiguration</code>, and <code>@ComponentScan</code>. Keep one primary
+  application annotation in normal applications. Multiple application roots can produce overlapping
+  scans and confusing tests.
+</p>
+
+<div class="note">
+  <strong>The annotation is a starting point, not an architecture</strong>
+  <p>
+    It bootstraps discovery. Clear feature boundaries, dependency direction, and focused
+    configuration still come from application design.
+  </p>
+</div>
+
+<h2 id="spring-application"><span class="num">03.</span> What SpringApplication.run does</h2>
+<p class="lead">
+  <code>SpringApplication</code> prepares the environment, creates the correct context, loads
+  configuration, refreshes the context, and runs startup callbacks.
+</p>
+
+<ol class="clean">
+  <li>Build a <code>SpringApplication</code> from primary source classes.</li>
+  <li>Determine the application type from the classpath, such as servlet, reactive, or non-web.</li>
+  <li>Prepare bootstrap listeners and initializers.</li>
+  <li>Create and populate the Spring <code>Environment</code>.</li>
+  <li>Print the banner unless disabled.</li>
+  <li>Create the appropriate <code>ApplicationContext</code>.</li>
+  <li>Load bean definitions, including application and auto-configuration classes.</li>
+  <li>Refresh the context, which creates eager singletons and starts infrastructure.</li>
+  <li>Publish lifecycle events and call runners.</li>
+  <li>Return the running application context.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Customizing before startup</b></figcaption>
+  <pre><code>public static void main(String[] args) {
+    SpringApplication app = new SpringApplication(OrdersApplication.class);
+    app.setBannerMode(Banner.Mode.OFF);
+    app.setDefaultProperties(Map.of("server.port", "8081"));
+    app.run(args);
+}</code></pre>
+</figure>
+
+<p>
+  Prefer declarative configuration for deploy-time values. Programmatic defaults are useful for
+  library-owned or bootstrap settings but are harder for operators to discover and override.
+</p>
+
+<h2 id="starters"><span class="num">04.</span> Starter dependencies</h2>
+<p class="lead">
+  A starter is a dependency descriptor that brings together a supported set of libraries for a
+  capability.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Starter</th>
+        <th>Typical capability</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>spring-boot-starter</code></td>
+        <td>Core Boot, logging, and configuration foundation</td>
+      </tr>
+      <tr>
+        <td><code>spring-boot-starter-web</code></td>
+        <td>Servlet web application, Spring MVC, JSON, embedded server</td>
+      </tr>
+      <tr>
+        <td><code>spring-boot-starter-validation</code></td>
+        <td>Jakarta Bean Validation implementation</td>
+      </tr>
+      <tr>
+        <td><code>spring-boot-starter-data-jpa</code></td>
+        <td>Spring Data JPA and Hibernate integration</td>
+      </tr>
+      <tr>
+        <td><code>spring-boot-starter-security</code></td>
+        <td>Spring Security foundation</td>
+      </tr>
+      <tr>
+        <td><code>spring-boot-starter-actuator</code></td>
+        <td>Operational endpoints and production observations</td>
+      </tr>
+      <tr>
+        <td><code>spring-boot-starter-test</code></td>
+        <td>Spring testing, JUnit, assertions, and common test tools</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A starter usually contains little or no implementation code. Removing it does not necessarily
+  remove the feature if equivalent dependencies remain. Conversely, adding a starter does not
+  guarantee a working integration when required properties or external services are missing.
+</p>
+
+<h2 id="dependency-management"><span class="num">05.</span> Dependency management</h2>
+<p class="lead">
+  Spring Boot publishes a tested dependency version set so related libraries work together.
+</p>
+
+<p>
+  Maven projects commonly inherit from <code>spring-boot-starter-parent</code> or import the Boot
+  dependency-management BOM. Gradle projects use the Boot plugin and supported dependency-management
+  mechanisms. Managed dependencies normally omit individual version numbers.
+</p>
+
+<figure class="code">
+  <figcaption><b>Maven dependency using Boot's managed version</b></figcaption>
+  <pre><code>&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Overriding one library can break the tested set</strong>
+  <p>
+    A forced version may be binary-incompatible with Spring Framework, Jackson, Hibernate, logging,
+    or a servlet container. Override only for a verified need, test the full application, and remove
+    the override after moving to a supported Boot release.
+  </p>
+</div>
+
+<h2 id="auto-configuration"><span class="num">06.</span> Auto-configuration</h2>
+<p class="lead">
+  Auto-configuration evaluates evidence and contributes beans only when its conditions match.
+</p>
+
+<p>
+  Important evidence includes classes on the classpath, existing or missing beans, properties, web
+  application type, resources, and parent configuration. For example, database configuration can
+  activate when JDBC classes and suitable properties exist, while backing away when the application
+  declares its own <code>DataSource</code>.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Condition</th>
+        <th>Question</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@ConditionalOnClass</code></td>
+        <td>Is a required library on the classpath?</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnMissingBean</code></td>
+        <td>Has the application already supplied this capability?</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnProperty</code></td>
+        <td>Does configuration enable or customize this feature?</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnWebApplication</code></td>
+        <td>Is this the correct kind of web application?</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnResource</code></td>
+        <td>Is a required resource present?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="back-off">The back-off principle</h3>
+<p>
+  Auto-configuration is non-invasive: when an application defines a bean that represents the same
+  choice, conditional configuration normally backs off. This is how sensible defaults coexist with
+  explicit control.
+</p>
+
+<h3 id="diagnose-auto-configuration">Diagnosing decisions</h3>
+<p>
+  Start with <code>--debug</code> or inspect the conditions evaluation report. A negative match is
+  not automatically an error. It explains why a configuration path did not apply. Search for the
+  capability you expected, then inspect its positive and negative conditions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Excluding an unwanted auto-configuration</b></figcaption>
+  <pre><code>@SpringBootApplication(
+    exclude = DataSourceAutoConfiguration.class
+)
+public class BatchApplication { /* ... */ }</code></pre>
+</figure>
+
+<p>
+  Exclusion is a precise escape hatch. Do not exclude configuration merely because startup reports a
+  missing database if the application actually needs a database. Supply correct properties or
+  dependencies instead.
+</p>
+
+<h2 id="external-config"><span class="num">07.</span> Externalized configuration</h2>
+<p class="lead">
+  The same application artifact should run in different environments by receiving different
+  configuration.
+</p>
+
+<p>
+  Spring Boot can read properties and YAML files, environment variables, Java system properties,
+  command-line arguments, imported configuration, test properties, and other property sources.
+  Higher-precedence sources can override lower-precedence defaults.
+</p>
+
+<div class="key">
+  <strong>Think in layers</strong>
+  <p>
+    Package safe defaults with the application. Supply environment-specific values outside the
+    archive. Use command-line or platform overrides for the final deployment. Keep secrets in a
+    secret manager or protected environment source, never in Git.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>application.yaml</b></figcaption>
+  <pre><code>server:
+  port: 8080
+
+orders:
+  payment:
+    base-url: https://payments.example
+    connect-timeout: 2s</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Common override forms</b></figcaption>
+  <pre><code>ORDERS_PAYMENT_BASEURL=https://payments.prod.example
+
+java -jar orders.jar \
+  --server.port=9090 \
+  --orders.payment.connect-timeout=1s</code></pre>
+</figure>
+
+<p>
+  Relaxed binding maps common property-name styles to Java property names. Environment variable
+  conversion generally replaces dots with underscores, removes dashes, and uses uppercase. Verify
+  exact binding rules for lists and maps instead of inventing names.
+</p>
+
+<h2 id="configuration-properties">
+  <span class="num">08.</span> Type-safe configuration properties
+</h2>
+<p class="lead">
+  Group related settings into a validated type instead of scattering string keys across beans.
+</p>
+
+<figure class="code">
+  <figcaption><b>Immutable configuration record</b></figcaption>
+  <pre><code>@ConfigurationProperties("orders.payment")
+@Validated
+public record PaymentProperties(
+    @NotNull URI baseUrl,
+    @NotNull Duration connectTimeout,
+    @Min(1) int maxAttempts
+) {}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Registering property types</b></figcaption>
+  <pre><code>@SpringBootApplication
+@ConfigurationPropertiesScan
+public class OrdersApplication { /* ... */ }</code></pre>
+</figure>
+
+<p>
+  Structured properties support conversion, metadata, validation, IDE completion, and a clear
+  configuration contract. Use <code>@Value</code> for a small isolated value or expression, not as
+  the main configuration model of a module.
+</p>
+
+<div class="warn">
+  <strong>Configuration validation should fail startup</strong>
+  <p>
+    A missing endpoint, impossible timeout, or invalid pool size should stop deployment before the
+    first request. Silent defaults for security or money-related behavior are especially dangerous.
+  </p>
+</div>
+
+<h2 id="profiles"><span class="num">09.</span> Profiles</h2>
+<p class="lead">
+  Profiles activate selected beans or configuration documents for an environment or mode.
+</p>
+
+<figure class="code">
+  <figcaption><b>Profile-specific file</b></figcaption>
+  <pre><code># application-prod.yaml
+orders:
+  payment:
+    base-url: https://payments.prod.example</code></pre>
+</figure>
+
+<p>
+  Activating <code>prod</code> considers base configuration and profile-specific configuration, with
+  profile-specific values overriding base values according to location and property-source rules. If
+  several profiles are active, later profiles can override earlier ones.
+</p>
+
+<ul class="clean">
+  <li>Use profiles for coarse environment or feature modes.</li>
+  <li>Use ordinary properties for values such as URLs, limits, and timeouts.</li>
+  <li>Do not create a different build artifact for every environment.</li>
+  <li>Do not hide dozens of independent feature flags inside one profile name.</li>
+  <li>Log active profiles and validate environment-critical settings.</li>
+</ul>
+
+<h2 id="embedded-server"><span class="num">10.</span> Embedded web servers</h2>
+<p class="lead">
+  A web starter can run the server inside the application process, so the application starts as a
+  normal Java process.
+</p>
+
+<p>
+  Servlet applications commonly use an embedded Tomcat server by default, with supported
+  alternatives available. Spring Boot creates and starts the server during context refresh. The
+  application can be packaged as an executable JAR and started with <code>java -jar</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Basic server configuration</b></figcaption>
+  <pre><code>server:
+  port: 8080
+  shutdown: graceful
+  servlet:
+    context-path: /orders</code></pre>
+</figure>
+
+<p>
+  A context path affects every endpoint and often complicates reverse-proxy routing and health
+  checks. Prefer clear gateway routing unless the deployment contract requires a shared container
+  path.
+</p>
+
+<h3 id="war">Executable JAR versus WAR</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Packaging</th>
+        <th>Deployment model</th>
+        <th>Strong default</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Executable JAR</td>
+        <td>Application owns embedded server</td>
+        <td>Containers, services, and most new applications</td>
+      </tr>
+      <tr>
+        <td>WAR</td>
+        <td>External servlet container owns deployment</td>
+        <td>Existing organization-managed application servers</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="runners"><span class="num">11.</span> Startup runners</h2>
+<p class="lead">
+  <code>ApplicationRunner</code> and <code>CommandLineRunner</code> execute after the context has
+  started.
+</p>
+
+<figure class="code">
+  <figcaption><b>Validated startup task</b></figcaption>
+  <pre><code>@Bean
+ApplicationRunner verifyCatalog(ProductRepository products) {
+    return args -&gt; {
+        if (products.count() == 0) {
+            throw new IllegalStateException("Product catalog is empty");
+        }
+    };
+}</code></pre>
+</figure>
+
+<p>
+  <code>ApplicationRunner</code> provides parsed option arguments.
+  <code>CommandLineRunner</code> receives the raw string array. Order multiple runners deliberately.
+  Do not run unbounded migrations, long imports, or non-idempotent remote calls during every
+  application startup.
+</p>
+
+<h2 id="lifecycle-events"><span class="num">12.</span> Startup lifecycle and events</h2>
+<p class="lead">
+  Boot publishes events around environment preparation, context creation, context refresh, runner
+  execution, readiness, and failure.
+</p>
+
+<p>
+  Very early events occur before the context exists, so their listeners cannot be ordinary beans.
+  Normal application behavior should usually react after the context is ready. Use readiness as an
+  operational signal, not as permission to start arbitrary background work without lifecycle
+  control.
+</p>
+
+<div class="note">
+  <strong>Ready does not mean every external dependency is healthy forever</strong>
+  <p>
+    Startup validation proves a point in time. Runtime resilience still needs timeouts, bounded
+    retries, circuit breaking where appropriate, health observations, and clear failure behavior.
+  </p>
+</div>
+
+<h2 id="logging"><span class="num">13.</span> Logging fundamentals</h2>
+<p class="lead">
+  Boot provides a logging abstraction and a supported default implementation through its starters.
+</p>
+
+<figure class="code">
+  <figcaption><b>Useful logging configuration</b></figcaption>
+  <pre><code>logging:
+  level:
+    root: INFO
+    com.example.orders: DEBUG
+  pattern:
+    correlation: "[%X{traceId:-}]"</code></pre>
+</figure>
+
+<p>
+  Log events with stable fields and enough context to act. Do not log secrets, access tokens,
+  passwords, full payment data, or unbounded request bodies. A debug level that is safe locally may
+  be expensive or sensitive in production.
+</p>
+
+<h2 id="devtools"><span class="num">14.</span> DevTools</h2>
+<p class="lead">
+  Spring Boot DevTools improves local feedback with restart and development-time defaults.
+</p>
+
+<p>
+  Restart uses classloader separation so application classes can reload faster than third-party
+  libraries. It is not the same as production hot deployment. Mark DevTools as a development-only
+  dependency and do not rely on its defaults in production.
+</p>
+
+<div class="warn">
+  <strong>Restart can expose classloader assumptions</strong>
+  <p>
+    Static caches, serialization, service loading, and libraries that retain application classes can
+    behave differently across restart classloaders. Reproduce suspicious failures with restart
+    disabled before blaming business logic.
+  </p>
+</div>
+
+<h2 id="packaging"><span class="num">15.</span> Executable archives and container images</h2>
+<p class="lead">
+  The Boot build plugins can repackage an application and its dependencies into an executable
+  archive.
+</p>
+
+<figure class="code">
+  <figcaption><b>Build and run</b></figcaption>
+  <pre><code>./mvnw clean verify
+java -jar target/orders-1.0.0.jar
+
+./gradlew clean bootJar
+java -jar build/libs/orders-1.0.0.jar</code></pre>
+</figure>
+
+<p>
+  Reproducible deployment means the artifact tested in CI is the artifact promoted to production.
+  Inject environment configuration at runtime. Do not rebuild the JAR merely to change a URL.
+</p>
+
+<p>
+  Build plugins can also create OCI images using buildpacks. Container concerns still include
+  non-root execution, memory limits, graceful shutdown, immutable images, vulnerability scanning,
+  and a supported Java runtime.
+</p>
+
+<h2 id="native-aot"><span class="num">16.</span> AOT processing and native images</h2>
+<p class="lead">
+  Ahead-of-time processing can analyze configuration and prepare runtime hints, including support
+  for GraalVM native images.
+</p>
+
+<p>
+  Native images can improve startup time and memory footprint, but they change build complexity and
+  closed-world assumptions around reflection, resources, serialization, and dynamic proxies. Measure
+  the deployment need before accepting the tradeoff. Standard JVM deployment remains a strong
+  default.
+</p>
+
+<h2 id="failure-analysis"><span class="num">17.</span> Failure analysis and debugging</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely area</th>
+        <th>First diagnostic</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Port already in use</td>
+        <td>Embedded server binding</td>
+        <td>Find the process or configure a different port</td>
+      </tr>
+      <tr>
+        <td>Bean missing</td>
+        <td>Scan, profile, condition, or dependency</td>
+        <td>Read the nested cause and condition report</td>
+      </tr>
+      <tr>
+        <td>Property failed to bind</td>
+        <td>Name, type conversion, or validation</td>
+        <td>Compare property prefix and target structure</td>
+      </tr>
+      <tr>
+        <td>Unexpected auto-configured bean</td>
+        <td>Classpath activated a condition</td>
+        <td>Inspect positive condition matches</td>
+      </tr>
+      <tr>
+        <td>Method or class not found</td>
+        <td>Dependency version conflict</td>
+        <td>Inspect the resolved dependency tree</td>
+      </tr>
+      <tr>
+        <td>Application exits immediately</td>
+        <td>Non-web type or no non-daemon work</td>
+        <td>Check starters and detected application type</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Read the deepest relevant cause, not only the top-level
+  <code>ApplicationContextException</code>. Boot failure analyzers often add an action section. Fix
+  the first causal configuration problem before reacting to downstream bean failures.
+</p>
+
+<h2 id="production-baseline"><span class="num">18.</span> Production baseline</h2>
+<ul class="clean">
+  <li>Pin a supported Spring Boot line and let its dependency management control the platform.</li>
+  <li>Use the smallest starter set and inspect the resolved dependency tree.</li>
+  <li>Externalize environment values and keep secrets out of source control.</li>
+  <li>Bind related settings to validated <code>@ConfigurationProperties</code> types.</li>
+  <li>Enable graceful shutdown and define platform termination timeouts.</li>
+  <li>Add Actuator and expose only intentionally secured operational endpoints.</li>
+  <li>Use health, metrics, structured logs, and correlation identifiers.</li>
+  <li>Set network timeouts and bounded resource pools explicitly.</li>
+  <li>Build once, test the artifact, scan it, and promote the same artifact.</li>
+  <li>Review release notes and migration guides before framework upgrades.</li>
+</ul>
+
+<h2 id="mistakes"><span class="num">19.</span> Common mistakes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Consequence</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Adding many starters "just in case"</td>
+        <td>Larger attack surface and unexpected auto-configuration</td>
+        <td>Add dependencies for known capabilities</td>
+      </tr>
+      <tr>
+        <td>Forcing arbitrary library versions</td>
+        <td>Runtime linkage failures</td>
+        <td>Use Boot's managed set</td>
+      </tr>
+      <tr>
+        <td>Putting the main class in a nested package</td>
+        <td>Expected components are not scanned</td>
+        <td>Use a deliberate root package</td>
+      </tr>
+      <tr>
+        <td>Scattering <code>@Value</code> strings</td>
+        <td>No clear configuration contract</td>
+        <td>Use validated property types</td>
+      </tr>
+      <tr>
+        <td>Committing production secrets</td>
+        <td>Credential exposure and difficult rotation</td>
+        <td>Use protected runtime secret sources</td>
+      </tr>
+      <tr>
+        <td>Using profiles for every switch</td>
+        <td>Combinatorial environment behavior</td>
+        <td>Use typed properties and focused conditions</td>
+      </tr>
+      <tr>
+        <td>Excluding auto-configuration blindly</td>
+        <td>Required infrastructure silently disappears</td>
+        <td>Read the condition report and fix the cause</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="interview"><span class="num">20.</span> Interview questions and answers</h2>
+
+<h3 id="qa-1">What problem does Spring Boot solve?</h3>
+<p>
+  It reduces application setup and integration work through starters, managed dependency versions,
+  conditional auto-configuration, embedded servers, executable packaging, externalized
+  configuration, and production-oriented features.
+</p>
+
+<h3 id="qa-2">What does @SpringBootApplication contain?</h3>
+<p>
+  It represents Boot configuration, enables auto-configuration, and enables component scanning from
+  its package. It is normally placed on the primary application class.
+</p>
+
+<h3 id="qa-3">How does auto-configuration work?</h3>
+<p>
+  Boot loads candidate configuration classes and evaluates conditions based on the classpath, beans,
+  properties, resources, and application type. Matching configurations contribute beans.
+  Missing-bean conditions let explicit application configuration replace defaults.
+</p>
+
+<h3 id="qa-4">What is the difference between a starter and auto-configuration?</h3>
+<p>
+  A starter groups dependencies. Auto-configuration contains conditional bean configuration. A
+  starter often places the classes on the classpath that make an auto-configuration eligible, but
+  they are separate concepts.
+</p>
+
+<h3 id="qa-5">How do you find why auto-configuration did not apply?</h3>
+<p>
+  Enable debug output or inspect the conditions evaluation report, find the expected configuration,
+  and read its matched and unmatched conditions.
+</p>
+
+<h3 id="qa-6">Why omit dependency versions in many Boot projects?</h3>
+<p>
+  The Boot BOM manages a compatible, tested version set. Omitting individual versions lets that
+  platform control them. Application-specific libraries outside the managed set still need explicit
+  versions.
+</p>
+
+<h3 id="qa-7">How are configuration values overridden?</h3>
+<p>
+  Boot combines ordered property sources. Later or higher-precedence sources, such as selected
+  runtime overrides, can replace packaged defaults. Exact precedence depends on source type and
+  config-data location.
+</p>
+
+<h3 id="qa-8">Why use @ConfigurationProperties instead of @Value?</h3>
+<p>
+  It provides grouped type-safe binding, conversion, validation, metadata, and a visible
+  configuration contract. <code>@Value</code> remains useful for isolated values and expressions.
+</p>
+
+<h3 id="qa-9">Does an executable JAR require an external Tomcat installation?</h3>
+<p>
+  No. A typical servlet starter includes a supported embedded server, and the Boot archive starts it
+  inside the application process. WAR deployment to an external container remains possible.
+</p>
+
+<h3 id="qa-10">What happens if you define your own DataSource bean?</h3>
+<p>
+  Relevant auto-configuration normally backs off because its missing-bean condition no longer
+  matches. The application becomes responsible for correctly configuring that bean.
+</p>
+
+<h2 id="practice"><span class="num">21.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>Generate a minimal web project and explain every direct dependency.</li>
+  <li>Run with <code>--debug</code> and locate three positive and three negative conditions.</li>
+  <li>Replace one auto-configured bean with an explicit bean and prove the back-off behavior.</li>
+  <li>Bind and validate a nested property record containing a URI, duration, and list.</li>
+  <li>Override one property using a file, environment variable, and command-line argument.</li>
+  <li>Create local and production profile documents without changing the built JAR.</li>
+  <li>Package an executable JAR and inspect its dependency layout.</li>
+  <li>Diagnose an intentional dependency-version conflict using the dependency tree.</li>
+</ol>
+
+<h2 id="cheatsheet"><span class="num">22.</span> One-screen cheat sheet</h2>
+<div class="key">
+  <strong>Boot rules</strong>
+  <ul class="clean">
+    <li>Spring Framework supplies the foundation; Boot supplies opinionated assembly.</li>
+    <li>A starter groups dependencies; auto-configuration conditionally supplies beans.</li>
+    <li><code>@SpringBootApplication</code> marks the primary configuration and scan root.</li>
+    <li>Auto-configuration backs off when the application supplies an explicit bean.</li>
+    <li>Use the condition report to explain configuration decisions.</li>
+    <li>Let Boot manage compatible dependency versions.</li>
+    <li>Externalize deploy-time configuration and protect secrets.</li>
+    <li>Use validated <code>@ConfigurationProperties</code> for related settings.</li>
+    <li>Profiles select coarse modes; properties carry normal values.</li>
+    <li>Executable JARs commonly own an embedded server.</li>
+    <li>Build once and promote the same tested artifact.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">23.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/using/auto-configuration.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot auto-configuration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/external-config.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Externalized configuration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/profiles.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot profiles</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/system-requirements.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Current system requirements</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
