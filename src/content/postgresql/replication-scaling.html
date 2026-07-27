@@ -1,0 +1,2124 @@
+<h1>PostgreSQL Replication and Scaling - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth and interview-focused guide to physical and logical replication, read replicas,
+  replication lag, durability choices, failover safety, high availability, and practical scaling
+  patterns for production PostgreSQL.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The replication mental model</h2>
+<p class="lead">
+  Replication copies an ordered history of changes from one PostgreSQL server to another. Scaling
+  decides how applications use those copies without breaking correctness.
+</p>
+
+<p>
+  Start with one primary server. Transactions change data on that primary. Before changed data pages
+  need to reach permanent storage, PostgreSQL describes the changes in write-ahead log, or WAL.
+  Replication transports information derived from this change history to another server. A physical
+  standby replays WAL against a binary copy of the whole cluster. A logical subscriber receives
+  row-level changes selected by publications and applies them to named tables.
+</p>
+
+<div class="analogy">
+  <p>
+    Imagine the primary as a clerk writing every approved event into a numbered journal. Physical
+    replication gives another office the same starting archive and asks it to replay journal entries
+    in order until its filing cabinets match. Logical replication translates selected journal
+    entries into instructions such as "insert this row" and sends only those instructions to a
+    chosen database.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Physical replication</th>
+        <th>Logical replication</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>What is copied?</td>
+        <td>WAL for the complete PostgreSQL cluster</td>
+        <td>Selected row changes for published tables</td>
+      </tr>
+      <tr>
+        <td>What must the target resemble?</td>
+        <td>Binary-compatible standby of the same cluster and major version</td>
+        <td>Tables with compatible names, columns and data conversions</td>
+      </tr>
+      <tr>
+        <td>Can clients write on the target?</td>
+        <td>Not while it remains in recovery</td>
+        <td>Yes, but local writes can conflict with incoming changes</td>
+      </tr>
+      <tr>
+        <td>Typical purpose</td>
+        <td>HA, disaster recovery, read replicas</td>
+        <td>Selective copy, migration, integration, fan-out</td>
+      </tr>
+      <tr>
+        <td>Main unit of progress</td>
+        <td>Log sequence number, or LSN</td>
+        <td>Transaction changes decoded from WAL and acknowledged by a slot</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Replication is not automatically high availability</strong>
+  <p>
+    A copy of data is only one building block. HA also needs failure detection, a safe decision
+    about which node may accept writes, promotion, client redirection, fencing of an old primary,
+    monitoring, and tested recovery procedures. Replication can faithfully copy an accidental
+    delete, corrupt application update, or bad DDL statement, so it is not a replacement for
+    backups.
+  </p>
+</div>
+
+<h3 id="core-terms">Core terms</h3>
+<ul class="clean">
+  <li><strong>Primary:</strong> the current server accepting normal writes.</li>
+  <li><strong>Standby:</strong> a physical copy that remains in recovery and replays WAL.</li>
+  <li><strong>Hot standby:</strong> a standby that accepts strictly read-only SQL connections.</li>
+  <li>
+    <strong>Publisher:</strong> a database that exposes logical change sets called publications.
+  </li>
+  <li><strong>Subscriber:</strong> a database that receives and applies logical changes.</li>
+  <li>
+    <strong>Upstream and downstream:</strong> the sender and receiver for one replication link.
+  </li>
+  <li><strong>LSN:</strong> a position in the WAL stream, written like <code>0/16B6C50</code>.</li>
+  <li><strong>RPO:</strong> the maximum data loss the business is prepared to accept.</li>
+  <li><strong>RTO:</strong> the maximum acceptable time to restore service after failure.</li>
+</ul>
+
+<h2 id="physical-flow"><span class="num">01.</span> Physical streaming replication</h2>
+<p class="lead">
+  Physical streaming replication starts from a base backup and continuously replays the primary's
+  WAL. It copies the whole cluster at the storage level, including every database in that cluster.
+</p>
+
+<h3 id="wal-pipeline">WAL sender, receiver, storage and replay</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>Where</th>
+        <th>What happens</th>
+        <th>Useful progress field</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Generate</td>
+        <td>Primary backends</td>
+        <td>Changes produce WAL records in primary order</td>
+        <td><code>pg_current_wal_lsn()</code></td>
+      </tr>
+      <tr>
+        <td>Send</td>
+        <td>Primary walsender</td>
+        <td>WAL bytes move over a replication connection</td>
+        <td><code>sent_lsn</code></td>
+      </tr>
+      <tr>
+        <td>Receive</td>
+        <td>Standby walreceiver</td>
+        <td>Standby receives the stream from its upstream</td>
+        <td><code>receive_lsn</code> or receiver status</td>
+      </tr>
+      <tr>
+        <td>Write and flush</td>
+        <td>Standby</td>
+        <td>Bytes enter local WAL storage and become durable</td>
+        <td><code>write_lsn</code>, <code>flush_lsn</code></td>
+      </tr>
+      <tr>
+        <td>Replay</td>
+        <td>Standby startup process</td>
+        <td>WAL records modify the standby's data files in order</td>
+        <td><code>replay_lsn</code></td>
+      </tr>
+      <tr>
+        <td>Visible</td>
+        <td>Hot standby queries</td>
+        <td>A replayed commit becomes visible to new snapshots</td>
+        <td><code>pg_last_xact_replay_timestamp()</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  These stages explain why one number called "lag" is not enough. WAL can wait before it is sent,
+  spend time in the network, be received but not flushed, or be durable but not replayed. The
+  primary exposes one row per directly connected WAL sender in <code>pg_stat_replication</code>. A
+  standby exposes its receiver in <code>pg_stat_wal_receiver</code>. The standby functions
+  <code>pg_last_wal_receive_lsn()</code> and <code>pg_last_wal_replay_lsn()</code> show received and
+  replayed positions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Observe the physical pipeline</b></figcaption>
+  <pre><code>-- Run on the primary.
+SELECT application_name,
+       client_addr,
+       state,
+       sync_state,
+       sent_lsn,
+       write_lsn,
+       flush_lsn,
+       replay_lsn,
+       write_lag,
+       flush_lag,
+       replay_lag
+FROM pg_stat_replication;
+
+-- Run on a standby.
+SELECT status,
+       sender_host,
+       sender_port,
+       slot_name,
+       written_lsn,
+       flushed_lsn,
+       latest_end_lsn,
+       latest_end_time
+FROM pg_stat_wal_receiver;
+
+SELECT pg_is_in_recovery(),
+       pg_last_wal_receive_lsn(),
+       pg_last_wal_replay_lsn(),
+       pg_last_xact_replay_timestamp();</code></pre>
+</figure>
+
+<div class="note">
+  <strong>LSN distance is bytes, not time</strong>
+  <p>
+    <code>pg_wal_lsn_diff(a, b)</code> measures a byte distance between WAL locations. The same
+    number of bytes may represent very different catch-up times under different network, disk, CPU,
+    checkpoint and workload conditions. Timestamp lag is also imperfect when no new transactions
+    occur. Monitor position, time, generation rate and receiver state together.
+  </p>
+</div>
+
+<h3 id="recovery-sources">How a standby finds WAL</h3>
+<p>
+  A server starts in standby mode when <code>standby.signal</code> exists. It can restore complete
+  WAL segments through <code>restore_command</code>, read already-present files from
+  <code>pg_wal</code>, and stream records through <code>primary_conninfo</code>. PostgreSQL cycles
+  among available sources while recovery continues. A durable WAL archive is therefore a valuable
+  fallback when a streaming connection is interrupted or the primary has already recycled an old
+  segment.
+</p>
+
+<p>
+  Physical replication normally requires the same major PostgreSQL version and compatible storage
+  architecture. It is not a table-by-table feature. DDL, catalog changes, indexes, extensions stored
+  in the cluster, and user data are replayed together because the standby follows physical WAL.
+  External files, operating-system configuration, secrets, load-balancer state and extension shared
+  libraries still require separate management.
+</p>
+
+<h2 id="physical-setup"><span class="num">02.</span> Configuration and standby bootstrap</h2>
+<p class="lead">
+  A reliable setup has four parts: WAL capacity, authenticated transport, a consistent base backup,
+  and a retention path that lets a disconnected standby catch up.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Location</th>
+        <th>Purpose</th>
+        <th>Operational warning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>wal_level</code></td>
+        <td>Primary</td>
+        <td><code>replica</code> for physical, <code>logical</code> for logical decoding too</td>
+        <td>Higher capability can produce extra WAL for some workloads</td>
+      </tr>
+      <tr>
+        <td><code>max_wal_senders</code></td>
+        <td>Sending server</td>
+        <td>Allows concurrent WAL sender connections</td>
+        <td>Reserve headroom for backups and cascading links</td>
+      </tr>
+      <tr>
+        <td><code>max_replication_slots</code></td>
+        <td>Slot host</td>
+        <td>Allows physical and logical slots</td>
+        <td>A slot can retain WAL even when its consumer is absent</td>
+      </tr>
+      <tr>
+        <td><code>primary_conninfo</code></td>
+        <td>Standby</td>
+        <td>Connection string for its upstream server</td>
+        <td>Protect credentials and verify TLS identity</td>
+      </tr>
+      <tr>
+        <td><code>primary_slot_name</code></td>
+        <td>Standby</td>
+        <td>Names the physical slot used on its upstream</td>
+        <td>One active consumer should own one slot intentionally</td>
+      </tr>
+      <tr>
+        <td><code>hot_standby</code></td>
+        <td>Standby</td>
+        <td>Permits read-only connections after recovery is consistent</td>
+        <td>Queries can conflict with replay</td>
+      </tr>
+      <tr>
+        <td><code>wal_keep_size</code></td>
+        <td>Primary</td>
+        <td>Provides minimum extra WAL retention for lagging standbys</td>
+        <td>It is not an exact retention guarantee by time</td>
+      </tr>
+      <tr>
+        <td><code>archive_mode</code> and archive command/library</td>
+        <td>Primary</td>
+        <td>Copies completed WAL segments to durable archive storage</td>
+        <td>Archive success and restore tests must be monitored</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Minimal shape of a physical replication setup</b></figcaption>
+  <pre><code>-- Primary SQL.
+CREATE ROLE repl_user WITH LOGIN REPLICATION PASSWORD 'use-a-secret-manager';
+SELECT * FROM pg_create_physical_replication_slot('standby_a');
+
+# Primary pg_hba.conf, use a narrowly scoped address and strong authentication.
+hostssl replication repl_user 10.20.30.41/32 scram-sha-256
+
+# Primary postgresql.conf.
+wal_level = replica
+max_wal_senders = 10
+max_replication_slots = 10
+
+# Bootstrap from a consistent physical base backup.
+pg_basebackup \
+  --host=primary.internal \
+  --username=repl_user \
+  --pgdata=/var/lib/postgresql/data \
+  --write-recovery-conf \
+  --slot=standby_a \
+  --wal-method=stream
+
+# Resulting standby configuration conceptually includes:
+primary_conninfo = 'host=primary.internal user=repl_user sslmode=verify-full'
+primary_slot_name = 'standby_a'</code></pre>
+</figure>
+
+<p>
+  <code>pg_basebackup</code> takes a base backup from a running cluster through the replication
+  protocol. The target data directory must be handled carefully, permissions must be correct, and
+  tablespaces need an intentional mapping. In production, automate the process through a tested
+  backup or HA system rather than copying a live data directory with a general file tool.
+</p>
+
+<h3 id="bootstrap-checklist">Bootstrap checklist</h3>
+<ol>
+  <li>Verify the primary version, system identifier, tablespaces and storage capacity.</li>
+  <li>Create a dedicated replication role and narrow <code>pg_hba.conf</code> rule.</li>
+  <li>Size sender and slot limits with operational headroom.</li>
+  <li>Create or reserve the correct slot if a slot-based design is used.</li>
+  <li>Take a consistent base backup and transfer it over authenticated encryption.</li>
+  <li>Configure the upstream, slot, archive restore path and <code>standby.signal</code>.</li>
+  <li>Start the standby and confirm it reaches streaming state.</li>
+  <li>Generate a known write, observe receive and replay advance, and read it on the standby.</li>
+  <li>Test reconnection, restart, archive fallback, promotion and rebuilding the old primary.</li>
+</ol>
+
+<div class="warn">
+  <strong>A connected standby is not proof of recoverability</strong>
+  <p>
+    A green TCP connection only proves the current stream exists. It does not prove that enough WAL
+    is retained after an outage, that an archive can restore, that promotion is correctly fenced, or
+    that clients can find the new primary. Exercise those paths.
+  </p>
+</div>
+
+<h2 id="slots"><span class="num">03.</span> Replication slots and WAL retention</h2>
+<p class="lead">
+  A replication slot records how far a consumer still needs the WAL or logical decoding history. It
+  protects the consumer, but transfers storage risk to the server that owns the slot.
+</p>
+
+<p>
+  A physical slot prevents required WAL from being removed before the standby receives it. A logical
+  slot also protects information needed to decode changes and can hold back removal of row versions
+  through its catalog horizon. Slots remain when consumers disconnect. That persistence is their
+  value and their danger.
+</p>
+
+<figure class="code">
+  <figcaption><b>Inspect slot health and retained WAL</b></figcaption>
+  <pre><code>SELECT slot_name,
+       slot_type,
+       database,
+       active,
+       active_pid,
+       restart_lsn,
+       confirmed_flush_lsn,
+       wal_status,
+       safe_wal_size,
+       inactive_since,
+       invalidation_reason
+FROM pg_replication_slots
+ORDER BY slot_name;
+
+SELECT slot_name,
+       pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+       ) AS retained_wal
+FROM pg_replication_slots
+WHERE restart_lsn IS NOT NULL;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Meaning</th>
+        <th>Question to ask</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>active</code></td>
+        <td>A consumer currently uses the slot</td>
+        <td>Should an inactive slot still exist?</td>
+      </tr>
+      <tr>
+        <td><code>restart_lsn</code></td>
+        <td>Oldest WAL that might still be required</td>
+        <td>How many bytes are retained behind current WAL?</td>
+      </tr>
+      <tr>
+        <td><code>confirmed_flush_lsn</code></td>
+        <td>Logical consumer-confirmed progress</td>
+        <td>Is the subscriber acknowledging work?</td>
+      </tr>
+      <tr>
+        <td><code>wal_status</code></td>
+        <td>Availability state of required WAL</td>
+        <td>Is the slot protected, extended, unreserved or lost?</td>
+      </tr>
+      <tr>
+        <td><code>invalidation_reason</code></td>
+        <td>Why the slot can no longer be used</td>
+        <td>Must the consumer be resynchronized?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Set alerts on retained bytes, free space, inactivity, slot invalidation and consumer progress.
+  <code>max_slot_wal_keep_size</code> can cap WAL retained by slots, but crossing the cap may make a
+  slot unusable and force a rebuild. It converts an unlimited primary-disk threat into a bounded
+  retention policy with an explicit consumer recovery consequence.
+</p>
+
+<div class="warn">
+  <strong>Never drop a slot merely because it is inactive</strong>
+  <p>
+    First identify its owner, application, expected outage, recovery path and current upstream.
+    Dropping a required slot can make a consumer unable to continue from its saved position. On the
+    other hand, leaving an abandoned slot can fill <code>pg_wal</code> and stop the primary. Slot
+    lifecycle must be part of deployment and decommissioning procedures.
+  </p>
+</div>
+
+<h2 id="read-replicas"><span class="num">04.</span> Read replicas and read-only routing</h2>
+<p class="lead">
+  A hot standby can remove some read work from the primary, but it is an eventually consistent,
+  restricted execution environment, not a transparent second primary.
+</p>
+
+<p>
+  During hot standby, <code>transaction_read_only</code> is always true. DML, DDL, sequence changes,
+  row-locking queries such as <code>SELECT FOR UPDATE</code>, temporary table creation, maintenance
+  commands and many catalog changes are unavailable. A report that writes staging rows to a
+  temporary table cannot simply be moved to a physical replica.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Routing pattern</th>
+        <th>Good fit</th>
+        <th>Correctness concern</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>All writes and critical reads to primary</td>
+        <td>Simple systems and strict freshness</td>
+        <td>Primary remains the read bottleneck</td>
+      </tr>
+      <tr>
+        <td>Reports and analytics to replica</td>
+        <td>Stale-tolerant, expensive reads</td>
+        <td>Long queries can conflict with WAL replay</td>
+      </tr>
+      <tr>
+        <td>Session stickiness after write</td>
+        <td>User flows needing read-your-writes</td>
+        <td>Time-based stickiness does not prove replay caught up</td>
+      </tr>
+      <tr>
+        <td>LSN-aware routing</td>
+        <td>Applications able to carry a causal position</td>
+        <td>Requires router and replica progress integration</td>
+      </tr>
+      <tr>
+        <td><code>remote_apply</code> for selected writes</td>
+        <td>Need visibility on a synchronous standby before commit returns</td>
+        <td>Adds replay and network latency to commit</td>
+      </tr>
+      <tr>
+        <td>Dedicated replicas by workload</td>
+        <td>Separate HA, reports and API traffic</td>
+        <td>More cost, monitoring and failover complexity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Make routing assumptions explicit</b></figcaption>
+  <pre><code>-- Check where this connection landed.
+SELECT pg_is_in_recovery() AS is_standby,
+       current_setting('transaction_read_only') AS read_only;
+
+-- Capture a causal marker on the primary after a write transaction.
+SELECT pg_current_wal_lsn();
+
+-- A router or application can wait until the chosen standby reports
+-- pg_last_wal_replay_lsn() at or beyond the required marker,
+-- with a bounded timeout and primary fallback.</code></pre>
+</figure>
+
+<p>
+  A load balancer that randomly sends every <code>SELECT</code> to a replica can break signup,
+  checkout, authorization and background workflows. A user may write a row on the primary and
+  immediately fail to find it on a lagging replica. Transactions must stay on one connection, and
+  read-only routing must understand semantic freshness, not just SQL keywords.
+</p>
+
+<h3 id="standby-conflicts">Hot standby query conflicts</h3>
+<p>
+  WAL replay represents work that already committed upstream. If a standby query blocks a replayed
+  DDL lock or still needs row versions that primary vacuum removed, PostgreSQL must eventually delay
+  replay or cancel the query. <code>max_standby_streaming_delay</code> and
+  <code>max_standby_archive_delay</code> bound how long replay waits for relevant conflicts.
+  <code>pg_stat_database_conflicts</code> counts cancellation reasons.
+</p>
+
+<p>
+  <code>hot_standby_feedback</code> reports standby snapshot needs upstream and can reduce cleanup
+  conflicts. The tradeoff is delayed cleanup and possible bloat on the primary. It does not prevent
+  every conflict, such as an Access Exclusive lock conflict. An HA replica normally favors prompt
+  replay and short queries. An analytics replica may tolerate more replay delay. One replica rarely
+  serves both goals perfectly.
+</p>
+
+<h2 id="lag"><span class="num">05.</span> Replication lag: types, causes and remediation</h2>
+<p class="lead">
+  Diagnose the first pipeline boundary that falls behind. Treat lag as a symptom with multiple
+  possible causes, not as a single server property.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Lag type</th>
+        <th>Signal</th>
+        <th>Likely causes</th>
+        <th>Typical response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Generation backlog</td>
+        <td>Current primary LSN far beyond <code>sent_lsn</code></td>
+        <td>Sender CPU, primary I/O, huge WAL burst, sender contention</td>
+        <td>Measure WAL rate, sender state and primary resource saturation</td>
+      </tr>
+      <tr>
+        <td>Network or receive lag</td>
+        <td><code>sent_lsn</code> beyond <code>write_lsn</code></td>
+        <td>Bandwidth, latency, packet loss, receiver starvation</td>
+        <td>Fix network path, compression architecture or receiver resources</td>
+      </tr>
+      <tr>
+        <td>Flush lag</td>
+        <td><code>write_lsn</code> beyond <code>flush_lsn</code></td>
+        <td>Slow or saturated standby WAL storage</td>
+        <td>Inspect storage latency, queue depth, fsync and competing work</td>
+      </tr>
+      <tr>
+        <td>Replay lag</td>
+        <td><code>flush_lsn</code> beyond <code>replay_lsn</code></td>
+        <td>Slow data storage, CPU, replay conflicts, recovery pause</td>
+        <td>Check conflicts, replay pause, locks, I/O and restartpoints</td>
+      </tr>
+      <tr>
+        <td>Logical apply lag</td>
+        <td>Subscriber worker progress trails publisher slot</td>
+        <td>Constraints, indexes, conflicts, slow DML, large transaction</td>
+        <td>Inspect worker, logs, subscription stats and target write capacity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Measure byte backlog from the primary</b></figcaption>
+  <pre><code>SELECT application_name,
+       pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)
+       ) AS not_sent,
+       pg_size_pretty(pg_wal_lsn_diff(sent_lsn, write_lsn)) AS network_or_write,
+       pg_size_pretty(pg_wal_lsn_diff(write_lsn, flush_lsn)) AS not_flushed,
+       pg_size_pretty(pg_wal_lsn_diff(flush_lsn, replay_lsn)) AS not_replayed
+FROM pg_stat_replication;
+
+-- Time since the last replayed transaction on a standby.
+SELECT CASE
+         WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL
+         ELSE clock_timestamp() - pg_last_xact_replay_timestamp()
+       END AS replay_time_gap;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>An idle database can look time-lagged</strong>
+  <p>
+    If no transaction commits for ten minutes, the last replay timestamp can also be ten minutes old
+    while the standby is fully caught up. Conversely, a steady stream of tiny transactions can make
+    timestamp lag look small while a significant byte backlog exists. Alert from multiple signals
+    and include traffic state.
+  </p>
+</div>
+
+<h3 id="lag-causes">Common lag causes</h3>
+<ul class="clean">
+  <li>
+    A bulk load, index build, rewrite, vacuum full or large update creates WAL faster than normal.
+  </li>
+  <li>The network cannot sustain peak WAL generation or has intermittent loss.</li>
+  <li>Standby storage has lower throughput or higher latency than primary storage.</li>
+  <li>Long standby queries delay replay because of recovery conflicts.</li>
+  <li>Recovery is intentionally paused with <code>pg_wal_replay_pause()</code>.</li>
+  <li>A very large transaction cannot become visible until its commit is replayed or applied.</li>
+  <li>
+    CPU-heavy decompression, checksums, encryption or competing queries starve receiver or replay.
+  </li>
+  <li>A logical apply worker stops on a constraint, permission, schema or data conflict.</li>
+  <li>A restart repeatedly redoes catch-up work, or required WAL has already been removed.</li>
+</ul>
+
+<h3 id="lag-playbook">Lag incident playbook</h3>
+<ol>
+  <li>Confirm the affected link, role, timeline, receiver state and whether recovery is paused.</li>
+  <li>
+    Record current, sent, written, flushed and replayed positions without restarting anything.
+  </li>
+  <li>
+    Compare backlog change over several samples. Catching up and falling behind need different
+    actions.
+  </li>
+  <li>Compare WAL bytes generated per second with network and standby write capacity.</li>
+  <li>Inspect standby conflicts, long queries, storage latency, CPU pressure and logs.</li>
+  <li>Protect correctness by removing a stale replica from freshness-sensitive routing.</li>
+  <li>Protect disk by watching slots and archive growth while the consumer is delayed.</li>
+  <li>After repair, verify backlog reaches steady state and run a known-write visibility check.</li>
+</ol>
+
+<p>
+  Do not immediately restart a lagging standby. A restart can destroy useful evidence and does not
+  solve inadequate throughput. Do not delete retained WAL or a slot to reclaim space without
+  accepting that the consumer may require a fresh base backup. Throttle the WAL-producing operation
+  only when the business and incident scope permit it.
+</p>
+
+<h2 id="sync-async"><span class="num">06.</span> Asynchronous and synchronous replication</h2>
+<p class="lead">
+  Asynchronous replication favors write availability and latency. Synchronous replication can
+  strengthen commit durability, but a commit waits for selected downstream acknowledgment.
+</p>
+
+<p>
+  Physical streaming replication is asynchronous by default. A primary can acknowledge a commit
+  before the standby has received it, so failover can lose recently acknowledged transactions.
+  Synchronous replication configures the primary to wait for one or more named standbys at a chosen
+  acknowledgment level.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th><code>synchronous_commit</code></th>
+        <th>Commit waits for</th>
+        <th>Useful interpretation</th>
+        <th>Main tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>off</code></td>
+        <td>Neither local durable flush nor remote acknowledgment for that transaction</td>
+        <td>May lose recent acknowledged transactions after crash</td>
+        <td>Lowest latency, weaker durability</td>
+      </tr>
+      <tr>
+        <td><code>local</code></td>
+        <td>Local primary WAL flush</td>
+        <td>Local crash durability without synchronous replica wait</td>
+        <td>Failover may lose unsent WAL</td>
+      </tr>
+      <tr>
+        <td><code>remote_write</code></td>
+        <td>Standby operating system has written WAL</td>
+        <td>Survives PostgreSQL process failure there, not every OS failure</td>
+        <td>Weaker remote guarantee than flush</td>
+      </tr>
+      <tr>
+        <td><code>on</code></td>
+        <td>Selected standby has flushed WAL durably</td>
+        <td>Normal synchronous durability target</td>
+        <td>At least network round-trip plus remote flush latency</td>
+      </tr>
+      <tr>
+        <td><code>remote_apply</code></td>
+        <td>Selected standby has replayed the commit</td>
+        <td>New standby snapshots can observe the committed change</td>
+        <td>Includes replay delay in commit latency</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Priority and quorum synchronous standby selection</b></figcaption>
+  <pre><code># Wait for the first two available standbys by listed priority.
+synchronous_standby_names = 'FIRST 2 (dc_a_1, dc_a_2, dc_b_1)'
+
+# Wait for any two members of the candidate set.
+synchronous_standby_names = 'ANY 2 (dc_a_1, dc_a_2, dc_b_1)'
+
+-- Override durability for one transaction when policy allows it.
+BEGIN;
+SET LOCAL synchronous_commit = 'remote_apply';
+UPDATE payments SET status = 'captured' WHERE payment_id = 9001;
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  <code>FIRST</code> is priority-based. <code>ANY</code> is quorum-based for acknowledgments. This
+  commit quorum does not itself elect a primary or prevent two primaries. Election quorum and
+  synchronous commit acknowledgment solve different problems.
+</p>
+
+<div class="warn">
+  <strong>Synchronous does not mean zero-risk distributed consensus</strong>
+  <p>
+    The guarantee is tied to what the application was told before failure, the configured
+    acknowledgment level and the selected standbys. If required synchronous standbys disappear,
+    commits can wait indefinitely until configuration or membership changes. Acknowledgment does not
+    replace fencing, correct promotion, backups, validation of failure domains or protection from
+    operator mistakes.
+  </p>
+</div>
+
+<p>
+  Place synchronous standbys according to the failure the business needs to survive. Same-rack
+  replicas give lower latency but share rack risk. Cross-region replicas survive wider failures but
+  add wide-area round-trip time to every synchronous commit. Locks remain held while a transaction
+  waits at commit, so downstream slowness can increase contention upstream. Measure tail latency,
+  not only averages.
+</p>
+
+<h2 id="cascading"><span class="num">07.</span> Cascading replication and topology</h2>
+<p class="lead">
+  A cascading standby receives WAL from an upstream server and relays it to downstream standbys,
+  reducing direct sender connections and repeated wide-area traffic from the primary.
+</p>
+
+<figure class="code">
+  <figcaption><b>Conceptual topology</b></figcaption>
+  <pre><code>Primary
+  |-- HA standby in region A
+  |-- Relay standby in region B
+        |-- Read replica B1
+        |-- Read replica B2</code></pre>
+</figure>
+
+<p>
+  The relay must allow replication connections, have enough
+  <code>max_wal_senders</code>, and expose appropriate authentication. Each downstream configures
+  <code>primary_conninfo</code> for its chosen upstream. Cascading physical replication is
+  asynchronous. Primary synchronous settings do not wait through a cascade because the primary does
+  not directly know the downstream nodes.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Benefit</th>
+        <th>Cost or risk</th>
+        <th>Control</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Fewer primary connections</td>
+        <td>Relay becomes a dependency for its subtree</td>
+        <td>Redundant relay or documented reparenting</td>
+      </tr>
+      <tr>
+        <td>One inter-region WAL stream</td>
+        <td>Extra hop increases end-to-end lag</td>
+        <td>Monitor each link and final replay, not only primary link</td>
+      </tr>
+      <tr>
+        <td>Regional read fan-out</td>
+        <td>Topology is harder to reason about during failover</td>
+        <td>Maintain explicit inventory and timeline procedures</td>
+      </tr>
+      <tr>
+        <td>Archive-fed relay can keep sending available WAL</td>
+        <td>Retention policies differ at each hop</td>
+        <td>Test archive and slot ownership per upstream</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  After upstream promotion, downstreams can follow the new timeline when
+  <code>recovery_target_timeline = 'latest'</code>, which is the default. That does not remove the
+  need to ensure they connect to the correct upstream and have the required WAL history. Topology
+  changes need the same care as initial bootstrap.
+</p>
+
+<h2 id="backup-pitr"><span class="num">08.</span> Replication, backups and PITR</h2>
+<p class="lead">
+  Replication provides a moving copy for availability. A base backup plus archived WAL provides a
+  historical recovery path. Strong systems use both.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Capability</th>
+        <th>Replica</th>
+        <th>Base backup plus WAL archive</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Fast server takeover</td>
+        <td>Yes, when caught up and promotion is automated safely</td>
+        <td>Usually slower because restore and replay are required</td>
+      </tr>
+      <tr>
+        <td>Recover state before an accidental delete</td>
+        <td>No, the delete is normally replicated</td>
+        <td>Yes, recover to a target time, LSN, name or transaction</td>
+      </tr>
+      <tr>
+        <td>Independent retention</td>
+        <td>Usually only current state and retained WAL window</td>
+        <td>Yes, according to backup policy</td>
+      </tr>
+      <tr>
+        <td>Corruption and operator-error isolation</td>
+        <td>Limited because changes can propagate</td>
+        <td>Better when immutable and independently validated</td>
+      </tr>
+      <tr>
+        <td>Proof of recovery</td>
+        <td>Promotion drill</td>
+        <td>Restore drill plus data and application checks</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PITR restores a physical base backup, retrieves archived WAL through
+  <code>restore_command</code>, and replays until a configured recovery target. Every required WAL
+  segment between the base backup and target must be available. Archive monitoring must verify both
+  timely storage and actual restore. A directory full of files is not evidence that the chain is
+  complete.
+</p>
+
+<p>
+  Timelines separate histories after recovery or promotion. When a standby is promoted, PostgreSQL
+  creates a new timeline so new WAL does not overwrite the old branch. Timeline history lets
+  recovery follow the correct ancestry. An old primary cannot safely rejoin as primary merely by
+  restarting. It must be fenced and rebuilt or rewound through a verified procedure.
+</p>
+
+<div class="key">
+  <strong>Define RPO and RTO before choosing topology</strong>
+  <p>
+    "We have a replica" is not a business objective. State how many acknowledged transactions may be
+    lost, how quickly writes must resume, which region failures matter, how stale replica reads may
+    be, and how far back accidental changes must be recoverable. Those answers choose asynchronous
+    versus synchronous replication, archive retention, number and placement of standbys, and
+    automation.
+  </p>
+</div>
+
+<h2 id="logical-model"><span class="num">09.</span> Logical replication mental model</h2>
+<p class="lead">
+  Logical replication decodes selected committed changes into table-level operations. It trades the
+  binary completeness of physical replication for selectivity and looser coupling.
+</p>
+
+<p>
+  The publisher defines a publication inside one database. The publication selects tables or all
+  tables in schemas, may select operation types, and can use row filters or column lists. A
+  subscriber defines a connection and one or more publication names. The publisher's logical slot
+  preserves and decodes the change stream. Subscriber workers copy existing rows and then apply
+  ongoing transactions.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Concept</th>
+        <th>Responsibility</th>
+        <th>Important boundary</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Publication</td>
+        <td>Declares which table changes are exposed</td>
+        <td>Belongs to one publisher database</td>
+      </tr>
+      <tr>
+        <td>Replica identity</td>
+        <td>Identifies a target row for update and delete</td>
+        <td>Usually the primary key</td>
+      </tr>
+      <tr>
+        <td>Logical slot</td>
+        <td>Retains and decodes changes until acknowledged</td>
+        <td>Lives on the publisher and can retain disk</td>
+      </tr>
+      <tr>
+        <td>Subscription</td>
+        <td>Names connection, publications and apply options</td>
+        <td>Belongs to one subscriber database</td>
+      </tr>
+      <tr>
+        <td>Table sync worker</td>
+        <td>Copies initial table contents</td>
+        <td>Uses temporary synchronization slots and snapshots</td>
+      </tr>
+      <tr>
+        <td>Apply worker</td>
+        <td>Applies committed transactions in the target database</td>
+        <td>Can stop on target conflicts or permissions</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="logical-use-cases">Good use cases</h3>
+<ul class="clean">
+  <li>Copy a subset of operational tables into a reporting PostgreSQL database.</li>
+  <li>Move between major PostgreSQL versions with a planned low-downtime migration.</li>
+  <li>Consolidate selected tables from databases when key spaces and ownership are controlled.</li>
+  <li>Feed change events to a consumer through logical decoding.</li>
+  <li>Replicate selected rows or columns when physical replication would expose too much.</li>
+  <li>Maintain a writable subscriber for controlled integration, accepting conflict management.</li>
+</ul>
+
+<h3 id="replica-identity">Replica identity</h3>
+<p>
+  Inserts carry the new row, so they do not require a lookup identity. Updates and deletes must find
+  the existing subscriber row. By default, PostgreSQL uses the primary key. A suitable unique index
+  can be selected with <code>REPLICA IDENTITY USING INDEX</code>. As a fallback,
+  <code>REPLICA IDENTITY FULL</code> sends old-row values, which increases WAL and lookup cost and
+  can be inefficient without a usable subscriber index.
+</p>
+
+<figure class="code">
+  <figcaption><b>Define the identity intentionally</b></figcaption>
+  <pre><code>-- Best default: a stable primary key.
+CREATE TABLE accounts (
+  account_id bigint PRIMARY KEY,
+  email text NOT NULL,
+  status text NOT NULL
+);
+
+-- Or choose a qualifying unique index.
+CREATE UNIQUE INDEX accounts_external_id_uq
+    ON accounts (external_id);
+ALTER TABLE accounts
+    REPLICA IDENTITY USING INDEX accounts_external_id_uq;
+
+-- Last-resort fallback for a keyless table.
+ALTER TABLE legacy_events REPLICA IDENTITY FULL;</code></pre>
+</figure>
+
+<p>
+  A publication that includes updates or deletes will reject those operations on a table without an
+  acceptable replica identity. Treat a stable key as part of the logical replication contract, not
+  as an optional performance optimization.
+</p>
+
+<h2 id="logical-setup">
+  <span class="num">10.</span> Publications, subscriptions and initial sync
+</h2>
+<p class="lead">
+  Logical replication setup is simple in syntax but operationally depends on pre-created schema,
+  compatible data, adequate workers, secure connectivity, slot capacity and a deliberate cutover.
+</p>
+
+<figure class="code">
+  <figcaption><b>Basic built-in logical replication</b></figcaption>
+  <pre><code>-- Publisher configuration requires:
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
+
+-- Publisher database.
+CREATE PUBLICATION commerce_pub
+FOR TABLE orders, order_items
+WITH (publish = 'insert, update, delete, truncate');
+
+-- The subscriber tables must already exist.
+-- A schema-only dump is a common starting point:
+pg_dump --schema-only --table=orders --table=order_items source_db |
+  psql target_db
+
+-- Subscriber database. Keep secrets outside command history in production.
+CREATE SUBSCRIPTION commerce_sub
+CONNECTION 'host=publisher.internal dbname=app user=logical_repl sslmode=verify-full'
+PUBLICATION commerce_pub
+WITH (copy_data = true);</code></pre>
+</figure>
+
+<p>
+  By default, creating the subscription creates a logical slot on the publisher and copies existing
+  table data. Each table synchronization obtains a consistent starting point while concurrent
+  changes continue entering the slot. When the copy catches the chosen point, normal apply keeps the
+  table current. Initial copy can load the publisher, network and subscriber, while the slot retains
+  WAL that cannot yet be released.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Decision</th>
+        <th>Option or action</th>
+        <th>Risk to manage</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Copy existing rows?</td>
+        <td><code>copy_data = true</code> by default</td>
+        <td>Duplicate rows if the subscriber was already seeded incorrectly</td>
+      </tr>
+      <tr>
+        <td>Create remote slot automatically?</td>
+        <td><code>create_slot</code></td>
+        <td>DDL transaction restrictions and orphaned slot lifecycle</td>
+      </tr>
+      <tr>
+        <td>Connect immediately?</td>
+        <td><code>connect = false</code> for staged setup</td>
+        <td>Manual slot creation, enable and refresh sequence</td>
+      </tr>
+      <tr>
+        <td>Apply in binary format?</td>
+        <td><code>binary = true</code></td>
+        <td>Cross-version and type compatibility is more restrictive</td>
+      </tr>
+      <tr>
+        <td>Stream large in-progress transactions?</td>
+        <td><code>streaming</code> subscription option</td>
+        <td>Worker, temporary storage and version-specific behavior</td>
+      </tr>
+      <tr>
+        <td>Enable subscriber failover support?</td>
+        <td>Failover-capable slot and synchronized standby slots</td>
+        <td>Requires coordinated PostgreSQL-version-specific configuration</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="publication-controls">Row filters, column lists and operation sets</h3>
+<figure class="code">
+  <figcaption><b>Publish only an intentional data contract</b></figcaption>
+  <pre><code>CREATE PUBLICATION active_customer_pub
+FOR TABLE customers (
+  customer_id,
+  email,
+  plan,
+  updated_at
+)
+WHERE (status = 'active')
+WITH (publish = 'insert, update, delete');
+
+-- After adding tables or changing subscribed publication membership:
+ALTER SUBSCRIPTION active_customer_sub REFRESH PUBLICATION;</code></pre>
+</figure>
+
+<p>
+  Row filters are evaluated according to publication rules as rows enter, leave or change within the
+  filter. Column lists limit replicated columns. These are data-distribution controls, not a
+  substitute for transport encryption, target authorization or data-governance review.
+  <code>TRUNCATE</code> is not filtered row by row. Initial copy behavior and combinations of
+  overlapping publications deserve explicit tests before production.
+</p>
+
+<h3 id="logical-monitoring">Monitor subscriber state</h3>
+<figure class="code">
+  <figcaption><b>Subscription and table synchronization status</b></figcaption>
+  <pre><code>-- Subscriber.
+SELECT subname,
+       pid,
+       relid::regclass,
+       received_lsn,
+       last_msg_send_time,
+       last_msg_receipt_time,
+       latest_end_lsn,
+       latest_end_time
+FROM pg_stat_subscription;
+
+SELECT subname,
+       apply_error_count,
+       sync_error_count,
+       stats_reset
+FROM pg_stat_subscription_stats;
+
+SELECT srsubstate, count(*)
+FROM pg_subscription_rel
+GROUP BY srsubstate
+ORDER BY srsubstate;
+
+-- Publisher.
+SELECT slot_name,
+       active,
+       restart_lsn,
+       confirmed_flush_lsn
+FROM pg_replication_slots
+WHERE slot_type = 'logical';</code></pre>
+</figure>
+
+<p>
+  Catalog state codes in <code>pg_subscription_rel</code> are useful during initial synchronization,
+  but operators should use the documentation for their deployed major version when interpreting
+  them. Alert on stopped workers, error counters, stale receipt times, retained WAL, tables that do
+  not reach ready state and data-validation failures.
+</p>
+
+<h2 id="logical-conflicts">
+  <span class="num">11.</span> Logical conflicts, limitations and change management
+</h2>
+<p class="lead">
+  A logical subscriber is a normal writable database. That flexibility means constraints, local
+  writes, permissions and schema drift can stop or alter replication.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Conflict or gap</th>
+        <th>Behavior</th>
+        <th>Prevention or response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Incoming insert violates unique constraint</td>
+        <td>Apply errors and stops until resolved</td>
+        <td>Reserve key space, prevent target writes, repair data deliberately</td>
+      </tr>
+      <tr>
+        <td>Incoming update or delete finds no row</td>
+        <td>Change is skipped and conflict is counted</td>
+        <td>Investigate drift and validate datasets</td>
+      </tr>
+      <tr>
+        <td>Target column or constraint incompatible</td>
+        <td>Apply can fail</td>
+        <td>Sequence compatible schema changes around both nodes</td>
+      </tr>
+      <tr>
+        <td>Subscription owner lacks permission or is subject to RLS</td>
+        <td>Apply fails</td>
+        <td>Use least privilege that still permits required target operations</td>
+      </tr>
+      <tr>
+        <td>Subscriber trigger behavior surprises application</td>
+        <td>Replica-origin apply follows trigger replication settings</td>
+        <td>Review trigger enable modes and test side effects</td>
+      </tr>
+      <tr>
+        <td>Overlapping subscriptions deliver the same rows</td>
+        <td>Duplicate changes can conflict</td>
+        <td>Make publication ownership disjoint or prove idempotent design</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PostgreSQL records logical conflict statistics in
+  <code>pg_stat_subscription_stats</code> and logs details. A conflict that raises an error requires
+  a decision: change subscriber data or permissions so the transaction can apply, or skip the remote
+  transaction using the documented subscription controls. Skipping preserves progress but
+  intentionally creates divergence, so record the decision and reconcile data.
+</p>
+
+<div class="warn">
+  <strong>Do not "fix" conflicts with blind deletes</strong>
+  <p>
+    Determine which system owns the row, whether the publisher transaction includes related changes,
+    and whether the subscriber served local writes. Capture evidence, back up the affected rows,
+    resolve the business truth, resume apply, and validate counts and checksums at an appropriate
+    granularity.
+  </p>
+</div>
+
+<h3 id="logical-limitations">Important built-in limitations</h3>
+<ul class="clean">
+  <li>
+    Schema definitions and DDL are not replicated. Create and evolve target schema separately.
+  </li>
+  <li>
+    Sequence state is not replicated, although inserted identity values are ordinary column data.
+  </li>
+  <li>
+    Large objects are not replicated. Store required content in supported table data or copy
+    separately.
+  </li>
+  <li>Targets are regular tables, not views, materialized views or foreign tables.</li>
+  <li>Tables match by fully qualified name and columns match by name.</li>
+  <li>Subscriber-only columns need suitable defaults or nullable behavior.</li>
+  <li>Partitioned-table mapping depends on publication settings and target table structure.</li>
+  <li>
+    <code>TRUNCATE</code> with foreign keys can fail if related target tables are outside the
+    subscription.
+  </li>
+  <li>Replica identity and supported operator behavior constrain update and delete application.</li>
+</ul>
+
+<h3 id="ddl-order">Safe schema evolution pattern</h3>
+<p>
+  Additive changes usually go to the subscriber first, then publisher, so incoming rows never refer
+  to a missing target column. For removal or incompatible type changes, stop producing the old
+  shape, allow replication to drain, update the publication or application contract, then alter
+  nodes in a tested order. Exact order depends on whether old and new application versions overlap.
+</p>
+
+<figure class="code">
+  <figcaption><b>Example additive rollout</b></figcaption>
+  <pre><code>-- 1. Subscriber: accept the future value first.
+ALTER TABLE orders ADD COLUMN fulfillment_note text;
+
+-- 2. Publisher: add the same compatible column.
+ALTER TABLE orders ADD COLUMN fulfillment_note text;
+
+-- 3. Deploy writers that populate the new column.
+-- 4. Validate apply and data.
+-- 5. Add stricter defaults or constraints through a separately tested rollout.</code></pre>
+</figure>
+
+<h2 id="ha-failover">
+  <span class="num">12.</span> High availability, promotion and split-brain safety
+</h2>
+<p class="lead">
+  Failover is a distributed-systems decision: determine that the old primary must no longer accept
+  writes, choose a sufficiently current standby, promote exactly one node, and redirect clients.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Component</th>
+        <th>Question it answers</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Health checks</td>
+        <td>Is the server process, SQL path and write path usable?</td>
+      </tr>
+      <tr>
+        <td>Distributed coordination</td>
+        <td>Which candidate has authority to act?</td>
+      </tr>
+      <tr>
+        <td>Candidate selection</td>
+        <td>Which standby has acceptable timeline, lag and location?</td>
+      </tr>
+      <tr>
+        <td>Fencing</td>
+        <td>How is the failed or isolated primary prevented from writing?</td>
+      </tr>
+      <tr>
+        <td>Promotion</td>
+        <td>How does the chosen standby leave recovery and accept writes?</td>
+      </tr>
+      <tr>
+        <td>Service discovery</td>
+        <td>How do clients connect to the new writer?</td>
+      </tr>
+      <tr>
+        <td>Rejoin procedure</td>
+        <td>How are old nodes rebuilt from the winning history?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PostgreSQL supplies replication, state inspection and promotion primitives such as
+  <code>pg_ctl promote</code> and <code>pg_promote()</code>. It does not by itself decide a complete
+  automatic HA policy, reconfigure every client or fence an unreachable machine. HA managers,
+  service managers, distributed configuration stores, virtual IPs, proxies and managed database
+  platforms combine these pieces in different ways.
+</p>
+
+<h3 id="split-brain">Split brain and fencing</h3>
+<p>
+  Split brain means more than one node accepts writes for the same logical database history. It can
+  happen when a network partition makes the primary and the failover controller unable to see each
+  other, but clients can still reach both. Later, WAL histories diverge and cannot be merged by
+  ordinary physical replication.
+</p>
+
+<p>
+  Fencing removes the old primary's ability to serve writes before or as the new one is promoted.
+  Examples at a high level include powering off or isolating the old node through infrastructure,
+  revoking its network path, detaching its storage, or using a provider operation with strong
+  guarantees. Closing one proxy route is insufficient if any client or administrator can still reach
+  the old server directly.
+</p>
+
+<div class="key">
+  <strong>Quorum is about authority, not merely counting database nodes</strong>
+  <p>
+    A coordination quorum helps avoid two automation controllers making opposite decisions during a
+    partition. Synchronous replication quorum controls how many acknowledgments a commit waits for.
+    Neither term alone guarantees safe failover. The design must specify membership, failure
+    domains, fencing and what happens when quorum is lost.
+  </p>
+</div>
+
+<h3 id="failover-playbook">Planned switchover or emergency failover</h3>
+<ol>
+  <li>
+    Declare the incident or maintenance window and identify the current authoritative primary.
+  </li>
+  <li>Stop or drain writes when possible. Record primary and candidate replay positions.</li>
+  <li>Confirm the candidate is healthy, on the expected timeline and within the permitted RPO.</li>
+  <li>Fence the old primary using the environment's tested mechanism.</li>
+  <li>Allow remaining WAL to replay when possible, then promote exactly one chosen standby.</li>
+  <li>Verify it is no longer in recovery and can commit a controlled write.</li>
+  <li>Redirect writer traffic and verify pools discard old connections.</li>
+  <li>Repoint or rebuild other standbys against the new primary and timeline.</li>
+  <li>Validate application invariants, lag, slots, archiving and backups.</li>
+  <li>Rebuild or rewind the old primary only after proving the winning history.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Useful state checks during a controlled event</b></figcaption>
+  <pre><code>-- A standby returns true before promotion.
+SELECT pg_is_in_recovery();
+
+-- Promotion request from SQL with a bounded wait.
+SELECT pg_promote(wait_seconds =&gt; 60);
+
+-- Confirm new writable role and identify its timeline through operational tools.
+SELECT pg_is_in_recovery(),
+       current_setting('transaction_read_only');
+
+-- Old primary data must never simply be assumed compatible with the new timeline.</code></pre>
+</figure>
+
+<p>
+  Automatic failover optimizes RTO but raises the cost of a false positive. Health checks must
+  distinguish a failed database from a failed monitoring path, overloaded server, isolated network
+  and unavailable coordination service. Use multiple signals and time bounds matched to the
+  business. Practice failover under realistic connection pools, DNS caches, long transactions and
+  partial failures.
+</p>
+
+<h2 id="scaling-patterns"><span class="num">13.</span> Scaling patterns and their limits</h2>
+<p class="lead">
+  Replicas scale some reads and improve availability. They do not make one primary's write,
+  coordination or data-model limits disappear.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>What it scales</th>
+        <th>What it does not solve</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Vertical scaling</td>
+        <td>CPU, memory, storage throughput of one node</td>
+        <td>Failure domain and unlimited growth</td>
+      </tr>
+      <tr>
+        <td>Connection pooling</td>
+        <td>Client concurrency with fewer PostgreSQL processes</td>
+        <td>Slow queries or write throughput by itself</td>
+      </tr>
+      <tr>
+        <td>Physical read replicas</td>
+        <td>Stale-tolerant reads and HA copies</td>
+        <td>Primary writes, replica freshness and replay cost</td>
+      </tr>
+      <tr>
+        <td>Logical reporting copy</td>
+        <td>Selected data and independent target indexes</td>
+        <td>Schema automation and conflict-free multi-writer behavior</td>
+      </tr>
+      <tr>
+        <td>Caching</td>
+        <td>Repeated read pressure and latency</td>
+        <td>Invalidation correctness and cache-miss load</td>
+      </tr>
+      <tr>
+        <td>Partitioning</td>
+        <td>Table lifecycle, pruning and maintenance units</td>
+        <td>Write distribution across independent servers</td>
+      </tr>
+      <tr>
+        <td>Application sharding</td>
+        <td>Writes and storage across multiple primaries</td>
+        <td>Cross-shard joins, transactions, uniqueness and operations</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="scale-sequence">A sensible scaling sequence</h3>
+<ol>
+  <li>
+    Measure the workload, slow queries, waits, WAL rate, connection count and storage latency.
+  </li>
+  <li>Fix query shape, indexes, transaction scope and accidental excess work.</li>
+  <li>Pool connections and set bounded concurrency so overload does not cascade.</li>
+  <li>Scale the primary vertically while the operational tradeoff remains favorable.</li>
+  <li>Add caches or replicas for clearly stale-tolerant read classes.</li>
+  <li>
+    Separate heavy analytics when replica conflicts or resource contention remain unacceptable.
+  </li>
+  <li>Partition for pruning and lifecycle needs, not merely because a table is large.</li>
+  <li>Shard only with an explicit routing key, ownership model and cross-shard plan.</li>
+</ol>
+
+<p>
+  Every physical replica must receive and replay the primary's WAL, so adding replicas consumes
+  network, primary sender resources, standby storage writes, backup work and operational attention.
+  A read moved away from the primary may still cause WAL replay conflicts and cache churn on the
+  standby. Benchmark total system behavior.
+</p>
+
+<h3 id="sharding">Sharding at a high level</h3>
+<p>
+  Sharding places disjoint data on independent writable PostgreSQL clusters. Choose a stable shard
+  key such as tenant ID, route every request, make globally unique identifiers, and minimize
+  cross-shard operations. Resharding moves live data while writes continue and is often harder than
+  the original design.
+</p>
+
+<p>
+  PostgreSQL physical replication then provides HA inside each shard. Logical replication can help
+  migrations or data movement, but it does not automatically solve concurrent writes to both old and
+  new owners. Define a single writer for each key range during every migration phase.
+</p>
+
+<h2 id="operations"><span class="num">14.</span> Operational playbooks and observability</h2>
+<p class="lead">
+  Reliable replication is maintained through invariants, alerts, rehearsed procedures and capacity
+  forecasts rather than one-time configuration.
+</p>
+
+<h3 id="dashboard">Minimum dashboard</h3>
+<ul class="clean">
+  <li>Node role, recovery state, timeline and last successful role transition.</li>
+  <li>WAL generation bytes per second and peaks by deployment or maintenance event.</li>
+  <li>Per-link sender state, byte backlogs and write, flush and replay timing.</li>
+  <li>Receiver connection status, last message times and reconnect counts.</li>
+  <li>Slot active state, retained WAL, catalog horizon, inactivity and invalidation.</li>
+  <li><code>pg_wal</code>, archive and filesystem free space with forecasted exhaustion.</li>
+  <li>Archive success, failure count, age of last archived WAL and restore-test age.</li>
+  <li>Standby conflict cancellations by reason and long-running standby queries.</li>
+  <li>Logical subscription workers, table sync state, apply errors and conflict counts.</li>
+  <li>Synchronous standby membership and commits waiting on replication.</li>
+  <li>Backup age, verified restore age, RPO estimate and failover-drill age.</li>
+</ul>
+
+<h3 id="lost-wal">Standby can no longer find required WAL</h3>
+<ol>
+  <li>Confirm the missing segment and whether a durable archive contains it.</li>
+  <li>Repair archive access or restore configuration if the segment exists.</li>
+  <li>If history is unavailable, stop repeated retries and plan a new base backup.</li>
+  <li>Protect the primary from obsolete slot retention and document any slot replacement.</li>
+  <li>Rebuild from the current authoritative primary, then validate catch-up and read behavior.</li>
+</ol>
+
+<h3 id="disk-pressure">Primary disk pressure from retained WAL</h3>
+<ol>
+  <li>Measure free space, WAL generation rate and time to exhaustion.</li>
+  <li>Identify the exact slot, archive failure or standby holding the oldest WAL.</li>
+  <li>Restore the consumer quickly if it can catch up before exhaustion.</li>
+  <li>Add safe capacity or reduce controllable WAL-producing work if available.</li>
+  <li>Drop or invalidate a consumer only through an explicit decision to rebuild it.</li>
+  <li>After recovery, add a retention limit and alerts appropriate to the agreed RPO.</li>
+</ol>
+
+<h3 id="logical-stopped">Logical apply stopped</h3>
+<ol>
+  <li>
+    Read subscriber logs and <code>pg_stat_subscription_stats</code>; identify the transaction and
+    table.
+  </li>
+  <li>
+    Check schema, permissions, RLS, unique constraints, replica identity and local target writes.
+  </li>
+  <li>Preserve conflicting rows and determine authoritative data ownership.</li>
+  <li>Repair the target or intentionally skip only through the documented mechanism.</li>
+  <li>Resume, observe acknowledgment progress and validate the affected data range.</li>
+  <li>Prevent recurrence through key-space, DDL or access-control changes.</li>
+</ol>
+
+<div class="note">
+  <strong>Alert on rate and consequence</strong>
+  <p>
+    A 5 GB slot backlog is harmless on one system and an emergency on another. Combine retained
+    bytes with generation rate, free space and rebuild cost. A 30-second replay delay may be fine
+    for analytics but violate checkout correctness. Thresholds must come from capacity and service
+    objectives.
+  </p>
+</div>
+
+<h2 id="security"><span class="num">15.</span> Replication security</h2>
+<p class="lead">
+  Replication streams can expose the database's sensitive contents. Protect them as privileged data
+  paths and minimize who can create, consume or redirect them.
+</p>
+
+<ul class="clean">
+  <li>Create dedicated roles with <code>LOGIN REPLICATION</code> instead of using superusers.</li>
+  <li>Narrow <code>pg_hba.conf</code> by user, replication database field and source network.</li>
+  <li>Use TLS and verify the server identity, not encryption without authentication.</li>
+  <li>
+    Keep passwords out of configuration committed to source control and out of command history.
+  </li>
+  <li>Rotate credentials through a procedure that avoids breaking every standby simultaneously.</li>
+  <li>Restrict network routes so only expected upstream and downstream nodes communicate.</li>
+  <li>
+    Protect base backups, WAL archives, temporary copies and snapshots with encryption and access
+    logs.
+  </li>
+  <li>Review publication tables, columns and row filters as a data-governance boundary.</li>
+  <li>Grant subscription-owner rights only on required target tables and schemas.</li>
+  <li>Audit slot, publication, subscription, promotion and replication-role changes.</li>
+</ul>
+
+<p>
+  A replication role can read the WAL stream, from which privileged data may be extracted even if
+  that role cannot issue ordinary table queries. Logical publications narrow delivered row changes,
+  but connection strings and target ownership remain sensitive. A writable subscriber also has its
+  own application and insider-threat surface.
+</p>
+
+<h2 id="edge-cases">
+  <span class="num">16.</span> Edge cases, mistakes and performance implications
+</h2>
+<p class="lead">
+  Most production failures come from ignoring a boundary: retained history, stale reads, role
+  authority, schema ownership, replay capacity or an untested recovery path.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Common mistake</th>
+        <th>Why it fails</th>
+        <th>Better rule</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Calling a replica a backup</td>
+        <td>Destructive changes replicate</td>
+        <td>Keep independent base backups and WAL archives; test restores</td>
+      </tr>
+      <tr>
+        <td>Routing every SELECT to replicas</td>
+        <td>Read-after-write and transaction semantics break</td>
+        <td>Classify reads by freshness and session requirements</td>
+      </tr>
+      <tr>
+        <td>Ignoring inactive slots</td>
+        <td>Required WAL grows until disk fills</td>
+        <td>Assign slot ownership, retention limits and alerts</td>
+      </tr>
+      <tr>
+        <td>Assuming synchronous means always available</td>
+        <td>Required acknowledgments can block commits</td>
+        <td>Design membership and degradation policy explicitly</td>
+      </tr>
+      <tr>
+        <td>Promoting before fencing</td>
+        <td>Old and new primaries may both accept writes</td>
+        <td>Prove single-writer authority before redirecting traffic</td>
+      </tr>
+      <tr>
+        <td>Reusing old primary without rebuild or rewind</td>
+        <td>Timelines may have diverged</td>
+        <td>Follow a verified rejoin procedure from winning history</td>
+      </tr>
+      <tr>
+        <td>Using <code>REPLICA IDENTITY FULL</code> casually</td>
+        <td>More WAL and expensive target lookup</td>
+        <td>Prefer a compact stable key and matching target index</td>
+      </tr>
+      <tr>
+        <td>Changing publisher DDL only</td>
+        <td>Logical apply encounters an incompatible target</td>
+        <td>Roll out schema through a version-compatible sequence</td>
+      </tr>
+      <tr>
+        <td>Running unlimited reports on HA standby</td>
+        <td>Queries delay replay or get canceled</td>
+        <td>Separate HA and analytics priorities when needed</td>
+      </tr>
+      <tr>
+        <td>Monitoring only connection state</td>
+        <td>A connected consumer can be far behind</td>
+        <td>Monitor the full LSN pipeline, rate, slots and consequences</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="performance-effects">Where replication costs appear</h3>
+<ul class="clean">
+  <li>Primary WAL generation, sender CPU and network bandwidth.</li>
+  <li>Extra WAL retention from slots, archives and lagging standbys.</li>
+  <li>Standby WAL writes, data-page replay, restartpoints and query I/O.</li>
+  <li>Synchronous commit network round trips, remote flush and possibly replay latency.</li>
+  <li>Locks held longer while synchronous commits wait.</li>
+  <li>Logical decoding memory, spill or streaming work for large transactions.</li>
+  <li>Subscriber index and constraint maintenance for every applied row.</li>
+  <li>Initial synchronization scans, network transfer and bulk target writes.</li>
+  <li>Primary bloat when hot standby feedback or logical horizons delay cleanup.</li>
+</ul>
+
+<h3 id="large-transactions">Large transactions</h3>
+<p>
+  A large transaction can generate a burst of WAL, retain locks, delay logical visibility until
+  commit, consume decoding resources and create a long apply unit. Break bulk work into bounded,
+  restartable transactions when business atomicity allows. Do not split a transaction whose
+  invariant genuinely requires all-or-nothing behavior merely to improve replication metrics.
+</p>
+
+<h3 id="version-upgrades">Version and compatibility boundaries</h3>
+<p>
+  Physical replication normally cannot cross major PostgreSQL versions, which is why major upgrades
+  use binary upgrade, dump and restore, or logical replication strategies. Logical replication is
+  more flexible, but schema, type, feature and protocol behavior still must be validated for the
+  exact source and target versions. Read the documentation for both deployed versions and rehearse
+  rollback.
+</p>
+
+<h2 id="practice"><span class="num">17.</span> Practice scenarios and questions</h2>
+<p class="lead">
+  Use these exercises to practice decisions, commands and failure reasoning. A strong answer names
+  the required guarantee, observes evidence, explains tradeoffs and includes validation.
+</p>
+
+<h3 id="practice-lab">Hands-on lab</h3>
+<ol>
+  <li>
+    Build a primary and physical standby in disposable environments. Use a dedicated replication
+    role, TLS if the lab supports it, a named slot and <code>pg_basebackup</code>.
+  </li>
+  <li>
+    Insert a marker row on the primary. Capture its commit-side WAL position and watch the standby's
+    receive and replay positions pass it.
+  </li>
+  <li>
+    Pause WAL replay briefly, generate writes, and compare receive backlog with replay backlog.
+    Resume replay before retention becomes unsafe.
+  </li>
+  <li>
+    Run a long read on the standby while updating and vacuuming relevant primary rows. Observe
+    conflict counters under lab-appropriate delay settings.
+  </li>
+  <li>
+    Create a publication for a keyed table and a subscription in another cluster. Watch initial
+    synchronization and ongoing apply.
+  </li>
+  <li>
+    Cause a safe unique-key conflict on the disposable subscriber. Capture logs and counters, repair
+    it, then verify apply resumes.
+  </li>
+  <li>
+    Perform a controlled physical promotion. Prove the new server is writable, then rebuild the old
+    primary as a standby rather than returning it as a competing writer.
+  </li>
+  <li>
+    Restore a base backup with archived WAL to a chosen target in an isolated environment. Validate
+    application rows, not only server startup.
+  </li>
+</ol>
+
+<h3 id="practice-design">Design questions</h3>
+<ol>
+  <li>
+    Checkout requires read-your-writes, but product search tolerates 30 seconds of staleness. Draw
+    the connection-routing rules and fallback behavior.
+  </li>
+  <li>
+    The business allows no acknowledged payment loss but can tolerate higher payment latency. Choose
+    a synchronous configuration and explain its behavior during standby loss.
+  </li>
+  <li>
+    An analytics query needs two hours and frequently gets canceled on the HA standby. Compare delay
+    changes, hot standby feedback, a dedicated replica and a logical reporting copy.
+  </li>
+  <li>
+    A slot retains 600 GB of WAL while its consumer is offline and disk will fill in 45 minutes.
+    Write the evidence-gathering and decision tree.
+  </li>
+  <li>
+    Plan a major-version migration with logical replication. Include schema setup, sequences,
+    initial sync, validation, write freeze, final catch-up, cutover and rollback boundary.
+  </li>
+  <li>
+    A network partition isolates the old primary from the HA controller but not from some clients.
+    Explain why promotion without fencing is unsafe.
+  </li>
+  <li>
+    Two regions require local low-latency reads, while writes remain in one region. Describe
+    routing, cascading, staleness expectations and disaster recovery.
+  </li>
+  <li>
+    An application wants active-active writes through two logical subscriptions. List the key,
+    conflict, sequence, ordering and DDL questions that must be solved first.
+  </li>
+</ol>
+
+<h3 id="practice-short">Short-answer checks</h3>
+<ul class="clean">
+  <li>Why can <code>replay_lsn</code> trail <code>flush_lsn</code>?</li>
+  <li>When can timestamp lag look large even while fully caught up?</li>
+  <li>What protects a disconnected standby from WAL recycling?</li>
+  <li>Why can <code>hot_standby_feedback</code> cause primary bloat?</li>
+  <li>What is the difference between <code>remote_write</code> and <code>remote_apply</code>?</li>
+  <li>Why is a synchronous quorum not a primary-election quorum?</li>
+  <li>Why are DDL and sequence state migration tasks in logical replication?</li>
+  <li>Which identity normally locates rows for logical update and delete?</li>
+  <li>Why must the old primary be rebuilt or safely rewound after failover?</li>
+  <li>How do replication and PITR solve different recovery problems?</li>
+</ul>
+
+<h2 id="interview"><span class="num">18.</span> Interview questions and model answers</h2>
+
+<div class="qa">
+  <p class="q">Q: Explain PostgreSQL streaming replication end to end.</p>
+  <p class="a">
+    A standby starts from a consistent physical base backup. Primary transactions generate WAL. A
+    walsender streams WAL records to the standby's walreceiver, which writes and flushes them into
+    local WAL. The standby startup process replays records against its data files in order. Once a
+    commit record is replayed, new hot-standby snapshots can see that transaction. LSN fields expose
+    progress through send, write, flush and replay stages.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Physical versus logical replication?</p>
+  <p class="a">
+    Physical replication replays the whole cluster's binary WAL into a same-major-version-compatible
+    standby and is the normal basis for HA and hot standbys. Logical replication decodes selected
+    table changes and applies them to pre-created target tables. It supports selective data and
+    major-version migration, but does not replicate DDL or sequence state and can encounter target
+    data conflicts.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is a replication slot?</p>
+  <p class="a">
+    It is persistent server state that records how much WAL or logical history a consumer may still
+    need. It prevents premature removal during consumer disconnection. Because the server retains
+    history until progress advances, an abandoned or slow slot can fill disk. Slots need ownership,
+    lag and free-space alerts, retention policy and a safe decommission procedure.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do you diagnose replication lag?</p>
+  <p class="a">
+    Compare the primary current LSN with sender sent, standby write, flush and replay LSNs. The
+    first large gap locates sender, network/write, flush or replay pressure. Sample over time to see
+    whether backlog grows or shrinks, then inspect WAL generation rate, network, disk, CPU, replay
+    conflicts, paused recovery, large transactions and logs. Protect freshness-sensitive routing and
+    slot disk while repairing the cause.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">
+    Q: Why are <code>write_lag</code>, <code>flush_lag</code> and <code>replay_lag</code> not
+    backlog estimates?
+  </p>
+  <p class="a">
+    They estimate recent delay between local WAL flush and remote acknowledgment stages and are
+    primarily useful for synchronous commit behavior. They can become null when a fully caught-up
+    idle standby has no recent measurement. Byte differences between LSNs show queued WAL. Both need
+    workload context.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Asynchronous versus synchronous replication?</p>
+  <p class="a">
+    Asynchronous commit does not wait for a standby, so it preserves lower latency and write
+    availability but failover may lose recent acknowledged transactions. Synchronous commit waits
+    for selected downstream acknowledgment at remote write, durable flush or replay, improving the
+    chosen durability or visibility guarantee while adding network and downstream latency. Missing
+    required standbys can block commits.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does <code>remote_apply</code> guarantee?</p>
+  <p class="a">
+    For a transaction using it with configured synchronous standbys, commit waits until selected
+    standbys report replay of the commit record. That means new snapshots on those standbys can see
+    the transaction. It adds replay time to commit latency and still requires correct routing,
+    fencing and failure management.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is cascading replication?</p>
+  <p class="a">
+    A cascading standby receives physical WAL and relays it to downstream standbys. It reduces
+    direct primary connections and repeated cross-site bandwidth, but adds a hop, a relay dependency
+    and topology complexity. Cascaded links are asynchronous, and the primary's synchronous standby
+    settings do not wait for indirect downstream nodes.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can read replicas return stale results?</p>
+  <p class="a">
+    The primary can commit before the standby receives, flushes and replays the commit, especially
+    with asynchronous replication. A read routed immediately after a write may arrive before replay.
+    Keep strict reads on the primary, use session or LSN-aware routing, wait for a required replay
+    position with a timeout, or use an appropriate synchronous visibility policy.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why can long queries be canceled on a hot standby?</p>
+  <p class="a">
+    WAL replay must apply upstream work that already committed, such as DDL locks or vacuum cleanup.
+    A standby query may hold a conflicting lock or snapshot. PostgreSQL waits only within configured
+    standby delay limits, then cancels the query so replay can proceed. Feedback can reduce cleanup
+    conflicts but may cause primary bloat.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is replica identity in logical replication?</p>
+  <p class="a">
+    It is the key information sent so the subscriber can find the existing row for an update or
+    delete. The primary key is the default. A qualifying unique index can be selected. Full-row
+    identity is a fallback that increases WAL and may make subscriber lookup expensive, so a compact
+    stable key is preferred.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What happens during logical initial synchronization?</p>
+  <p class="a">
+    Table synchronization workers copy existing rows from a consistent snapshot while changes keep
+    accumulating through logical slots. Each table catches up from its copy point, then the regular
+    apply path maintains it. The copy consumes source, network and target capacity, and delayed
+    acknowledgment can retain substantial publisher WAL.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What does logical replication not copy?</p>
+  <p class="a">
+    Built-in logical replication does not copy schema DDL, sequence state or large objects. It
+    targets supported tables, not views or materialized views. Operators must pre-create compatible
+    tables, coordinate later schema changes, set sequence values for writable cutover, and handle
+    unsupported objects separately.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How do logical replication conflicts happen?</p>
+  <p class="a">
+    The subscriber applies normal target operations. Local writes, duplicate key spaces,
+    incompatible constraints, missing rows, permissions, RLS or schema drift can conflict with
+    incoming changes. Some errors stop apply until repaired or intentionally skipped, while missing
+    update or delete targets are skipped and counted. Data ownership and validation are essential.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Why is replication not a backup?</p>
+  <p class="a">
+    Replication normally copies current changes, including accidental deletes and harmful
+    application updates. It is optimized for availability and current copies. Backups plus archived
+    WAL provide independent retention and point-in-time recovery before an error. Production needs
+    replication, backups, archive monitoring and restore tests.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What is split brain?</p>
+  <p class="a">
+    It is a state where more than one node accepts writes for the same logical database history.
+    Network partitions and unsafe promotion can create it. Safe failover uses coordination and
+    fencing to remove the old primary's write authority before promoting and routing to one new
+    primary. Diverged physical histories cannot be merged by ordinary replay.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What are RPO and RTO?</p>
+  <p class="a">
+    RPO is the acceptable amount of data loss measured from the failure point. RTO is the acceptable
+    time to restore service. They turn vague HA requirements into topology choices: synchronous
+    level, placement, archive retention, standby readiness, failover automation and tested recovery
+    procedures.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: How would you scale PostgreSQL reads?</p>
+  <p class="a">
+    First optimize queries, indexes and connection concurrency. Classify reads by freshness and
+    transaction semantics. Route stale-tolerant reports or search to appropriately sized replicas,
+    retain critical and read-after-write queries on the primary or use causal routing, and monitor
+    replay capacity and conflicts. Add dedicated replicas when HA and analytics priorities differ.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: Do read replicas scale writes?</p>
+  <p class="a">
+    No. Every write still commits on the primary and generates WAL that each physical replica must
+    receive and replay. Offloading reads can free primary resources indirectly, but sustained write
+    scaling requires workload optimization, vertical capacity, partitioning for suitable problems,
+    or a carefully designed sharding and ownership model.
+  </p>
+</div>
+
+<div class="qa">
+  <p class="q">Q: What would you verify after failover?</p>
+  <p class="a">
+    Confirm the old primary is fenced, exactly one new primary is out of recovery, controlled writes
+    commit, applications and pools use it, timelines and standbys follow it, replication lag and
+    slots are healthy, archiving works, backups target the new authority, and business invariants
+    remain correct. Then rebuild the old primary safely.
+  </p>
+</div>
+
+<h2 id="cheatsheet"><span class="num">19.</span> One-screen cheat sheet</h2>
+<ul class="clean">
+  <li>
+    <strong>Physical:</strong> base backup plus whole-cluster WAL replay, normal HA foundation.
+  </li>
+  <li>
+    <strong>Logical:</strong> publications, slots and subscriptions for selected table changes.
+  </li>
+  <li><strong>Pipeline:</strong> generate, send, receive, write, flush, replay, become visible.</li>
+  <li><strong>LSN:</strong> WAL position; use differences for byte backlog.</li>
+  <li><strong>Primary view:</strong> <code>pg_stat_replication</code>.</li>
+  <li><strong>Standby view:</strong> <code>pg_stat_wal_receiver</code>.</li>
+  <li><strong>Role check:</strong> <code>pg_is_in_recovery()</code>.</li>
+  <li><strong>Slot view:</strong> <code>pg_replication_slots</code>.</li>
+  <li>
+    <strong>Slot rule:</strong> protects consumers but can retain WAL until primary disk fills.
+  </li>
+  <li>
+    <strong>Read replica:</strong> eventually consistent and more restricted than primary read-only
+    mode.
+  </li>
+  <li>
+    <strong>Causal read:</strong> primary routing, replay-position wait or suitable synchronous
+    policy.
+  </li>
+  <li>
+    <strong>Replay conflict:</strong> delay WAL or cancel standby query; feedback may cause bloat.
+  </li>
+  <li><strong>Async:</strong> lower latency, possible recent acknowledged loss on failover.</li>
+  <li><strong>Sync on:</strong> wait for durable remote flush from selected standbys.</li>
+  <li><strong>Remote apply:</strong> wait for replay and visibility to new standby snapshots.</li>
+  <li><strong>FIRST:</strong> priority synchronous selection.</li>
+  <li><strong>ANY:</strong> quorum synchronous acknowledgments, not primary election.</li>
+  <li><strong>Cascade:</strong> standby relays WAL; fewer links, extra dependency and lag.</li>
+  <li><strong>Replica identity:</strong> stable key for logical update and delete.</li>
+  <li>
+    <strong>Logical gaps:</strong> DDL, sequences and large objects require separate handling.
+  </li>
+  <li><strong>Conflict:</strong> repair business truth, resume, then validate data.</li>
+  <li>
+    <strong>Promotion:</strong> fence old primary, promote one candidate, redirect and verify.
+  </li>
+  <li>
+    <strong>Split brain:</strong> multiple writable authorities; prevent with coordination and
+    fencing.
+  </li>
+  <li><strong>Backup:</strong> independent base backup plus WAL archive for PITR.</li>
+  <li>
+    <strong>Scaling:</strong> optimize first, pool, classify reads, then replicas or deliberate
+    sharding.
+  </li>
+  <li>
+    <strong>Operations:</strong> monitor rates, backlog stages, slots, disk, archive and restore
+    drills.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">20.</span> Official reference map</h2>
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/high-availability.html"
+      >High availability, load balancing and replication</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/warm-standby.html"
+      >Log-shipping standby servers, streaming, slots, cascading and synchronous replication</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/hot-standby.html"
+      >Hot standby behavior and recovery conflicts</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-replication.html"
+      >Replication configuration parameters</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/monitoring-stats.html"
+      >Replication, receiver, slot and subscription statistics</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/functions-admin.html"
+      >WAL, recovery, backup and replication administration functions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/app-pgbasebackup.html">pg_basebackup</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/continuous-archiving.html"
+      >Continuous archiving and point-in-time recovery</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication.html"
+      >Logical replication overview and architecture</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-publication.html"
+      >Publications and replica identity</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-subscription.html"
+      >Subscriptions and initial synchronization</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-row-filter.html"
+      >Logical replication row filters</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-col-lists.html"
+      >Logical replication column lists</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-conflicts.html"
+      >Logical replication conflicts</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-restrictions.html"
+      >Logical replication restrictions</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/logical-replication-monitoring.html"
+      >Monitoring logical replication</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-createpublication.html"
+      >CREATE PUBLICATION</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-createsubscription.html"
+      >CREATE SUBSCRIPTION</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

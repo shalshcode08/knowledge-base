@@ -36,8 +36,16 @@
           "path": "postgresql/locking-concurrency"
         },
         {
+          "title": "VACUUM, WAL and Bloat",
+          "path": "postgresql/vacuum-wal-bloat"
+        },
+        {
           "title": "Performance Tuning and Operations",
           "path": "postgresql/performance-tuning-operations"
+        },
+        {
+          "title": "Replication and Scaling",
+          "path": "postgresql/replication-scaling"
         },
         {
           "title": "Extensions and Specialized Features",
