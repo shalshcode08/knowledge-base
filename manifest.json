@@ -46,6 +46,10 @@
         {
           "title": "Replication and Scaling",
           "path": "postgresql/replication-scaling"
+        },
+        {
+          "title": "Extensions and Specialized Features",
+          "path": "postgresql/extensions-specialized-features"
         }
       ]
     }
