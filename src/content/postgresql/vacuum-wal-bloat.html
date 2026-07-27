@@ -1,0 +1,2318 @@
+<h1>PostgreSQL Internals: VACUUM, WAL &amp; Bloat - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth, practical and interview-focused guide to heap tuple versions, visibility, HOT, dead
+  tuples, vacuuming, autovacuum, transaction ID freezing, bloat, write-ahead logging, checkpoints,
+  crash recovery, durability, archiving and operational diagnosis.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> One mental model for the whole topic</h2>
+<p class="lead">
+  PostgreSQL separates a logical row from its physical row versions, and separates transaction
+  durability from immediate data-file writes. MVCC creates old tuple versions that later need
+  cleanup. WAL makes committed changes recoverable before dirty table and index pages reach disk.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a table as a notebook whose previous entries cannot be erased while somebody might
+    still be reading an older edition. An update writes a new entry and marks the old one as
+    superseded. VACUUM eventually makes obsolete space reusable. Beside the notebook is a
+    chronological repair journal, the WAL. PostgreSQL first makes the repair instructions durable,
+    then it may write the changed notebook page later. After a crash, it replays the journal.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mechanism</th>
+        <th>Problem it solves</th>
+        <th>Cost or responsibility it creates</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>MVCC tuple versions</td>
+        <td>Readers can see consistent snapshots while writers continue</td>
+        <td>Updates and deletes leave versions that must later become reusable</td>
+      </tr>
+      <tr>
+        <td>VACUUM and autovacuum</td>
+        <td>Reclaim reusable space, maintain maps and prevent ID wraparound</td>
+        <td>Consumes I/O, CPU, memory and sometimes brief locks</td>
+      </tr>
+      <tr>
+        <td>WAL</td>
+        <td>Crash recovery, durability, physical replication and PITR</td>
+        <td>Every logged change produces sequential WAL traffic</td>
+      </tr>
+      <tr>
+        <td>Checkpoints</td>
+        <td>Bound how far crash recovery must replay WAL</td>
+        <td>Flush dirty pages and make later first changes produce full-page images</td>
+      </tr>
+      <tr>
+        <td>Monitoring and tuning</td>
+        <td>Keep cleanup and WAL production ahead of workload demand</td>
+        <td>Requires workload-specific thresholds, capacity and alerts</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The central cause-and-effect chain</strong>
+  <p>
+    Write workload creates tuple versions and WAL. Old snapshots can delay tuple removal. Delayed
+    removal increases table and index work. More pages increase scans, cache pressure and future
+    maintenance. Frequent checkpoints increase full-page images. A healthy system keeps transactions
+    short, autovacuum timely, WAL storage safe and monitoring focused on trends.
+  </p>
+</div>
+
+<h2 id="heap-pages"><span class="num">01.</span> Heap storage, pages and tuple locations</h2>
+<p class="lead">
+  An ordinary PostgreSQL table uses heap storage: row versions are placed where suitable free space
+  exists, rather than being physically ordered by a primary key.
+</p>
+
+<h3 id="relation-files">Relations, forks and pages</h3>
+<p>
+  Tables and indexes are relations stored in relation files. Large relation files can be split into
+  file segments, but SQL normally treats them as one object. A heap has several forks:
+</p>
+
+<ul class="clean">
+  <li>The main fork stores heap pages and tuples.</li>
+  <li>The free space map fork, suffixed <code>_fsm</code>, records approximate free space.</li>
+  <li>
+    The visibility map fork, suffixed <code>_vm</code>, records all-visible and all-frozen pages.
+  </li>
+  <li>The initialization fork, suffixed <code>_init</code>, exists for unlogged relations.</li>
+  <li>
+    Large values can be moved to an associated TOAST table, which has its own storage and indexes.
+  </li>
+</ul>
+
+<p>
+  The usual page size is 8 KiB, chosen when PostgreSQL is compiled. A heap page has a fixed header,
+  an array of item identifiers, free space, tuple data and normally no special area. Item
+  identifiers grow forward from the page front while tuple data grows backward from the page end.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Page part</th>
+        <th>Purpose</th>
+        <th>Operational meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Page header</td>
+        <td>Stores flags, free-space boundaries, checksum and page LSN information</td>
+        <td>The page LSN connects a data page to WAL ordering</td>
+      </tr>
+      <tr>
+        <td>Item identifiers</td>
+        <td>Stable page-local pointers with tuple offset and length</td>
+        <td>Indexes point to a table block plus item identifier</td>
+      </tr>
+      <tr>
+        <td>Free space</td>
+        <td>Unused bytes between item identifiers and tuple data</td>
+        <td>Allows inserts, non-indexed growth and same-page HOT updates</td>
+      </tr>
+      <tr>
+        <td>Tuple data</td>
+        <td>Tuple headers, null bitmap and column values</td>
+        <td>Multiple physical versions can represent one logical row over time</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A tuple identifier, or TID, is commonly displayed as <code>(block_number,item_number)</code>. The
+  system column <code>ctid</code> exposes the current row version's TID. It is useful for diagnosis
+  and tightly scoped maintenance, but it is not a durable key. An update, table rewrite or row
+  movement changes it.
+</p>
+
+<figure class="code">
+  <figcaption><b>Inspect logical identity and physical version identity</b></figcaption>
+  <pre><code>SELECT id, xmin, xmax, cmin, cmax, ctid
+FROM accounts
+WHERE id = 42;
+
+SELECT
+  pg_size_pretty(pg_relation_size('accounts')) AS heap,
+  pg_size_pretty(pg_indexes_size('accounts')) AS indexes,
+  pg_size_pretty(pg_total_relation_size('accounts')) AS total;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Size is not automatically bloat</strong>
+  <p>
+    <code>pg_total_relation_size</code> includes the main table, indexes and TOAST-related storage.
+    A large relation may contain useful data, reserved free space or reusable space. Bloat means
+    avoidable excess relative to the workload's useful contents and steady-state reuse needs.
+  </p>
+</div>
+
+<h2 id="tuple-lifecycle"><span class="num">02.</span> Heap tuple lifecycle and system columns</h2>
+<p class="lead">
+  PostgreSQL performs an update by creating a new tuple version and making the old version no longer
+  current. This is the physical basis of MVCC.
+</p>
+
+<h3 id="insert-update-delete">INSERT, UPDATE and DELETE</h3>
+<ol class="clean">
+  <li>
+    <code>INSERT</code> creates a tuple version whose <code>xmin</code> identifies the inserting
+    transaction.
+  </li>
+  <li>
+    <code>UPDATE</code> creates a replacement tuple with a new <code>xmin</code>. The old version's
+    tuple metadata records that it was superseded. Its <code>ctid</code> participates in the version
+    chain.
+  </li>
+  <li>
+    <code>DELETE</code> does not immediately erase bytes. It records deletion metadata on the
+    existing version.
+  </li>
+  <li>
+    When no possible snapshot can need an old version, it becomes dead and can be pruned or
+    vacuumed.
+  </li>
+  <li>
+    Reclaimed space becomes available for later tuples. Plain vacuum usually does not compact every
+    page or return internal free space to the operating system.
+  </li>
+</ol>
+
+<p>
+  This is often summarized as "UPDATE is insert plus mark old," but it is not two user-visible SQL
+  statements. It is one atomic PostgreSQL operation with tuple header changes, locking, index work
+  and WAL records governed by the storage engine.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>System column</th>
+        <th>Meaning for a row version</th>
+        <th>Important caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>xmin</code></td>
+        <td>Transaction ID that inserted this version</td>
+        <td>XIDs wrap and are not permanent globally unique identifiers</td>
+      </tr>
+      <tr>
+        <td><code>xmax</code></td>
+        <td>Normally the deleting or superseding transaction, or zero when unused</td>
+        <td>
+          Can also encode row-lock or multixact state, and nonzero does not prove invisibility
+        </td>
+      </tr>
+      <tr>
+        <td><code>cmin</code></td>
+        <td>Command number that inserted the version within its transaction</td>
+        <td>Relevant to command ordering inside one transaction</td>
+      </tr>
+      <tr>
+        <td><code>cmax</code></td>
+        <td>Command number that deleted or superseded the version</td>
+        <td>Exposed logically although tuple storage can reuse header fields</td>
+      </tr>
+      <tr>
+        <td><code>ctid</code></td>
+        <td>Physical block and item location of this version</td>
+        <td>Changes on update or physical rewrite, so use a primary key for identity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>Do not implement visibility from xmin and xmax by hand</strong>
+  <p>
+    Correct visibility also depends on transaction commit status, the statement snapshot, command
+    IDs, subtransactions, hint bits, special XIDs, multixacts and isolation behavior. The displayed
+    system columns are excellent learning and diagnostic aids, not an application-level visibility
+    algorithm.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Observe version replacement in one session</b></figcaption>
+  <pre><code>CREATE TEMP TABLE version_demo (
+  id bigint PRIMARY KEY,
+  status text
+);
+
+INSERT INTO version_demo VALUES (1, 'new');
+SELECT id, status, xmin, xmax, ctid FROM version_demo;
+
+UPDATE version_demo SET status = 'paid' WHERE id = 1;
+SELECT id, status, xmin, xmax, ctid FROM version_demo;
+
+-- The logical key stays 1. xmin and usually ctid identify a new version.</code></pre>
+</figure>
+
+<h2 id="snapshots"><span class="num">03.</span> Snapshots, visibility and dead tuples</h2>
+<p class="lead">
+  A tuple is not dead merely because a newer version exists. It is dead only when no transaction
+  that PostgreSQL must honor can still see it.
+</p>
+
+<h3 id="snapshot-question">The visibility question</h3>
+<p>
+  A snapshot represents which transactions were in progress around a query's visibility boundary.
+  PostgreSQL combines the snapshot with the inserting and deleting transactions' states to decide
+  whether a version belongs in the query's view. In Read Committed, each command gets a fresh
+  snapshot. Repeatable Read and Serializable normally retain a transaction snapshot, subject to
+  their additional rules.
+</p>
+
+<p>
+  A transaction that started earlier can keep an old version visible even after another transaction
+  commits an update. VACUUM must not remove that old version. This required retention boundary is
+  often discussed as the cleanup horizon. Long transactions, abandoned idle transactions, prepared
+  transactions and some replication-slot states can hold horizons back.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Tuple state</th>
+        <th>Meaning</th>
+        <th>Can normal cleanup remove it?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>In progress</td>
+        <td>Its creating or deleting transaction has not resolved</td>
+        <td>No, visibility is not final</td>
+      </tr>
+      <tr>
+        <td>Live</td>
+        <td>Visible to current or future relevant snapshots</td>
+        <td>No</td>
+      </tr>
+      <tr>
+        <td>Recently dead</td>
+        <td>No longer current, but an existing snapshot might still need it</td>
+        <td>Not yet</td>
+      </tr>
+      <tr>
+        <td>Dead</td>
+        <td>No valid snapshot can need the version</td>
+        <td>Yes, subject to the cleanup mechanism and index references</td>
+      </tr>
+      <tr>
+        <td>Aborted insertion</td>
+        <td>Created by a transaction that rolled back</td>
+        <td>Yes when cleanup can safely process it</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="long-transactions">Why long transactions are maintenance problems</h3>
+<p>
+  A long-running query may be read-only and hold no troublesome row lock, yet its old snapshot can
+  prevent removal of many versions produced by unrelated writers. The table and indexes grow, future
+  scans visit more pages, and vacuum repeatedly encounters versions it cannot remove. An
+  <code>idle in transaction</code> session is especially wasteful because it retains transactional
+  state while doing no useful work.
+</p>
+
+<figure class="code">
+  <figcaption><b>Find transactions and snapshot horizons that deserve investigation</b></figcaption>
+  <pre><code>SELECT
+  pid,
+  usename,
+  state,
+  xact_start,
+  backend_xid,
+  backend_xmin,
+  wait_event_type,
+  wait_event,
+  left(query, 120) AS query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start;
+
+SELECT gid, prepared, owner, database, transaction
+FROM pg_prepared_xacts
+ORDER BY prepared;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Dead-tuple counters are estimates</strong>
+  <p>
+    Statistics views are designed for operational decisions, not byte-perfect proofs. Counters may
+    be delayed, reset or approximate. Compare trends, vacuum timestamps, table size and workload
+    behavior. Use deeper inspection tools only when the decision justifies their cost.
+  </p>
+</div>
+
+<h2 id="hot"><span class="num">04.</span> HOT updates and page pruning</h2>
+<p class="lead">
+  Heap-only tuple, or HOT, updates reduce index churn by keeping a version chain on one heap page
+  when indexed values do not require new ordinary index entries.
+</p>
+
+<h3 id="hot-requirements">When HOT is possible</h3>
+<ul class="clean">
+  <li>
+    The update does not change columns referenced by the table's indexes, excluding summarizing
+    indexes.
+  </li>
+  <li>The page holding the old tuple has enough free space for the new tuple version.</li>
+</ul>
+
+<p>
+  An index entry can continue pointing to the original page item identifier. PostgreSQL follows the
+  page-local HOT chain to the visible version. Dead intermediate versions can be pruned during
+  normal page access, including some reads, so HOT can reduce both new index entries and reliance on
+  a later full index-cleanup cycle.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Update kind</th>
+        <th>Heap work</th>
+        <th>Index work</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>HOT-eligible and same-page space exists</td>
+        <td>New version on the same page</td>
+        <td>No new entries in ordinary indexes for that row version</td>
+      </tr>
+      <tr>
+        <td>Indexed value changes</td>
+        <td>New version</td>
+        <td>Relevant indexes need new entries</td>
+      </tr>
+      <tr>
+        <td>No same-page room</td>
+        <td>New version goes elsewhere</td>
+        <td>Indexes need entries that reach the new location</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Lowering <code>fillfactor</code> reserves page space during initial filling and later inserts,
+  increasing the chance of same-page updates. It also makes the table larger when new. This is a
+  workload tradeoff, not a universal optimization. It is most valuable for frequently updated rows
+  whose indexed columns usually remain unchanged.
+</p>
+
+<figure class="code">
+  <figcaption><b>Measure HOT effectiveness before changing fillfactor</b></figcaption>
+  <pre><code>SELECT
+  relname,
+  n_tup_upd,
+  n_tup_hot_upd,
+  n_tup_newpage_upd,
+  round(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 2) AS hot_pct
+FROM pg_stat_user_tables
+ORDER BY n_tup_upd DESC;
+
+ALTER TABLE frequently_updated_accounts SET (fillfactor = 80);
+-- Existing pages are not magically repacked. A rewrite may be needed
+-- if the operational decision is to apply the new layout immediately.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>An unnecessary index can make every update more expensive</strong>
+  <p>
+    If a frequently changed column is included in any ordinary index, changing it prevents HOT for
+    that update. Audit indexes for read value as well as write cost. Do not remove a production
+    index only to improve HOT without proving that query and constraint needs remain satisfied.
+  </p>
+</div>
+
+<h2 id="bloat"><span class="num">05.</span> Table bloat and index bloat</h2>
+<p class="lead">
+  Bloat is avoidable physical space and work left behind when the useful data becomes much smaller
+  than the relation footprint or when reusable space is poorly matched to future writes.
+</p>
+
+<h3 id="table-bloat">Table bloat</h3>
+<p>
+  Dead tuple space inside heap pages can usually be reused after vacuum. That space is not always
+  harmful if the table will soon refill it. It becomes operational bloat when the relation remains
+  needlessly large, scans and cache usage suffer, or free space cannot serve the workload well.
+  Deleting 90 percent of a table may leave a large file because plain vacuum preserves internal
+  pages for reuse.
+</p>
+
+<h3 id="index-bloat">Index bloat</h3>
+<p>
+  Non-HOT updates can create new index entries for new tuple versions. Deletes and obsolete tuple
+  versions leave entries that vacuum's index-cleanup phase can remove. B-tree page splits, sparse
+  pages and changing key distributions can also leave an index much larger than its useful content.
+  Index bloat increases index scan I/O, cache pressure, write amplification and maintenance time.
+</p>
+
+<h3 id="bloat-causes">Common causes</h3>
+<ul class="clean">
+  <li>High update or delete volume with vacuum arriving too late.</li>
+  <li>Long snapshots or old replication-related horizons blocking tuple removal.</li>
+  <li>Large tables using scale-factor thresholds that allow too many changes before vacuum.</li>
+  <li>Updates to indexed columns, preventing HOT and generating index entries.</li>
+  <li>Pages packed too tightly for a strongly update-oriented workload.</li>
+  <li>One-time bulk deletion followed by little or no future reuse.</li>
+  <li>Repeatedly skipped or incomplete index cleanup.</li>
+  <li>Disabled autovacuum, exhausted workers, excessive throttling or lock conflicts.</li>
+</ul>
+
+<div class="key">
+  <strong>Reusable space and returned disk are different outcomes</strong>
+  <p>
+    Plain <code>VACUUM</code> normally makes internal space reusable by PostgreSQL. It returns space
+    to the operating system only when empty pages at the physical end can be truncated and the
+    required lock is acquired. <code>VACUUM FULL</code> rewrites a compact copy and can return much
+    more space, at a much higher availability and temporary-disk cost.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Start with supported size and activity signals</b></figcaption>
+  <pre><code>SELECT
+  s.schemaname,
+  s.relname,
+  s.n_live_tup,
+  s.n_dead_tup,
+  s.n_mod_since_analyze,
+  s.last_autovacuum,
+  s.autovacuum_count,
+  pg_size_pretty(pg_relation_size(s.relid)) AS heap_size,
+  pg_size_pretty(pg_indexes_size(s.relid)) AS index_size
+FROM pg_stat_user_tables AS s
+ORDER BY pg_total_relation_size(s.relid) DESC;
+
+SELECT
+  indexrelname,
+  idx_scan,
+  pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes
+WHERE relname = 'accounts'
+ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
+</figure>
+
+<p>
+  The optional official <code>pgstattuple</code> extension can estimate or inspect tuple and free
+  space more directly. Its exact functions and locking costs differ, so read the matching server
+  version's manual and test on representative data. Estimation is usually safer for a first
+  production pass.
+</p>
+
+<h2 id="plain-vacuum"><span class="num">06.</span> What plain VACUUM actually does</h2>
+<p class="lead">
+  Plain vacuum is routine online maintenance. It finds removable versions, cleans related index
+  entries when appropriate, marks heap space reusable, updates maps and advances maintenance
+  metadata.
+</p>
+
+<h3 id="vacuum-phases">Conceptual phases</h3>
+<ol class="clean">
+  <li>Scan heap pages that may need processing, using the visibility map to skip safe pages.</li>
+  <li>Identify dead tuple identifiers that are removable below the cleanup horizon.</li>
+  <li>Remove corresponding entries from indexes when index cleanup is selected.</li>
+  <li>Remove dead heap line pointers and make tuple space reusable.</li>
+  <li>Update the free space map and set valid visibility-map bits.</li>
+  <li>Freeze eligible old transaction and multixact metadata.</li>
+  <li>Optionally truncate completely empty pages from the physical end.</li>
+</ol>
+
+<p>
+  The implementation can make multiple passes when maintenance memory cannot hold every dead tuple
+  identifier. Index cleanup may use parallel workers for eligible indexes. Current PostgreSQL can
+  skip index cleanup when there are very few dead tuples because scanning every index could cost
+  more than the immediate benefit.
+</p>
+
+<figure class="code">
+  <figcaption><b>Useful manual vacuum forms</b></figcaption>
+  <pre><code>VACUUM (VERBOSE) public.accounts;
+
+VACUUM (ANALYZE, VERBOSE) public.accounts;
+
+VACUUM (INDEX_CLEANUP ON, VERBOSE) public.accounts;
+
+VACUUM (TRUNCATE OFF, VERBOSE) public.busy_events;
+
+VACUUM (PARALLEL 4, VERBOSE) public.large_fact_table;</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Plain VACUUM behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Concurrent DML</td>
+        <td>Ordinary SELECT, INSERT, UPDATE and DELETE can continue</td>
+      </tr>
+      <tr>
+        <td>Table lock</td>
+        <td>Uses a lock compatible with ordinary DML, but conflicts with some DDL</td>
+      </tr>
+      <tr>
+        <td>Transaction block</td>
+        <td>Cannot run inside <code>BEGIN ... COMMIT</code></td>
+      </tr>
+      <tr>
+        <td>Disk return</td>
+        <td>Usually internal reuse; possible tail truncation needs a brief stronger lock</td>
+      </tr>
+      <tr>
+        <td>Planner statistics</td>
+        <td>
+          Updated only when <code>ANALYZE</code> is requested, aside from maintenance counters
+        </td>
+      </tr>
+      <tr>
+        <td>Guarantee of removing every dead tuple</td>
+        <td>No, old horizons, skipped pages, locks and concurrent changes can limit work</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="vacuum-options">Options worth understanding</h3>
+<ul class="clean">
+  <li><code>VERBOSE</code> reports what happened, including freezing and cleanup details.</li>
+  <li><code>ANALYZE</code> follows vacuum with statistics collection.</li>
+  <li><code>FREEZE</code> uses aggressive freezing cutoffs for a controlled special case.</li>
+  <li>
+    <code>INDEX_CLEANUP AUTO</code> is the normal policy; <code>ON</code> and <code>OFF</code> force
+    a choice.
+  </li>
+  <li><code>TRUNCATE OFF</code> avoids the tail-truncation attempt and its stronger lock.</li>
+  <li>
+    <code>SKIP_LOCKED</code> lets a multi-relation maintenance command skip relations it cannot
+    lock.
+  </li>
+  <li><code>BUFFER_USAGE_LIMIT</code> controls the maintenance buffer-access ring.</li>
+</ul>
+
+<div class="warn">
+  <strong>VACUUM is not a row-count correction button</strong>
+  <p>
+    It performs several physical and safety jobs. A successful command can still leave dead tuples
+    that are not yet removable, and a small dead-tuple count does not prove a relation is compact.
+    Read verbose output, progress, horizons and size trends together.
+  </p>
+</div>
+
+<h2 id="full-analyze"><span class="num">07.</span> VACUUM FULL, ANALYZE and rewrite choices</h2>
+<p class="lead">
+  <code>VACUUM FULL</code> solves a different problem from routine vacuum, while
+  <code>ANALYZE</code> solves planner estimation rather than physical cleanup.
+</p>
+
+<h3 id="vacuum-full">VACUUM FULL</h3>
+<p>
+  <code>VACUUM FULL</code> rewrites the table into a compact new file and rebuilds its indexes. It
+  usually returns much more space to the operating system, but it requires an
+  <code>ACCESS EXCLUSIVE</code> lock, blocks all table use, takes time and needs temporary disk for
+  the new copy until the operation completes. The table gets a new physical layout, so tuple
+  locations change.
+</p>
+
+<p>
+  Use it only after measuring a durable need to shrink and planning the lock window, extra disk, WAL
+  volume, replica impact and recovery path. Autovacuum never chooses <code>VACUUM FULL</code>.
+  Routine vacuum should normally keep a write-heavy table in a reusable steady state.
+</p>
+
+<h3 id="rewrite-alternatives">Related rewrite choices</h3>
+<ul class="clean">
+  <li>
+    <code>CLUSTER</code> rewrites the heap in an index order and rebuilds indexes, with a strong
+    lock.
+  </li>
+  <li>Some <code>ALTER TABLE</code> forms rewrite the table as part of a schema change.</li>
+  <li>
+    <code>REINDEX</code> or <code>REINDEX CONCURRENTLY</code> targets index structure rather than
+    heap compaction.
+  </li>
+  <li>
+    <code>TRUNCATE</code> is efficient when the intent is to remove every row, but has distinct MVCC
+    and locking semantics.
+  </li>
+  <li>
+    Online rewrite extensions exist, but they add operational dependencies and are not core
+    behavior.
+  </li>
+</ul>
+
+<h3 id="analyze">ANALYZE</h3>
+<p>
+  <code>ANALYZE</code> samples table contents and stores statistics used by the planner, including
+  value distributions, null fractions and distinct-value estimates. It does not remove dead tuples
+  or shrink a relation. Autoanalyze triggers independently from autovacuum based on data-change
+  counters.
+</p>
+
+<figure class="code">
+  <figcaption><b>Choose the command that matches the symptom</b></figcaption>
+  <pre><code>-- Reclaim dead space for reuse and maintain visibility/freezing:
+VACUUM public.orders;
+
+-- Refresh planner statistics after a data-distribution change:
+ANALYZE public.orders;
+
+-- Do both:
+VACUUM (ANALYZE) public.orders;
+
+-- Exceptional offline compaction after proving the need:
+VACUUM (FULL, ANALYZE) public.archived_events;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Partitioned parents need deliberate statistics maintenance</strong>
+  <p>
+    Changes in partitions do not necessarily trigger analyze on the partitioned parent. Queries
+    using parent-level statistics can therefore need scheduled manual <code>ANALYZE</code> on the
+    parent even when individual partitions receive automatic maintenance.
+  </p>
+</div>
+
+<h2 id="maps"><span class="num">08.</span> Free space map and visibility map</h2>
+<p class="lead">
+  The free space map answers "where might a tuple fit?" The visibility map answers "which heap pages
+  are safe to skip for specific visibility or freezing work?"
+</p>
+
+<h3 id="fsm">Free space map</h3>
+<p>
+  The FSM stores approximate available space per heap or index page in a compact tree. Insert and
+  update paths consult it to find a page likely to fit a tuple without scanning the whole relation.
+  Vacuum updates it after reclaiming space. Because entries are approximate and races are possible,
+  finding a page through the FSM does not guarantee that enough room remains when the writer reaches
+  it.
+</p>
+
+<h3 id="vm">Visibility map</h3>
+<p>A heap visibility map stores two conservative bits per heap page:</p>
+
+<ul class="clean">
+  <li>
+    <strong>All-visible</strong>: every tuple on the page is known visible to all active and future
+    transactions. Vacuum can skip some work, and an index-only scan may avoid a heap visibility
+    fetch.
+  </li>
+  <li>
+    <strong>All-frozen</strong>: every tuple is frozen, so even anti-wraparound vacuum can skip the
+    page.
+  </li>
+</ul>
+
+<p>
+  Vacuum sets valid bits after checking a page. Any data modification clears the relevant
+  all-visible state. The map is conservative: a missing bit means "not proven," not necessarily
+  "false." Indexes do not have their own visibility map because MVCC visibility belongs to heap
+  tuples.
+</p>
+
+<div class="key">
+  <strong>Vacuum can improve read performance without shrinking a table</strong>
+  <p>
+    By setting all-visible bits, vacuum can make index-only scans avoid heap reads. This is why a
+    read-mostly table still benefits from maintenance after a load or update batch, even when dead
+    space is not the main concern.
+  </p>
+</div>
+
+<h2 id="autovacuum"><span class="num">09.</span> Autovacuum architecture</h2>
+<p class="lead">
+  Autovacuum is a launcher plus worker processes that schedule table-level <code>VACUUM</code> and
+  <code>ANALYZE</code> based on statistics and safety ages.
+</p>
+
+<ol class="clean">
+  <li>The launcher wakes and considers databases over time.</li>
+  <li>It starts workers, limited by configured worker slots and maximum active workers.</li>
+  <li>A worker connects to one database and checks tables for vacuum or analyze eligibility.</li>
+  <li>
+    The worker runs eligible maintenance with cost-based throttling and table-specific settings.
+  </li>
+  <li>Workers avoid duplicating the same table work, but several can operate in one database.</li>
+</ol>
+
+<p>
+  The default launcher nap is one minute per database cycle. With multiple databases, launches are
+  distributed across that interval. A few very large eligible tables can occupy all workers and
+  delay smaller tables, so worker capacity and per-table thresholds matter.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Default in PostgreSQL 18</th>
+        <th>Role</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>autovacuum</code></td>
+        <td><code>on</code></td>
+        <td>Enables ordinary automatic vacuum and analyze scheduling</td>
+      </tr>
+      <tr>
+        <td><code>autovacuum_worker_slots</code></td>
+        <td>Typically 16</td>
+        <td>Reserves backend slots from which autovacuum workers are taken</td>
+      </tr>
+      <tr>
+        <td><code>autovacuum_max_workers</code></td>
+        <td>3</td>
+        <td>Maximum simultaneously running workers, excluding launcher</td>
+      </tr>
+      <tr>
+        <td><code>autovacuum_naptime</code></td>
+        <td>1 minute</td>
+        <td>Minimum delay between runs on a database</td>
+      </tr>
+      <tr>
+        <td><code>log_autovacuum_min_duration</code></td>
+        <td>Disabled</td>
+        <td>Logs slow or all autovacuum actions when configured</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>Do not disable autovacuum as a performance fix</strong>
+  <p>
+    That trades visible maintenance work for growing dead versions, stale maps, possible planner
+    issues and forced anti-wraparound work. Fix thresholds, worker capacity, blockers and cost
+    settings instead. PostgreSQL can still launch anti-wraparound workers even when ordinary
+    autovacuum is disabled.
+  </p>
+</div>
+
+<h2 id="autovacuum-thresholds">
+  <span class="num">10.</span> Autovacuum thresholds and per-table tuning
+</h2>
+<p class="lead">
+  Threshold plus scale factor allows small tables to trigger after a fixed number of changes and
+  large tables to trigger in proportion to estimated size.
+</p>
+
+<h3 id="vacuum-trigger">Update and delete vacuum trigger</h3>
+<p>Conceptually, a table becomes eligible after changed tuples exceed:</p>
+
+<figure class="code">
+  <figcaption><b>Ordinary update/delete trigger in current PostgreSQL</b></figcaption>
+  <pre><code>vacuum_trigger =
+  min(
+    autovacuum_vacuum_threshold
+      + autovacuum_vacuum_scale_factor * estimated_table_tuples,
+    autovacuum_vacuum_max_threshold
+  )
+
+-- PostgreSQL 18 defaults:
+-- threshold = 50
+-- scale factor = 0.20
+-- maximum threshold = 100,000,000</code></pre>
+</figure>
+
+<p>
+  The maximum threshold prevents the proportional formula from requiring more than 100 million
+  updates or deletes by default on enormous tables. On versions before that setting exists, or when
+  it is set to <code>-1</code>, there is no such cap.
+</p>
+
+<h3 id="insert-trigger">Insert vacuum trigger</h3>
+<p>
+  Insert-triggered vacuum exists because append-only tables still need visibility-map maintenance
+  and freezing. Its scale component is based on unfrozen pages, not simply live tuple count:
+</p>
+
+<figure class="code">
+  <figcaption><b>Insert-triggered vacuum</b></figcaption>
+  <pre><code>insert_trigger =
+  autovacuum_vacuum_insert_threshold
+    + autovacuum_vacuum_insert_scale_factor * estimated_tuples_on_unfrozen_pages
+
+-- Defaults: 1000 and 0.20
+-- A threshold of -1 disables insert-based triggering.</code></pre>
+</figure>
+
+<h3 id="analyze-trigger">Analyze trigger</h3>
+<figure class="code">
+  <figcaption><b>Autoanalyze trigger</b></figcaption>
+  <pre><code>analyze_trigger =
+  autovacuum_analyze_threshold
+    + autovacuum_analyze_scale_factor * estimated_table_tuples
+
+-- Defaults: 50 and 0.10
+-- Inserts, updates and deletes contribute to the change count.</code></pre>
+</figure>
+
+<h3 id="large-table-tuning">Why large busy tables often need smaller scale factors</h3>
+<p>
+  At 100 million rows, a 20 percent scale component represents 20 million changes before ordinary
+  eligibility, unless capped. That can be much too late for a hot table even if the percentage
+  sounds reasonable. Configure lower per-table values based on actual change rate, vacuum duration,
+  acceptable dead-tuple backlog and available I/O.
+</p>
+
+<figure class="code">
+  <figcaption><b>Per-table settings for a high-churn table</b></figcaption>
+  <pre><code>ALTER TABLE public.orders SET (
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_analyze_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.02,
+  autovacuum_vacuum_cost_limit = 2000,
+  autovacuum_vacuum_cost_delay = 2
+);
+
+-- Inspect effective relation options:
+SELECT relname, reloptions
+FROM pg_class
+WHERE oid = 'public.orders'::regclass;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Eligibility is not immediate completion</strong>
+  <p>
+    A table can cross its trigger and still wait for the launcher, a worker slot, locks and the
+    worker's previous table. Tune using the full lag from change creation to cleanup completion, not
+    just the arithmetic threshold.
+  </p>
+</div>
+
+<h2 id="freezing"><span class="num">11.</span> Transaction ID wraparound and freezing</h2>
+<p class="lead">
+  Normal transaction IDs are 32-bit values compared in a circular space. Old tuple metadata must be
+  frozen before wraparound could make the past appear to be the future.
+</p>
+
+<h3 id="xid-ring">The XID ring</h3>
+<p>
+  There are roughly four billion 32-bit XID values. For a normal XID, roughly two billion are
+  considered older and two billion newer using modulo arithmetic. A tuple left with ordinary old
+  transaction metadata for too long could eventually be misclassified. PostgreSQL prevents this by
+  marking sufficiently old committed tuple versions frozen.
+</p>
+
+<p>
+  Modern PostgreSQL normally preserves the displayed original <code>xmin</code> and records frozen
+  state in tuple flags. A frozen version is treated as safely older than every normal transaction
+  for visibility purposes.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting or field</th>
+        <th>Typical default</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>vacuum_freeze_min_age</code></td>
+        <td>50 million XIDs</td>
+        <td>Minimum age at which regular vacuum normally freezes eligible XID state</td>
+      </tr>
+      <tr>
+        <td><code>vacuum_freeze_table_age</code></td>
+        <td>150 million XIDs</td>
+        <td>Encourages an aggressive scan before the safety maximum</td>
+      </tr>
+      <tr>
+        <td><code>autovacuum_freeze_max_age</code></td>
+        <td>200 million XIDs</td>
+        <td>Forces anti-wraparound vacuum even if ordinary autovacuum is disabled</td>
+      </tr>
+      <tr>
+        <td><code>pg_class.relfrozenxid</code></td>
+        <td>Per relation</td>
+        <td>Lower bound for oldest potentially unfrozen XID in the table</td>
+      </tr>
+      <tr>
+        <td><code>pg_database.datfrozenxid</code></td>
+        <td>Per database</td>
+        <td>Lower bound derived from relation maintenance state</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A normal vacuum can skip all-visible pages, so it may not freeze every older tuple. An aggressive
+  vacuum visits every page that might contain unfrozen XID or multixact state, skipping pages
+  already marked all-frozen. Current PostgreSQL can also eagerly freeze selected all-visible pages
+  during normal vacuum to reduce later aggressive work.
+</p>
+
+<h3 id="multixact-wraparound">Multixact wraparound</h3>
+<p>
+  Multiple transactions can hold compatible row locks on one tuple. PostgreSQL may represent them
+  through a multixact ID stored in tuple state. Multixact IDs and member storage also have finite
+  ranges and separate freeze ages. Monitor <code>relminmxid</code> and <code>mxid_age()</code> for
+  workloads with heavy shared row locking or foreign-key checks.
+</p>
+
+<figure class="code">
+  <figcaption><b>Monitor database and relation XID age</b></figcaption>
+  <pre><code>SELECT
+  datname,
+  age(datfrozenxid) AS xid_age
+FROM pg_database
+ORDER BY xid_age DESC;
+
+SELECT
+  c.oid::regclass AS relation,
+  greatest(age(c.relfrozenxid), age(t.relfrozenxid)) AS xid_age,
+  mxid_age(c.relminmxid) AS mxid_age
+FROM pg_class AS c
+LEFT JOIN pg_class AS t ON t.oid = c.reltoastrelid
+WHERE c.relkind IN ('r', 'm')
+ORDER BY xid_age DESC
+LIMIT 30;</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Anti-wraparound vacuum is safety work, not optional background polish</strong>
+  <p>
+    Repeatedly canceling it, blocking it with old transactions or allowing every worker to become
+    occupied can move the cluster toward write refusal. PostgreSQL warns before the danger point and
+    eventually stops assigning XIDs to protect data. Treat rising age as a capacity incident.
+  </p>
+</div>
+
+<h2 id="vacuum-blockers"><span class="num">12.</span> What prevents vacuum from keeping up</h2>
+<p class="lead">
+  Slow cleanup is often a horizon, scheduling or capacity problem rather than a broken VACUUM
+  command.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Blocker</th>
+        <th>Effect</th>
+        <th>What to investigate</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Long or idle transaction</td>
+        <td>Old versions remain potentially visible</td>
+        <td>Transaction age, application owner and timeout policy</td>
+      </tr>
+      <tr>
+        <td>Old prepared transaction</td>
+        <td>Retains transaction state indefinitely</td>
+        <td>Whether it should be committed or rolled back</td>
+      </tr>
+      <tr>
+        <td>Stale replication slot</td>
+        <td>Can retain catalog rows or WAL</td>
+        <td><code>xmin</code>, <code>catalog_xmin</code>, restart LSN and consumer health</td>
+      </tr>
+      <tr>
+        <td>Worker starvation</td>
+        <td>Eligible tables wait while all workers are busy</td>
+        <td>Worker count, large tables, per-database queue and duration</td>
+      </tr>
+      <tr>
+        <td>Over-throttling</td>
+        <td>Vacuum produces less cleanup than writes produce debt</td>
+        <td>Cost delay, cost limit, I/O headroom and completion rate</td>
+      </tr>
+      <tr>
+        <td>Lock conflict</td>
+        <td>Maintenance waits or skips relation work</td>
+        <td>DDL, queued strong locks and vacuum progress wait events</td>
+      </tr>
+      <tr>
+        <td>Threshold too high</td>
+        <td>Dead versions accumulate before table becomes eligible</td>
+        <td>Change rate, table size and per-table scale factor</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Hot standby queries can conflict with replay of vacuum cleanup records. PostgreSQL must choose
+  between delaying recovery and canceling conflicting standby queries according to standby delay
+  settings. Enabling <code>hot_standby_feedback</code> can reduce query cancellations by telling the
+  primary about standby horizons, but it can increase primary bloat. That is a deliberate
+  availability versus cleanup tradeoff.
+</p>
+
+<div class="note">
+  <strong>Replication slots can retain two different resources</strong>
+  <p>
+    An old <code>restart_lsn</code> can retain WAL files. Old <code>xmin</code> or
+    <code>catalog_xmin</code> can retain row versions or catalog tuples. Measure both storage and
+    vacuum consequences before deciding how to repair or remove a slot.
+  </p>
+</div>
+
+<h2 id="vacuum-monitoring"><span class="num">13.</span> Monitoring vacuum and diagnosing bloat</h2>
+<p class="lead">
+  Diagnose in layers: workload and transaction horizons, maintenance history, active progress,
+  physical sizes, then deeper structural inspection.
+</p>
+
+<h3 id="table-statistics">Table statistics</h3>
+<figure class="code">
+  <figcaption><b>Rank user tables by cleanup pressure</b></figcaption>
+  <pre><code>SELECT
+  relid::regclass AS relation,
+  n_live_tup,
+  n_dead_tup,
+  n_mod_since_analyze,
+  n_ins_since_vacuum,
+  last_vacuum,
+  last_autovacuum,
+  vacuum_count,
+  autovacuum_count,
+  pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;</code></pre>
+</figure>
+
+<p>
+  A growing <code>n_dead_tup</code>, old <code>last_autovacuum</code>, large
+  <code>n_ins_since_vacuum</code> and rising physical size are signals, not standalone verdicts.
+  Compare them with transaction ages, per-table options and write rate.
+</p>
+
+<h3 id="vacuum-progress">Active progress</h3>
+<figure class="code">
+  <figcaption><b>See plain vacuum phases and work completed</b></figcaption>
+  <pre><code>SELECT
+  p.pid,
+  p.relid::regclass AS relation,
+  p.phase,
+  p.heap_blks_total,
+  p.heap_blks_scanned,
+  p.heap_blks_vacuumed,
+  p.index_vacuum_count,
+  p.num_dead_item_ids,
+  p.max_dead_item_ids
+FROM pg_stat_progress_vacuum AS p;</code></pre>
+</figure>
+
+<p>
+  Heap scanning, index vacuuming, index cleanup and heap cleanup are distinct phases. A phase that
+  appears stationary may be doing work whose counter is not the one being watched. Join the PID to
+  <code>pg_stat_activity</code> for wait events and query context.
+</p>
+
+<h3 id="effective-settings">Effective configuration</h3>
+<figure class="code">
+  <figcaption><b>Read global and relation-level maintenance settings</b></figcaption>
+  <pre><code>SELECT name, setting, unit, source
+FROM pg_settings
+WHERE name LIKE 'autovacuum%'
+   OR name LIKE 'vacuum%'
+ORDER BY name;
+
+SELECT
+  n.nspname,
+  c.relname,
+  c.reloptions
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.reloptions IS NOT NULL
+ORDER BY 1, 2;</code></pre>
+</figure>
+
+<h3 id="slot-horizons">Replication slots</h3>
+<figure class="code">
+  <figcaption><b>Find inactive or retaining slots</b></figcaption>
+  <pre><code>SELECT
+  slot_name,
+  slot_type,
+  active,
+  xmin,
+  catalog_xmin,
+  restart_lsn,
+  confirmed_flush_lsn,
+  wal_status,
+  safe_wal_size
+FROM pg_replication_slots
+ORDER BY active, slot_name;</code></pre>
+</figure>
+
+<h3 id="diagnostic-order">A safe diagnostic order</h3>
+<ol class="clean">
+  <li>Confirm the symptom: disk growth, slow scans, replica lag, old XID age or write latency.</li>
+  <li>Measure relation, index, TOAST and WAL sizes separately.</li>
+  <li>Find long transactions, prepared transactions and replication horizons.</li>
+  <li>Check whether autovacuum ran, is running, is waiting, or never became eligible.</li>
+  <li>Inspect effective global and per-table configuration.</li>
+  <li>Compare cleanup rate with update, delete and insert rate over time.</li>
+  <li>Use deeper bloat inspection only when deciding between tuning, reindexing or rewriting.</li>
+  <li>Plan availability, disk, WAL and replica consequences before any rewrite.</li>
+</ol>
+
+<h2 id="vacuum-performance">
+  <span class="num">14.</span> Vacuum performance and tuning tradeoffs
+</h2>
+<p class="lead">
+  Vacuum must finish soon enough to control debt without monopolizing the I/O system. The correct
+  target is sustainable completion, not minimum instantaneous resource usage.
+</p>
+
+<h3 id="cost-delay">Cost-based delay</h3>
+<p>
+  Vacuum assigns estimated costs to cached-page hits, reads and dirtying. When accumulated cost
+  reaches a limit, a cost-enabled vacuum sleeps briefly. Higher cost limit or lower delay makes work
+  more aggressive. Autovacuum has its own cost settings and can distribute a global cost allowance
+  among active workers.
+</p>
+
+<h3 id="maintenance-memory">Memory and repeated index work</h3>
+<p>
+  Vacuum collects dead tuple identifiers before cleaning indexes. Insufficient maintenance memory
+  can require repeated index vacuum cycles. Raising the relevant maintenance memory can help a large
+  cleanup, but multiply memory assumptions by concurrent maintenance workers and operations.
+  Anti-wraparound failsafe behavior may skip index cleanup and cost delays to prioritize safety.
+</p>
+
+<h3 id="vacuum-io">I/O behavior</h3>
+<ul class="clean">
+  <li>
+    A vacuum reads heap pages, may dirty them, scans indexes and writes WAL for necessary changes.
+  </li>
+  <li>A buffer access strategy limits pollution of shared buffers during large scans.</li>
+  <li>Parallel vacuum can parallelize eligible index phases, not every heap phase.</li>
+  <li>
+    Tail truncation may briefly need <code>ACCESS EXCLUSIVE</code>; disable it per operation if that
+    lock is undesirable.
+  </li>
+  <li>
+    Running smaller vacuums earlier is often cheaper than processing a large accumulated backlog.
+  </li>
+</ul>
+
+<div class="key">
+  <strong>Tune hot tables individually</strong>
+  <p>
+    Cluster-wide defaults must serve many workloads. A billion-row append table, a ten-thousand-row
+    queue table and a mostly static lookup table have different maintenance needs. Per-table
+    thresholds, fillfactor and cost controls are normal PostgreSQL operational tools.
+  </p>
+</div>
+
+<h2 id="wal-model"><span class="num">15.</span> WAL fundamentals and the write-ahead rule</h2>
+<p class="lead">
+  Before PostgreSQL allows a changed data page to reach durable storage, the WAL needed to explain
+  that change must already be durable up to the page's WAL position.
+</p>
+
+<h3 id="why-wal">Why WAL exists</h3>
+<p>
+  Without WAL, committing a transaction safely could require flushing every changed table and index
+  page. These pages are scattered and expensive to synchronize. WAL turns the durability path into
+  mostly sequential append and flush work. Data pages can be written later in batches.
+</p>
+
+<ol class="clean">
+  <li>A backend changes a copy of a page in shared buffers and creates WAL records.</li>
+  <li>The records receive ordered WAL positions and enter shared WAL buffers.</li>
+  <li>
+    At durable commit, the commit record and preceding required WAL are flushed to stable storage.
+  </li>
+  <li>
+    The client can receive success even though corresponding heap and index pages remain dirty in
+    memory.
+  </li>
+  <li>Background writing and checkpoints eventually flush dirty data pages.</li>
+  <li>After a crash, startup replays WAL records not already reflected in data files.</li>
+</ol>
+
+<div class="warn">
+  <strong>WAL is not the same as an audit log</strong>
+  <p>
+    Physical WAL is an internal recovery stream whose retention, format and contents are controlled
+    by PostgreSQL. It is not a stable user-facing history of SQL statements. Logical decoding can
+    derive change streams at <code>wal_level = logical</code>, but that requires explicit slot and
+    consumer design.
+  </p>
+</div>
+
+<h2 id="wal-records"><span class="num">16.</span> WAL records, LSNs, segments and buffers</h2>
+<p class="lead">
+  WAL is an ordered byte stream split into files. An LSN identifies a byte position in that stream.
+</p>
+
+<h3 id="lsn">Log sequence numbers</h3>
+<p>
+  The <code>pg_lsn</code> type is internally a 64-bit WAL position and is printed as two hexadecimal
+  numbers such as <code>16/B374D848</code>. LSNs can be compared, and subtraction gives the number
+  of bytes between positions. They measure WAL generation, archiving, replication receive, flush and
+  replay progress.
+</p>
+
+<figure class="code">
+  <figcaption><b>Measure WAL produced by a controlled operation</b></figcaption>
+  <pre><code>SELECT pg_current_wal_lsn() AS before_lsn;
+
+-- Run the operation in a separate controlled step.
+
+SELECT
+  pg_current_wal_lsn() AS after_lsn,
+  pg_size_pretty(
+    pg_wal_lsn_diff(pg_current_wal_lsn(), '0/00000000'::pg_lsn)
+  ) AS position_from_zero;
+
+-- In practice, save before_lsn and subtract it from after_lsn:
+SELECT pg_size_pretty('0/3000000'::pg_lsn - '0/1000000'::pg_lsn);</code></pre>
+</figure>
+
+<h3 id="segments">Segment files</h3>
+<p>
+  WAL files live under <code>pg_wal</code>. The common segment size is 16 MiB, selected at
+  <code>initdb</code>, and segments contain WAL pages and variable records. Segment filenames also
+  encode a timeline, which distinguishes histories after recovery or promotion.
+</p>
+
+<h3 id="wal-record-content">What a WAL record represents</h3>
+<p>
+  Record contents depend on the resource manager and operation: heap changes, index changes,
+  commits, checkpoints, relation operations and many other internal actions. A record has checksums
+  and references enough data for its recovery routine. WAL records describe physical changes, but
+  some also carry logical-decoding information when configured.
+</p>
+
+<h3 id="wal-buffers">WAL buffers and writer</h3>
+<p>
+  <code>wal_buffers</code> is shared memory for WAL not yet written out. Its default automatic
+  sizing is normally reasonable. Backends insert records; a WAL writer and commit-time flush paths
+  move data toward storage. If buffers fill under heavy generation, foreground backends may have to
+  write WAL while holding internal page locks, increasing latency.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Action</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Insert into WAL buffers</td>
+        <td>Copy a record into shared memory and assign stream order</td>
+      </tr>
+      <tr>
+        <td>Write WAL</td>
+        <td>Move bytes to operating-system cache</td>
+      </tr>
+      <tr>
+        <td>Flush or sync WAL</td>
+        <td>Request persistence through the configured storage synchronization method</td>
+      </tr>
+      <tr>
+        <td>Replay WAL</td>
+        <td>Apply records to data pages during recovery or standby operation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="durability"><span class="num">17.</span> Commit durability settings</h2>
+<p class="lead">
+  Durability depends on PostgreSQL settings and an I/O stack that truthfully honors flush requests.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Safe interpretation</th>
+        <th>Main tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>fsync = on</code></td>
+        <td>PostgreSQL requests durable writes needed for crash consistency</td>
+        <td>Required synchronization latency</td>
+      </tr>
+      <tr>
+        <td><code>synchronous_commit = on</code></td>
+        <td>Commit waits for local WAL flush, plus configured synchronous standby behavior</td>
+        <td>Commit latency for stronger acknowledgment</td>
+      </tr>
+      <tr>
+        <td><code>synchronous_commit = off</code></td>
+        <td>
+          Recent acknowledged transactions may be lost after crash, but database consistency remains
+        </td>
+        <td>Lower latency with bounded recent transaction loss</td>
+      </tr>
+      <tr>
+        <td><code>full_page_writes = on</code></td>
+        <td>Protects recovery from partial page writes using full-page images</td>
+        <td>More WAL, especially after checkpoints</td>
+      </tr>
+      <tr>
+        <td><code>wal_sync_method</code></td>
+        <td>Selects the platform-specific method used to synchronize WAL</td>
+        <td>Reliability and performance depend on platform and storage</td>
+      </tr>
+      <tr>
+        <td><code>wal_level</code></td>
+        <td>
+          <code>replica</code> supports archiving and physical replication;
+          <code>logical</code> adds logical information
+        </td>
+        <td>Higher levels can produce more WAL</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Turning off <code>fsync</code> can leave the cluster unrecoverably corrupt after an operating
+  system or power failure. It is suitable only when the whole cluster can be recreated. In contrast,
+  asynchronous commit does not violate database consistency: some recent transactions reported as
+  committed can disappear as though they had aborted.
+</p>
+
+<h3 id="group-commit">Group commit</h3>
+<p>
+  Several concurrent transactions can share one expensive WAL synchronization. This is group commit.
+  It improves throughput because one flush establishes durability for multiple commit records.
+  <code>commit_delay</code> can intentionally wait for more group members, but unnecessary delay
+  increases latency and must be benchmarked.
+</p>
+
+<div class="warn">
+  <strong>Fast storage must still be truthful storage</strong>
+  <p>
+    Volatile drive or controller caches that acknowledge flushes incorrectly defeat database
+    guarantees. Validate the entire path, including virtualization, RAID controllers, filesystems,
+    device caches and power protection. PostgreSQL settings cannot repair dishonest hardware.
+  </p>
+</div>
+
+<h2 id="checkpoints">
+  <span class="num">18.</span> Checkpoints, full-page images and crash recovery
+</h2>
+<p class="lead">
+  A checkpoint establishes that all data-file changes before its redo point are safely represented
+  on disk, bounding where recovery must begin.
+</p>
+
+<h3 id="checkpoint-sequence">Checkpoint sequence</h3>
+<ol class="clean">
+  <li>The checkpointer begins writing dirty buffers over a controlled interval.</li>
+  <li>Required WAL was already written ahead of corresponding data pages.</li>
+  <li>At completion, PostgreSQL records checkpoint information and the recovery redo position.</li>
+  <li>
+    Old WAL no longer needed for crash recovery may be recycled, unless archiving, slots, standby
+    needs or other retention rules require it.
+  </li>
+</ol>
+
+<p>
+  Checkpoints start after <code>checkpoint_timeout</code> or when WAL volume approaches
+  <code>max_wal_size</code>, whichever comes first. <code>max_wal_size</code> is a soft limit, not a
+  disk-usage guarantee. Archiver failure or a lagging replication slot can make
+  <code>pg_wal</code> grow far beyond it.
+</p>
+
+<h3 id="full-page-images">Why full-page images exist</h3>
+<p>
+  PostgreSQL commonly writes 8 KiB pages while hardware sectors can be smaller. A power failure can
+  leave a torn page containing part old and part new content. With <code>full_page_writes</code>
+  enabled, the first modification of a page after each checkpoint logs a complete page image.
+  Recovery can restore the whole image before applying later records.
+</p>
+
+<p>
+  More frequent checkpoints mean more "first changes after checkpoint," so they often increase
+  full-page-image WAL. <code>wal_compression</code> can compress such images at a CPU cost. This is
+  why checkpoint tuning affects both dirty-page I/O and WAL volume.
+</p>
+
+<h3 id="crash-recovery">Crash recovery</h3>
+<ol class="clean">
+  <li>Startup reads control and checkpoint information.</li>
+  <li>It begins redo from the checkpoint's required WAL position.</li>
+  <li>
+    For each record, recovery checks whether the target page already contains that change using page
+    LSN ordering.
+  </li>
+  <li>Missing changes are replayed; full-page images repair pages when required.</li>
+  <li>
+    Uncommitted transactions have no durable commit record and their versions remain invisible,
+    later becoming cleanup candidates.
+  </li>
+  <li>When a consistent end is reached, normal service can resume.</li>
+</ol>
+
+<div class="key">
+  <strong>PostgreSQL recovery is primarily REDO, not undoing data files at crash time</strong>
+  <p>
+    MVCC transaction metadata makes uncommitted tuple effects invisible. WAL replays changes needed
+    for physical consistency. Later vacuum removes aborted or obsolete versions. This differs from
+    systems whose recovery design relies heavily on an undo log.
+  </p>
+</div>
+
+<h2 id="archive-replication">
+  <span class="num">19.</span> WAL archiving, PITR and replication connection
+</h2>
+<p class="lead">
+  The same ordered WAL stream used for crash recovery can be retained for point-in-time recovery and
+  transported to physical standbys.
+</p>
+
+<h3 id="pitr">Base backup plus WAL equals PITR</h3>
+<p>
+  A physical base backup provides a starting copy of cluster files. A complete, continuous sequence
+  of archived WAL can replay that copy forward to a target time, transaction, name or LSN. A backup
+  without all required WAL is not a valid PITR chain. Archive commands must be idempotent, must not
+  overwrite a different file with the same name and must return success only after safe storage.
+</p>
+
+<h3 id="physical-replication">Physical streaming replication</h3>
+<p>
+  A primary streams WAL to a standby, which writes, flushes and replays it. Different LSNs represent
+  different lag stages:
+</p>
+
+<ul class="clean">
+  <li>Sent: primary has transmitted WAL.</li>
+  <li>Written: standby operating system has accepted it.</li>
+  <li>Flushed: standby has made it durable.</li>
+  <li>Replayed: standby has applied it to data pages and queries can see its effect.</li>
+</ul>
+
+<p>
+  Synchronous replication can make commits wait for selected standby stages. Asynchronous
+  replication lets the primary commit without waiting, so failover can lose the latest transactions
+  that had not reached the promoted standby.
+</p>
+
+<h3 id="logical-connection">Logical decoding and replication</h3>
+<p>
+  At <code>wal_level = logical</code>, logical decoding reconstructs row-level change streams from
+  WAL. Logical slots retain required WAL and catalog horizons until consumers confirm progress. A
+  failed logical consumer can therefore cause both WAL growth and vacuum retention. Slot lifecycle
+  belongs in monitoring and disaster-recovery procedures.
+</p>
+
+<figure class="code">
+  <figcaption><b>Measure physical replication lag by WAL position</b></figcaption>
+  <pre><code>SELECT
+  application_name,
+  state,
+  sync_state,
+  sent_lsn,
+  write_lsn,
+  flush_lsn,
+  replay_lsn,
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn))
+    AS replay_byte_lag
+FROM pg_stat_replication;</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Byte lag and time lag answer different questions</strong>
+  <p>
+    A large byte gap can replay quickly on a fast standby, while a small byte gap can be old during
+    an idle period. Monitor positions, timestamps, receive/replay state, resource saturation and
+    business recovery objectives together.
+  </p>
+</div>
+
+<h2 id="wal-monitoring"><span class="num">20.</span> Monitoring and tuning WAL</h2>
+<p class="lead">
+  WAL incidents usually appear as commit latency, excessive generation, checkpoint pressure, archive
+  backlog, slot retention, replica lag or disk exhaustion.
+</p>
+
+<h3 id="wal-stat">WAL generation</h3>
+<figure class="code">
+  <figcaption><b>Inspect cluster WAL statistics</b></figcaption>
+  <pre><code>SELECT
+  wal_records,
+  wal_fpi,
+  pg_size_pretty(wal_bytes) AS wal_bytes,
+  wal_buffers_full,
+  stats_reset
+FROM pg_stat_wal;</code></pre>
+</figure>
+
+<p>
+  High <code>wal_fpi</code> relative to workload can point toward frequent checkpoints or a workload
+  touching many distinct pages after each checkpoint. Rising <code>wal_buffers_full</code> suggests
+  foreground insertion is filling WAL buffers; verify write rate and latency before changing
+  <code>wal_buffers</code>.
+</p>
+
+<h3 id="checkpoint-stat">Checkpoint pressure</h3>
+<figure class="code">
+  <figcaption><b>Inspect checkpoint and restartpoint behavior</b></figcaption>
+  <pre><code>SELECT *
+FROM pg_stat_checkpointer;
+
+SELECT
+  backend_type,
+  object,
+  context,
+  writes,
+  fsyncs,
+  write_time,
+  fsync_time
+FROM pg_stat_io
+WHERE object = 'wal';</code></pre>
+</figure>
+
+<p>
+  Compare requested checkpoints with timed checkpoints, write and sync time, WAL generation and
+  latency. Frequent requested checkpoints commonly indicate that <code>max_wal_size</code> is too
+  small for the workload or that a bulk operation is producing an expected burst.
+</p>
+
+<h3 id="archive-monitoring">Archive health</h3>
+<figure class="code">
+  <figcaption><b>Detect archiver failure before pg_wal fills</b></figcaption>
+  <pre><code>SELECT
+  archived_count,
+  last_archived_wal,
+  last_archived_time,
+  failed_count,
+  last_failed_wal,
+  last_failed_time,
+  stats_reset
+FROM pg_stat_archiver;</code></pre>
+</figure>
+
+<h3 id="wal-tuning-questions">Questions before tuning</h3>
+<ul class="clean">
+  <li>
+    Is generation caused by useful DML, full-page images, rewrites, vacuum or index maintenance?
+  </li>
+  <li>Are checkpoints time-driven or WAL-volume-driven?</li>
+  <li>Is commit time spent writing, flushing, waiting for synchronous standbys or elsewhere?</li>
+  <li>Are archived segments completing at least as fast as they are generated?</li>
+  <li>Which slot, standby, backup or summary requirement owns the oldest retained WAL?</li>
+  <li>
+    Does available disk cover a peak plus failure-response time rather than only average volume?
+  </li>
+</ul>
+
+<h2 id="combined-performance">
+  <span class="num">21.</span> How MVCC maintenance and WAL amplify each other
+</h2>
+<p class="lead">
+  Tuple-version debt and WAL pressure often form one feedback loop, so treating them as unrelated
+  incidents misses the root cause.
+</p>
+
+<ol class="clean">
+  <li>Non-HOT updates write a new heap tuple and new index entries.</li>
+  <li>Those physical changes generate WAL and dirty more pages.</li>
+  <li>Old versions and index entries increase relation size until cleanup.</li>
+  <li>Larger relations make scans, vacuum and cache use more expensive.</li>
+  <li>Cleanup and later reindex or rewrite operations generate their own I/O and WAL.</li>
+  <li>Extra WAL can increase checkpoint frequency, archive work and replica lag.</li>
+  <li>Replica feedback or slots may retain cleanup horizons, feeding bloat again.</li>
+</ol>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Design choice</th>
+        <th>Heap and vacuum effect</th>
+        <th>WAL and replication effect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Short transactions</td>
+        <td>Old versions become removable sooner</td>
+        <td>Less retained cleanup debt; no direct WAL reduction by itself</td>
+      </tr>
+      <tr>
+        <td>HOT-friendly schema and fillfactor</td>
+        <td>Less index churn, easier pruning</td>
+        <td>Often less index-related WAL</td>
+      </tr>
+      <tr>
+        <td>Earlier smaller vacuums</td>
+        <td>Controls dead-tuple backlog and maps</td>
+        <td>Spreads maintenance WAL and I/O over time</td>
+      </tr>
+      <tr>
+        <td>Frequent checkpoints</td>
+        <td>Flushes dirty pages more often</td>
+        <td>More full-page images, potentially more WAL</td>
+      </tr>
+      <tr>
+        <td>Table rewrite</td>
+        <td>Compacts heap and rebuilds indexes</td>
+        <td>Can generate large WAL and replica catch-up work</td>
+      </tr>
+      <tr>
+        <td>Stale logical slot</td>
+        <td>Can retain catalog cleanup horizon</td>
+        <td>Retains WAL until consumer advances or slot is removed</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="playbooks"><span class="num">22.</span> Maintenance playbooks</h2>
+
+<h3 id="playbook-hot-table">Hot update-heavy table is growing</h3>
+<ol class="clean">
+  <li>Graph heap, index, dead-tuple and write-rate trends.</li>
+  <li>Find old transactions, prepared transactions, slots and standby feedback horizons.</li>
+  <li>Check HOT ratio and which indexed columns change most often.</li>
+  <li>Inspect current autovacuum threshold, completion interval and active worker pressure.</li>
+  <li>Lower per-table scale factor or threshold so vacuum starts earlier.</li>
+  <li>Increase table-specific vacuum capacity only within measured I/O headroom.</li>
+  <li>Consider fillfactor for future same-page updates after validating storage cost.</li>
+  <li>After controlling the cause, decide whether existing excess justifies reindex or rewrite.</li>
+</ol>
+
+<h3 id="playbook-bulk-delete">One-time bulk delete</h3>
+<ol class="clean">
+  <li>
+    If removing every row, decide whether <code>TRUNCATE</code> semantics fit before using
+    <code>DELETE</code>.
+  </li>
+  <li>For selective deletion, batch if transaction size, locks, WAL or replica lag require it.</li>
+  <li>Allow plain vacuum to make space reusable and update maps.</li>
+  <li>If future inserts will reuse the space, avoid an unnecessary rewrite.</li>
+  <li>
+    If the table will remain much smaller, plan <code>VACUUM FULL</code>, <code>CLUSTER</code> or
+    another controlled rewrite.
+  </li>
+  <li>Budget temporary disk, strong locks, WAL generation and replica recovery.</li>
+</ol>
+
+<h3 id="playbook-wraparound">XID age alert</h3>
+<ol class="clean">
+  <li>Measure <code>datfrozenxid</code>, oldest relations, TOAST ages and multixact age.</li>
+  <li>Find and resolve old open or prepared transactions that block horizon progress.</li>
+  <li>Review old replication slot <code>xmin</code> and <code>catalog_xmin</code>.</li>
+  <li>Let anti-wraparound vacuum run; do not repeatedly cancel the safety worker.</li>
+  <li>Give it I/O and worker capacity, then confirm relation ages actually advance.</li>
+  <li>After safety is restored, correct ordinary thresholds and alert lead time.</li>
+</ol>
+
+<h3 id="playbook-pgwal">pg_wal disk is growing</h3>
+<ol class="clean">
+  <li>Confirm filesystem usage and time to exhaustion.</li>
+  <li>Check archiver failures and archive destination health.</li>
+  <li>Inspect physical and logical slot retention, standby state and <code>restart_lsn</code>.</li>
+  <li>Compare WAL generation rate with normal baseline and recent bulk operations.</li>
+  <li>Do not delete files manually from <code>pg_wal</code>.</li>
+  <li>
+    Repair the owner of retention, or deliberately remove an obsolete slot with rebuild consequences
+    understood.
+  </li>
+  <li>Add capacity only as response time, not as a substitute for fixing unbounded retention.</li>
+</ol>
+
+<h3 id="playbook-latency">Checkpoint or commit latency spikes</h3>
+<ol class="clean">
+  <li>Separate WAL write, WAL sync, checkpoint writeback and synchronous-standby waits.</li>
+  <li>Check requested checkpoint frequency and full-page-image rate.</li>
+  <li>Verify storage latency and truthful flush behavior.</li>
+  <li>
+    Increase <code>max_wal_size</code> or checkpoint interval only with recovery time and disk
+    headroom.
+  </li>
+  <li>Keep <code>checkpoint_completion_target</code> spreading writes across the interval.</li>
+  <li>Use asynchronous commit only for transactions whose loss policy explicitly allows it.</li>
+</ol>
+
+<h2 id="edge-cases"><span class="num">23.</span> Edge cases and common mistakes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Safer approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Disable autovacuum because it uses I/O</td>
+        <td>Cleanup debt and wraparound risk continue growing</td>
+        <td>Tune scheduling, per-table thresholds, workers and cost</td>
+      </tr>
+      <tr>
+        <td>Run VACUUM FULL as routine maintenance</td>
+        <td>Strong lock, rewrite time, disk and WAL cost</td>
+        <td>Run timely plain vacuum; reserve rewrites for measured shrink needs</td>
+      </tr>
+      <tr>
+        <td>Expect plain vacuum to shrink every file</td>
+        <td>Its primary result is internal reuse</td>
+        <td>Decide whether reuse or operating-system disk return is required</td>
+      </tr>
+      <tr>
+        <td>Use <code>ctid</code> as a permanent identifier</td>
+        <td>Updates and rewrites change physical locations</td>
+        <td>Use a primary or stable unique key</td>
+      </tr>
+      <tr>
+        <td>Interpret nonzero <code>xmax</code> as deleted</td>
+        <td>It can represent locks, aborted work or uncommitted deletion</td>
+        <td>Let PostgreSQL apply visibility rules</td>
+      </tr>
+      <tr>
+        <td>Cancel anti-wraparound vacuum repeatedly</td>
+        <td>Safety margin decreases toward write refusal</td>
+        <td>Remove blockers and let safety maintenance finish</td>
+      </tr>
+      <tr>
+        <td>Tune only cluster-wide scale factors</td>
+        <td>Tables have very different sizes and change rates</td>
+        <td>Use targeted relation storage parameters</td>
+      </tr>
+      <tr>
+        <td>Add fillfactor without measuring HOT</td>
+        <td>Wastes space if workload does not benefit</td>
+        <td>Measure update pattern and indexed-column changes first</td>
+      </tr>
+      <tr>
+        <td>Delete files from <code>pg_wal</code></td>
+        <td>Can make the cluster unrecoverable</td>
+        <td>Fix archiving, slots, replication or generation through PostgreSQL</td>
+      </tr>
+      <tr>
+        <td>Set <code>fsync = off</code> for normal production speed</td>
+        <td>Crash can cause unrecoverable corruption</td>
+        <td>Use reliable storage and consider scoped async commit for disposable work</td>
+      </tr>
+      <tr>
+        <td>Assume max_wal_size is a hard cap</td>
+        <td>Retention and heavy load can exceed it</td>
+        <td>Monitor actual disk and every retention owner</td>
+      </tr>
+      <tr>
+        <td>Use standby feedback without bloat monitoring</td>
+        <td>Primary cleanup can be held back by standby queries</td>
+        <td>Set query policies and observe primary horizons</td>
+      </tr>
+      <tr>
+        <td>Run a huge rewrite without replica planning</td>
+        <td>WAL and replay work can cause lag or disk pressure</td>
+        <td>Capacity-plan primary, archive and every standby</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="more-edge-cases">Details that often surprise people</h3>
+<ul class="clean">
+  <li>A rolled-back update can still leave physical work for later cleanup.</li>
+  <li>A read-only old snapshot can cause write-heavy tables to retain versions.</li>
+  <li>Vacuuming a GIN index can also process its pending list.</li>
+  <li>Plain vacuum can briefly seek a strong lock only for tail truncation.</li>
+  <li>
+    A table can be large and healthy because its internal free space is being reused steadily.
+  </li>
+  <li>Freezing is needed for static data even when there are no dead tuples.</li>
+  <li>Index-only scans depend on heap visibility-map state, not only covering index columns.</li>
+  <li>
+    Temporary tables require session-managed analyze and vacuum behavior because autovacuum cannot
+    access them.
+  </li>
+  <li>
+    Unlogged tables reduce normal WAL for their data but are truncated after crash recovery and
+    cannot serve as durable replicated data.
+  </li>
+  <li>
+    Logical and physical replication consume the same WAL foundation but expose different semantics.
+  </li>
+</ul>
+
+<h2 id="practice"><span class="num">24.</span> Practice problems</h2>
+
+<h3 id="practice-1">1. Explain a row update physically</h3>
+<p>
+  Session A updates account 42 while session B holds an older Repeatable Read snapshot. What happens
+  to the heap versions, visibility and cleanup?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    PostgreSQL creates a new tuple version for A and marks the old version superseded. After A
+    commits, new snapshots can see the replacement, but B can continue seeing the old version under
+    its transaction snapshot. Vacuum cannot remove that old version until B and every other relevant
+    old horizon finish. If eligible, a same-page non-indexed update can be HOT and avoid new
+    ordinary index entries.
+  </p>
+</details>
+
+<h3 id="practice-2">2. Calculate a vacuum trigger</h3>
+<p>
+  A table has an estimated 5,000,000 tuples. Its threshold is 1,000, scale factor is 0.01 and
+  maximum threshold is 100,000,000. Approximately how many updates or deletes trigger eligibility?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    The proportional result is <code>1,000 + 0.01 * 5,000,000 = 51,000</code>. The maximum cap is
+    larger, so eligibility begins at roughly 51,000 qualifying changes. Scheduling and completion
+    are later than eligibility.
+  </p>
+</details>
+
+<h3 id="practice-3">3. Choose VACUUM or VACUUM FULL</h3>
+<p>
+  A queue table deleted 70 percent of rows but will refill to its old size tomorrow. Disk is not
+  currently constrained. Which maintenance is appropriate?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    Plain vacuum is normally right. It makes dead space reusable for tomorrow's inserts without an
+    offline rewrite. <code>VACUUM FULL</code> would pay a strong lock, temporary disk and WAL cost
+    to return space that the table soon needs again.
+  </p>
+</details>
+
+<h3 id="practice-4">4. Diagnose ineffective vacuum</h3>
+<p>
+  Autovacuum runs every few minutes but <code>n_dead_tup</code> and heap size keep rising. Name the
+  first checks.
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    Check long and idle transactions, prepared transactions, replication slot horizons and standby
+    feedback. Then inspect vacuum verbose logs or progress, table change rate, effective relation
+    thresholds, index cleanup, worker pressure and cost throttling. Running vacuum does not mean old
+    versions are removable or that cleanup throughput exceeds write throughput.
+  </p>
+</details>
+
+<h3 id="practice-5">5. Explain commit before data-page flush</h3>
+<p>
+  How can PostgreSQL safely acknowledge a commit while changed heap pages remain only in memory?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    The WAL records and commit record are flushed first. The write-ahead rule prevents dirty data
+    pages from becoming durable ahead of required WAL. After a crash, recovery replays the durable
+    records to reproduce changes missing from data files.
+  </p>
+</details>
+
+<h3 id="practice-6">6. Diagnose WAL growth beyond max_wal_size</h3>
+<p>
+  <code>pg_wal</code> is much larger than <code>max_wal_size</code>. Is PostgreSQL violating its
+  configuration?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    No. <code>max_wal_size</code> is a soft checkpoint target, not a hard cap. Failed archiving,
+    replication slots, <code>wal_keep_size</code>, backup or standby requirements and high WAL
+    production can retain more. Inspect the archiver, slots, standby state, generation rate and
+    filesystem headroom. Never delete WAL files manually.
+  </p>
+</details>
+
+<h3 id="practice-7">7. Reduce update amplification</h3>
+<p>
+  A table updates <code>last_seen_at</code> constantly, and that column is in an index used only
+  once per month. What should be evaluated?
+</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    Measure the index's actual query value and the table's HOT ratio. Updating an indexed column
+    prevents HOT for those updates and creates index and WAL work. If the monthly query can use a
+    safer alternative, removing or redesigning the index may help. Also evaluate fillfactor for
+    same-page space. Preserve any constraint or important read requirement.
+  </p>
+</details>
+
+<h3 id="practice-8">8. Plan PITR</h3>
+<p>Why is copying the data directory nightly not enough for recovery to 14:37?</p>
+<details>
+  <summary>Solution</summary>
+  <p>
+    PITR needs a valid physical base backup plus an uninterrupted archive of every required WAL
+    segment through the target. The restore process starts from the base backup and replays WAL to
+    the chosen time or LSN. The backup and archive chain must be tested, retained and protected.
+  </p>
+</details>
+
+<h2 id="interview"><span class="num">25.</span> Interview Q&amp;A</h2>
+
+<h3 id="qa-1">Why does PostgreSQL UPDATE create a new tuple?</h3>
+<p>
+  MVCC must let old snapshots see the previous committed state while newer snapshots see the update.
+  A new tuple version preserves both states without overwriting data that a concurrent reader may
+  need.
+</p>
+
+<h3 id="qa-2">When is a tuple dead?</h3>
+<p>
+  A superseded or deleted version is dead when no transaction or retained horizon PostgreSQL must
+  honor can still see it. Before that it can be recently dead but not removable.
+</p>
+
+<h3 id="qa-3">What is HOT?</h3>
+<p>
+  Heap-only tuple update is an optimization used when indexed columns do not need new ordinary index
+  entries and the new version fits on the same page. It creates a page-local version chain, reduces
+  index churn and enables earlier pruning of intermediate versions.
+</p>
+
+<h3 id="qa-4">What does fillfactor do?</h3>
+<p>
+  It leaves a percentage of page space unused during filling so future updates may fit on the same
+  page. Lower fillfactor can improve HOT rates for update-heavy tables but makes the initial table
+  larger.
+</p>
+
+<h3 id="qa-5">What is the difference between VACUUM and VACUUM FULL?</h3>
+<p>
+  Plain vacuum performs online cleanup and makes internal space reusable, usually without shrinking
+  the file. <code>VACUUM FULL</code> rewrites a compact table and rebuilds indexes, returns more
+  disk to the operating system and requires an <code>ACCESS EXCLUSIVE</code> lock and extra disk.
+</p>
+
+<h3 id="qa-6">Does VACUUM update planner statistics?</h3>
+<p>
+  Only when used with <code>ANALYZE</code>. Vacuum maintains cleanup, maps and freezing metadata.
+  Analyze samples data distributions used for query planning.
+</p>
+
+<h3 id="qa-7">What triggers autovacuum?</h3>
+<p>
+  Update/delete changes use a fixed threshold plus a scale factor times estimated table tuples,
+  capped by a current maximum threshold. Inserts have a separate threshold and scale factor based on
+  unfrozen pages. Anti-wraparound age can force vacuum independently. Analyze has its own change
+  threshold and scale factor.
+</p>
+
+<h3 id="qa-8">Why can autovacuum run but remove little?</h3>
+<p>
+  Old transactions, prepared transactions or replication horizons can keep versions visible. Index
+  cleanup may be skipped, locks can interfere, and concurrent writes can create new debt while
+  vacuum runs.
+</p>
+
+<h3 id="qa-9">What are the FSM and VM?</h3>
+<p>
+  The free space map records approximate per-page room for new tuples. The visibility map records
+  conservative all-visible and all-frozen bits per heap page, supporting vacuum skipping, index-only
+  scans and freeze skipping.
+</p>
+
+<h3 id="qa-10">Why is transaction ID wraparound dangerous?</h3>
+<p>
+  Normal 32-bit XIDs are compared in a circular range. Without freezing, a very old inserting XID
+  could eventually appear to be in the future. Vacuum freezes old tuple state, and forced
+  anti-wraparound vacuum prevents reaching the danger point.
+</p>
+
+<h3 id="qa-11">What is WAL's write-ahead rule?</h3>
+<p>
+  WAL describing a data-page change must reach durable storage before that changed page can be
+  durably written. A transaction's commit WAL must be durable before a synchronous durable commit is
+  acknowledged.
+</p>
+
+<h3 id="qa-12">What is an LSN?</h3>
+<p>
+  A log sequence number is a byte position in the WAL stream, represented by <code>pg_lsn</code>.
+  Comparing and subtracting LSNs measures WAL progress and byte distance for generation, recovery
+  and replication.
+</p>
+
+<h3 id="qa-13">What does a checkpoint do?</h3>
+<p>
+  It flushes dirty data pages over time and records a recovery boundary so crash recovery can begin
+  from a known redo point. It also starts a new cycle in which the first change to each page
+  normally emits a full-page image.
+</p>
+
+<h3 id="qa-14">Why are full-page images needed?</h3>
+<p>
+  A crash can interrupt an 8 KiB page write and leave mixed old and new sectors. The first
+  post-checkpoint modification logs a full image so recovery can restore a valid whole page before
+  replaying later records.
+</p>
+
+<h3 id="qa-15">What is the difference between fsync off and synchronous_commit off?</h3>
+<p>
+  Turning off <code>fsync</code> can cause unrecoverable corruption after system failure.
+  Asynchronous commit keeps the database consistent but can lose recent transactions that were
+  acknowledged before WAL reached durable storage.
+</p>
+
+<h3 id="qa-16">How does WAL support replication?</h3>
+<p>
+  Physical standbys receive and replay the primary's WAL to reproduce its data-file changes. Logical
+  decoding reconstructs logical changes from WAL when the server and objects are configured for it.
+</p>
+
+<h3 id="qa-17">What causes table and index bloat?</h3>
+<p>
+  Common causes include high version churn, late vacuum, old cleanup horizons, non-HOT updates,
+  repeated page splits and one-time deletions whose space is not reused. Bloat is a measured
+  workload-relative condition, not simply a large file.
+</p>
+
+<h3 id="qa-18">How would you investigate bloat in production?</h3>
+<p>
+  Measure size and dead-tuple trends, inspect maintenance timestamps and progress, find old
+  transactions and slots, check HOT ratios and effective thresholds, then use a supported structural
+  inspection tool if a reindex or rewrite decision needs stronger evidence.
+</p>
+
+<h3 id="qa-19">Why can pg_wal exceed max_wal_size?</h3>
+<p>
+  It is a soft checkpoint target. Archive failure, replication slots, standby needs,
+  <code>wal_keep_size</code>, summarization and heavy production can retain additional segments.
+</p>
+
+<h3 id="qa-20">What is the operational goal for autovacuum?</h3>
+<p>
+  It should complete cleanup, map maintenance and freezing faster than the workload creates debt,
+  while staying within acceptable I/O and latency budgets. Timely smaller work is usually better
+  than rare emergency cleanup.
+</p>
+
+<h2 id="cheatsheet"><span class="num">26.</span> Concise cheat sheet</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need or symptom</th>
+        <th>First concept or tool</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Understand an update</td>
+        <td>New heap version, old version retained by snapshot rules</td>
+      </tr>
+      <tr>
+        <td>Reduce index work on updates</td>
+        <td>HOT eligibility, indexed columns and same-page free space</td>
+      </tr>
+      <tr>
+        <td>Reuse dead space</td>
+        <td>Plain <code>VACUUM</code></td>
+      </tr>
+      <tr>
+        <td>Return large internal space to the OS</td>
+        <td>Measured rewrite such as <code>VACUUM FULL</code>, with outage planning</td>
+      </tr>
+      <tr>
+        <td>Refresh planner distributions</td>
+        <td><code>ANALYZE</code></td>
+      </tr>
+      <tr>
+        <td>Large busy table vacuums too late</td>
+        <td>Lower per-table threshold or scale factor</td>
+      </tr>
+      <tr>
+        <td>Vacuum runs but cannot remove versions</td>
+        <td>Old transactions, prepared transactions, slots and standby feedback</td>
+      </tr>
+      <tr>
+        <td>Enable index-only scan heap skipping</td>
+        <td>All-visible visibility-map bits maintained by vacuum</td>
+      </tr>
+      <tr>
+        <td>Prevent XID wraparound</td>
+        <td>Freezing, relation age and anti-wraparound vacuum</td>
+      </tr>
+      <tr>
+        <td>Make commit durable</td>
+        <td>Flush WAL commit record with <code>fsync</code> and suitable commit mode</td>
+      </tr>
+      <tr>
+        <td>Measure WAL position gap</td>
+        <td>Subtract <code>pg_lsn</code> values</td>
+      </tr>
+      <tr>
+        <td>Repair after crash</td>
+        <td>Redo WAL from checkpoint recovery position</td>
+      </tr>
+      <tr>
+        <td>Protect against torn pages</td>
+        <td>Full-page images after checkpoints</td>
+      </tr>
+      <tr>
+        <td>Recover to a chosen time</td>
+        <td>Valid base backup plus continuous archived WAL</td>
+      </tr>
+      <tr>
+        <td>pg_wal is growing</td>
+        <td>Archiver, slots, standby retention and generation rate</td>
+      </tr>
+      <tr>
+        <td>Frequent checkpoint spikes</td>
+        <td>Requested checkpoints, max WAL size, writeback and FPI rate</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ul class="clean">
+  <li>Logical rows are stable ideas; heap tuples are replaceable physical versions.</li>
+  <li><code>xmin</code> creates a version; <code>xmax</code> is not a simple deleted boolean.</li>
+  <li><code>ctid</code> is a physical locator, never a durable application key.</li>
+  <li>Old snapshots can prevent cleanup without blocking ordinary writes.</li>
+  <li>HOT needs unchanged indexed columns and room on the same page.</li>
+  <li>Plain vacuum reuses space; full vacuum rewrites and shrinks.</li>
+  <li>FSM finds space; VM proves all-visible or all-frozen page state.</li>
+  <li>Autovacuum eligibility depends on thresholds, but workers and locks determine completion.</li>
+  <li>Freezing is correctness maintenance, not just space cleanup.</li>
+  <li>WAL is durable sequential repair information, not a SQL audit trail.</li>
+  <li>Commit can be durable before table pages are written because WAL comes first.</li>
+  <li>More checkpoints can mean more full-page images and more WAL.</li>
+  <li><code>max_wal_size</code> is not a hard disk cap.</li>
+  <li>Never manually delete files from <code>pg_wal</code>.</li>
+  <li>Measure the entire feedback loop: writes, versions, vacuum, WAL, archive and replicas.</li>
+</ul>
+
+<h2 id="references"><span class="num">27.</span> Official reference map</h2>
+<p class="lead">
+  These PostgreSQL 18 manual sections are the primary sources for the behavior, syntax and current
+  defaults described in this guide.
+</p>
+
+<ul class="clean">
+  <li>
+    <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html"
+      >Routine vacuuming, space recovery, visibility maps, freezing and autovacuum</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-vacuum.html"
+      >VACUUM syntax, options, locking and command behavior</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-analyze.html"
+      >ANALYZE syntax and planner statistics</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-vacuum.html"
+      >Autovacuum thresholds, workers, cost delay and freezing settings</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/storage-page-layout.html"
+      >Database page and heap tuple layout</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/storage-fsm.html">Free space map</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/storage-vm.html">Visibility map</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/storage-hot.html">Heap-only tuples</a>
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-system-columns.html"
+      >xmin, xmax, cmin, cmax and ctid system columns</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/progress-reporting.html"
+      >Vacuum and rewrite progress reporting</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/monitoring-stats.html"
+      >Table, WAL, I/O, checkpoint, archive and activity statistics</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/wal-intro.html"
+      >Write-ahead logging and redo fundamentals</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/wal-reliability.html"
+      >Storage reliability, page writes and WAL protection</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/wal-configuration.html"
+      >Checkpoint, WAL buffer and group commit configuration</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/wal-internals.html"
+      >WAL files, segments, records and LSN internals</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-wal.html"
+      >WAL, durability, checkpoint, archiving and recovery settings</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/continuous-archiving.html"
+      >Continuous archiving and point-in-time recovery</a
+    >
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/warm-standby.html"
+      >Physical streaming replication and standby behavior</a
+    >
+  </li>
+</ul>
