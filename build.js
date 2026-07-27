@@ -37,8 +37,9 @@ function chevronDown(cls, size) {
   );
 }
 
-// A topic with more than this many notes collapses behind a "show more" toggle.
-const VISIBLE = 5;
+// Topic lists use different limits on the home page and documentation pages.
+const HOME_VISIBLE = 3;
+const SIDEBAR_VISIBLE = 5;
 
 function showMoreButton(hidden, expanded) {
   const label = `Show ${hidden} more`;
@@ -156,23 +157,23 @@ function rootPrefix(pagePath) {
 function buildSidebar(activePath, prefix) {
   return manifest.topics
     .map((topic) => {
-      const collapsible = topic.pages.length > VISIBLE;
+      const collapsible = topic.pages.length > SIDEBAR_VISIBLE;
       // Never hide the page you're on — expand the group if it lives in the tail.
       const activeIdx = topic.pages.findIndex((p) => p.path === activePath);
-      const expanded = collapsible && activeIdx >= VISIBLE;
+      const expanded = collapsible && activeIdx >= SIDEBAR_VISIBLE;
 
       const items = topic.pages.length
         ? topic.pages
             .map((p, i) => {
               const active = p.path === activePath ? ' class="active"' : "";
-              const extra = collapsible && i >= VISIBLE ? ' class="extra"' : "";
+              const extra = collapsible && i >= SIDEBAR_VISIBLE ? ' class="extra"' : "";
               return `          <li${extra}><a href="${prefix}${p.path}.html"${active}>${p.title}</a></li>`;
             })
             .join("\n")
         : `          <li><span class="empty" style="padding:5px 10px;color:var(--faint);font-size:14px;">— soon —</span></li>`;
 
       const more = collapsible
-        ? `\n        ${showMoreButton(topic.pages.length - VISIBLE, expanded)}`
+        ? `\n        ${showMoreButton(topic.pages.length - SIDEBAR_VISIBLE, expanded)}`
         : "";
       const attrs =
         `class="nav-group${expanded ? " expanded" : ""}"` +
@@ -265,16 +266,16 @@ function noteMain(pagePath, prefix, contentHtml) {
 function homeMain() {
   const cards = manifest.topics
     .map((t) => {
-      const collapsible = t.pages.length > VISIBLE;
+      const collapsible = t.pages.length > HOME_VISIBLE;
       const list = t.pages.length
         ? t.pages
             .map((p, i) => {
-              const extra = collapsible && i >= VISIBLE ? ' class="extra"' : "";
+              const extra = collapsible && i >= HOME_VISIBLE ? ' class="extra"' : "";
               return `<li${extra}><a href="${p.path}.html">${p.title}</a></li>`;
             })
             .join("")
         : `<li class="empty">nothing here yet</li>`;
-      const more = collapsible ? showMoreButton(t.pages.length - VISIBLE, false) : "";
+      const more = collapsible ? showMoreButton(t.pages.length - HOME_VISIBLE, false) : "";
       const attrs = `class="topic-card"` + (collapsible ? " data-collapsible" : "");
       return `        <div ${attrs}><h3>${t.name}</h3><ul>${list}</ul>${more}</div>`;
     })
