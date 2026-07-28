@@ -1,0 +1,1846 @@
+<h1>JPA and Hibernate Fundamentals - Complete Notes</h1>
+<p class="subtitle">
+  A complete learning and interview guide to object-relational mapping, Jakarta Persistence,
+  Hibernate, entity modeling, persistence contexts, lifecycle operations, relationships, locking,
+  queries, PostgreSQL integration, performance, security, testing, and production practices.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The ORM mental model</h2>
+<p class="lead">
+  An ORM maps an in-memory object graph to relational rows, but the object model and the relational
+  model remain different systems with different rules.
+</p>
+
+<p>
+  Java code works with identity, references, inheritance, collections, and mutable objects. A
+  relational database works with tables, keys, constraints, joins, sets of rows, and transactions.
+  Object-relational mapping, or ORM, records how those concepts correspond and coordinates SQL for a
+  unit of work.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of the persistence context as a careful translator with a notebook. It remembers which
+    database row corresponds to each Java object, tracks changes made to managed objects, and writes
+    the required SQL when synchronization is necessary. The translator reduces repetitive work, but
+    it cannot choose good table design, transaction boundaries, indexes, or fetch plans for you.
+  </p>
+</div>
+
+<div class="key">
+  <strong>ORM does not remove SQL</strong>
+  <p>
+    Every useful mapping eventually becomes SQL. Correct ORM code requires understanding the
+    generated statements, database constraints, query plans, locks, and transaction behavior.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Object concept</th>
+        <th>Relational concept</th>
+        <th>Important mismatch</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Object identity</td>
+        <td>Primary key</td>
+        <td>Java reference equality is not database identity</td>
+      </tr>
+      <tr>
+        <td>Reference</td>
+        <td>Foreign key and join</td>
+        <td>Following a reference can require a query</td>
+      </tr>
+      <tr>
+        <td>Collection</td>
+        <td>Multiple rows or join table</td>
+        <td>Ordering and uniqueness must be mapped explicitly</td>
+      </tr>
+      <tr>
+        <td>Inheritance</td>
+        <td>No direct equivalent</td>
+        <td>Every strategy has storage and query costs</td>
+      </tr>
+      <tr>
+        <td>Field update</td>
+        <td><code>UPDATE</code></td>
+        <td>SQL may be delayed until flush</td>
+      </tr>
+      <tr>
+        <td>Null reference</td>
+        <td><code>NULL</code></td>
+        <td>Database null has three-valued logic</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="jpa-hibernate-spring">
+  <span class="num">01.</span> Jakarta Persistence, Hibernate, and Spring
+</h2>
+<p class="lead">
+  Jakarta Persistence defines the portable contract. Hibernate ORM implements that contract. Spring
+  integrates the provider with dependency injection, transactions, configuration, and exception
+  translation.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>What it provides</th>
+        <th>Typical API</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Jakarta Persistence</td>
+        <td>Standard annotations, entity lifecycle, persistence context, query and locking APIs</td>
+        <td><code>EntityManager</code>, <code>@Entity</code>, JPQL</td>
+      </tr>
+      <tr>
+        <td>Hibernate ORM</td>
+        <td>JPA provider, mapping engine, SQL generation, dirty checking, provider extensions</td>
+        <td><code>Session</code>, HQL, Hibernate annotations</td>
+      </tr>
+      <tr>
+        <td>Spring Framework</td>
+        <td>Entity manager integration, transaction management, resource binding, exceptions</td>
+        <td><code>@Transactional</code>, <code>JpaTransactionManager</code></td>
+      </tr>
+      <tr>
+        <td>Spring Boot</td>
+        <td>
+          Conditional setup of the data source, entity manager factory, provider, and settings
+        </td>
+        <td><code>spring.jpa.*</code>, starters</td>
+      </tr>
+      <tr>
+        <td>Spring Data JPA</td>
+        <td>Repository abstraction built on JPA</td>
+        <td><code>JpaRepository</code>, specifications</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Code written only to standard Jakarta Persistence APIs is easier to move between providers.
+  Hibernate-specific features can still be valuable when they solve a measured problem. Isolate
+  provider extensions and document the portability tradeoff.
+</p>
+
+<p>
+  In modern code the package is <code>jakarta.persistence</code>, not the older
+  <code>javax.persistence</code>. A package migration is a source-level compatibility change, so
+  library versions must be aligned through the Spring Boot dependency platform.
+</p>
+
+<h2 id="setup"><span class="num">02.</span> Spring Boot and PostgreSQL setup</h2>
+<p class="lead">
+  The JPA starter assembles Spring Data JPA, Spring ORM, and a supported Hibernate version. The
+  PostgreSQL JDBC driver remains a runtime dependency.
+</p>
+
+<figure class="code">
+  <figcaption><b>Minimal Maven dependencies</b></figcaption>
+  <pre><code>&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-data-jpa&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.postgresql&lt;/groupId&gt;
+    &lt;artifactId&gt;postgresql&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Production-oriented starting configuration</b></figcaption>
+  <pre><code>spring.datasource.url=jdbc:postgresql://db.internal:5432/orders
+spring.datasource.username=orders_app
+spring.datasource.password=${ORDERS_DB_PASSWORD}
+
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+spring.jpa.properties.hibernate.jdbc.batch_size=50
+spring.jpa.properties.hibernate.order_inserts=true
+spring.jpa.properties.hibernate.order_updates=true
+spring.jpa.properties.hibernate.jdbc.time_zone=UTC</code></pre>
+</figure>
+
+<p>
+  Boot scans its auto-configuration packages for <code>@Entity</code>, <code>@Embeddable</code>, and
+  <code>@MappedSuperclass</code> types. Put the application class above domain packages or configure
+  scanning deliberately. Boot normally creates a
+  <code>LocalContainerEntityManagerFactoryBean</code> and a transaction manager when the required
+  classes, data source, and conditions are present.
+</p>
+
+<div class="warn">
+  <strong>Do not use automatic schema mutation as a production migration system</strong>
+  <p>
+    <code>ddl-auto=update</code> is convenient for experiments but cannot express reviewed,
+    repeatable, zero-downtime migrations reliably. Use Flyway or Liquibase, make migration files the
+    schema authority, and use <code>validate</code> to detect mapping drift.
+  </p>
+</div>
+
+<h3 id="entity-manager-factory">Factory and manager roles</h3>
+<p>
+  <code>EntityManagerFactory</code> is expensive to build and is thread-safe. It owns mapping
+  metadata and creates entity managers. An <code>EntityManager</code> represents one persistence
+  context and is not thread-safe. Spring normally injects a shared proxy that delegates to the real
+  transaction-bound entity manager for the current thread.
+</p>
+
+<h2 id="entities"><span class="num">03.</span> Entities and mapping basics</h2>
+<p class="lead">
+  An entity has persistent identity. Its class describes how state maps to a table and its instances
+  participate in a managed lifecycle.
+</p>
+
+<figure class="code">
+  <figcaption><b>A domain-focused entity</b></figcaption>
+  <pre><code>@Entity
+@Table(
+    name = "purchase_order",
+    uniqueConstraints = @UniqueConstraint(
+        name = "uk_purchase_order_number",
+        columnNames = "order_number"
+    )
+)
+public class PurchaseOrder {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_seq")
+    @SequenceGenerator(
+        name = "order_seq",
+        sequenceName = "purchase_order_id_seq",
+        allocationSize = 50
+    )
+    private Long id;
+
+    @Version
+    private long version;
+
+    @Column(name = "order_number", nullable = false, updatable = false, length = 40)
+    private String orderNumber;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 24)
+    private OrderStatus status;
+
+    @Embedded
+    private Money total;
+
+    protected PurchaseOrder() {
+        // Required for provider construction.
+    }
+
+    public PurchaseOrder(String orderNumber, Money total) {
+        this.orderNumber = Objects.requireNonNull(orderNumber);
+        this.total = Objects.requireNonNull(total);
+        this.status = OrderStatus.PENDING;
+    }
+
+    public void confirm() {
+        if (status != OrderStatus.PENDING) {
+            throw new IllegalStateException("Only pending orders can be confirmed");
+        }
+        status = OrderStatus.CONFIRMED;
+    }
+}</code></pre>
+</figure>
+
+<p>
+  A portable entity is a top-level class or static nested class, is not final, and has a public or
+  protected no-argument constructor. Hibernate can support some additional shapes, but proxying and
+  portability are simplest when the standard requirements are followed. An entity itself cannot be a
+  Java record, although Jakarta Persistence 3.2 supports records as embeddable types.
+</p>
+
+<h3 id="field-property-access">Field access versus property access</h3>
+<p>
+  Placing <code>@Id</code> on a field selects field access by default. Placing it on a getter
+  selects property access. With field access, Hibernate reads and writes fields directly and
+  business methods can stay expressive. With property access, persistence goes through getters and
+  setters. Do not mix access styles accidentally. Use <code>@Access</code> when a deliberate
+  override is needed.
+</p>
+
+<h3 id="mapping-explicitly">Map important database rules explicitly</h3>
+<ul class="clean">
+  <li>Use stable table and column names rather than relying entirely on naming conventions.</li>
+  <li>Mirror required values with database <code>NOT NULL</code> constraints.</li>
+  <li>Enforce uniqueness in the database, not only with an application lookup.</li>
+  <li>Choose adequate precision and scale for decimal values.</li>
+  <li>
+    Use Bean Validation for helpful input feedback and database constraints for final integrity.
+  </li>
+  <li>Keep entities behavior-rich enough to protect local invariants.</li>
+</ul>
+
+<h2 id="identifiers-equality"><span class="num">04.</span> Identifiers and entity equality</h2>
+<p class="lead">
+  Every entity needs a stable identifier. Identifier strategy affects insert timing, batching,
+  portability, equality, and database operations.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>Behavior</th>
+        <th>Practical note</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>SEQUENCE</code></td>
+        <td>Obtains values from a database sequence</td>
+        <td>Strong PostgreSQL choice and supports allocation</td>
+      </tr>
+      <tr>
+        <td><code>IDENTITY</code></td>
+        <td>Database generates during insert</td>
+        <td>Can force earlier inserts and restrict insert batching</td>
+      </tr>
+      <tr>
+        <td><code>TABLE</code></td>
+        <td>Uses a table as an identifier allocator</td>
+        <td>Portable but usually adds contention and overhead</td>
+      </tr>
+      <tr>
+        <td><code>AUTO</code></td>
+        <td>Provider chooses based on type and database</td>
+        <td>Convenient, but less explicit</td>
+      </tr>
+      <tr>
+        <td>Assigned UUID</td>
+        <td>Application or provider assigns before insert</td>
+        <td>Useful across nodes, with larger indexes than integers</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  For sequence allocation, the mapping's <code>allocationSize</code> and the database sequence
+  increment must agree. Pooled allocation reduces sequence calls. Gaps are normal after rollbacks,
+  crashes, caching, or pooled allocation, so identifiers must not be treated as gapless business
+  numbers.
+</p>
+
+<p>
+  Composite keys use <code>@EmbeddedId</code> or <code>@IdClass</code>. The key class must model
+  database equality correctly and implement <code>equals</code> and <code>hashCode</code>. Composite
+  foreign keys spread through other tables and APIs, so use them when the domain truly needs them
+  rather than as a default.
+</p>
+
+<h3 id="entity-equality">Choosing equals and hashCode</h3>
+<p>
+  Default reference equality is safe inside one persistence context because only one managed object
+  represents a given entity identity there. It becomes awkward across detached instances. Equality
+  based only on a generated identifier is also tricky because the identifier may be null before
+  persistence and changing a hash code while an object is inside a <code>HashSet</code> breaks the
+  collection.
+</p>
+
+<ul class="clean">
+  <li>Use an immutable, truly unique business key when the domain has one.</li>
+  <li>Otherwise use a carefully documented generated-id pattern with a stable hash strategy.</li>
+  <li>Do not include mutable fields or lazy associations in equality methods.</li>
+  <li>Make equality proxy-safe if Hibernate proxies can appear.</li>
+  <li>
+    Test transient, managed, detached, and proxy cases before using entities in sets or map keys.
+  </li>
+</ul>
+
+<h2 id="lifecycle"><span class="num">05.</span> Entity lifecycle states</h2>
+<p class="lead">
+  Lifecycle state describes an object's relationship to one persistence context, not whether a row
+  happens to exist in the database.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>State</th>
+        <th>Meaning</th>
+        <th>How it changes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>New or transient</td>
+        <td>No persistent identity and not managed</td>
+        <td><code>persist</code> can make it managed</td>
+      </tr>
+      <tr>
+        <td>Managed or persistent</td>
+        <td>Associated with the current persistence context</td>
+        <td>Loaded, persisted, or returned from <code>merge</code></td>
+      </tr>
+      <tr>
+        <td>Detached</td>
+        <td>Has identity but is no longer associated</td>
+        <td>Context closes, clears, or explicitly detaches it</td>
+      </tr>
+      <tr>
+        <td>Removed</td>
+        <td>Managed and scheduled for deletion</td>
+        <td><code>remove</code> marks it until flush</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Lifecycle transitions in one transaction</b></figcaption>
+  <pre><code>@Transactional
+public void lifecycle(EntityManager em, Long id) {
+    PurchaseOrder created = new PurchaseOrder("PO-1042", Money.usd("30.00"));
+    // created is new
+
+    em.persist(created);
+    // created is managed; INSERT may still be deferred
+
+    PurchaseOrder found = em.find(PurchaseOrder.class, id);
+    // found is managed if a row exists
+
+    em.detach(found);
+    // found is detached; later changes are not tracked
+
+    PurchaseOrder managedCopy = em.merge(found);
+    // managedCopy is managed; found remains detached
+
+    em.remove(managedCopy);
+    // managedCopy is removed; DELETE may still be deferred
+}</code></pre>
+</figure>
+
+<p>
+  <code>EntityManager.contains(entity)</code> can test whether a particular instance is managed. An
+  object with a non-null identifier is not automatically detached. Assigned identifiers, manually
+  constructed objects, and deleted rows make that shortcut unreliable.
+</p>
+
+<h2 id="persistence-context">
+  <span class="num">06.</span> Persistence context and first-level cache
+</h2>
+<p class="lead">
+  A persistence context is an identity map and unit of work. For one entity type and identifier, it
+  contains at most one managed Java instance.
+</p>
+
+<figure class="code">
+  <figcaption><b>Identity guarantee inside one context</b></figcaption>
+  <pre><code>PurchaseOrder first = em.find(PurchaseOrder.class, 42L);
+PurchaseOrder second = em.find(PurchaseOrder.class, 42L);
+
+assert first == second;</code></pre>
+</figure>
+
+<p>
+  The second lookup can be satisfied from the first-level cache. This cache is mandatory and local
+  to the persistence context. It is not a cross-request cache and it does not mean every query is
+  skipped. A JPQL query may still execute SQL, then resolve matching identities to managed
+  instances.
+</p>
+
+<p>
+  Spring's normal transaction-scoped context begins with a transaction and closes when the
+  transaction ends. An extended context survives multiple transactions but is a poor fit for
+  singleton services because it is not thread-safe, retains state for a long time, and can return
+  stale data.
+</p>
+
+<div class="warn">
+  <strong>Never share an EntityManager across threads</strong>
+  <p>
+    A persistence context contains mutable identity, snapshots, queued actions, proxies, and JDBC
+    coordination. Async work, parallel streams, and manually created threads need independent
+    transactions and persistence contexts.
+  </p>
+</div>
+
+<h3 id="clear-detach-refresh">Context control operations</h3>
+<ul class="clean">
+  <li><code>detach(entity)</code> stops tracking one managed instance.</li>
+  <li><code>clear()</code> detaches every entity and discards queued context state.</li>
+  <li><code>refresh(entity)</code> reloads database state and overwrites unflushed changes.</li>
+  <li><code>close()</code> ends an application-managed entity manager.</li>
+  <li><code>unwrap(Session.class)</code> provides documented Hibernate-specific operations.</li>
+</ul>
+
+<h2 id="dirty-checking"><span class="num">07.</span> Dirty checking, flushing, and SQL timing</h2>
+<p class="lead">
+  Hibernate tracks managed state. At flush it detects changes and translates the unit of work into
+  SQL actions.
+</p>
+
+<figure class="code">
+  <figcaption><b>No explicit update call is needed</b></figcaption>
+  <pre><code>@Transactional
+public void confirm(Long id) {
+    PurchaseOrder order = entityManager.find(PurchaseOrder.class, id);
+    order.confirm();
+    // Hibernate detects the changed status during flush.
+}</code></pre>
+</figure>
+
+<p>
+  Hibernate commonly compares current values with a loaded snapshot. Bytecode enhancement can
+  provide more direct change tracking. Dirty checking applies only to managed entities. Changing a
+  detached entity after a transaction ends does nothing unless its state is deliberately merged or
+  copied into another managed object.
+</p>
+
+<h3 id="flush-not-commit">Flush is not commit</h3>
+<p>
+  Flush synchronizes the persistence context with the database by executing SQL. Commit completes
+  the transaction and makes its outcome durable and visible according to database isolation. Flushed
+  SQL can still be rolled back. A transaction may flush:
+</p>
+
+<ul class="clean">
+  <li>At transaction commit.</li>
+  <li>Before a query whose result could be affected by pending changes.</li>
+  <li>When the application calls <code>flush()</code>.</li>
+  <li>At another provider-required point, such as some identifier generation cases.</li>
+</ul>
+
+<p>
+  With JPA <code>FlushModeType.AUTO</code>, the provider ensures relevant queries do not ignore
+  pending changes. <code>COMMIT</code> reduces automatic flushing before queries but query results
+  in the presence of pending changes are not generally safe to assume. Hibernate has additional
+  native flush modes.
+</p>
+
+<div class="note">
+  <strong>Why explicit flush can be useful</strong>
+  <p>
+    Flush at a deliberate boundary when code must catch a constraint or optimistic-lock failure
+    before proceeding. After a persistence exception, treat the transaction as failed and roll it
+    back rather than continuing with a possibly inconsistent context.
+  </p>
+</div>
+
+<p>
+  Hibernate's action queue determines SQL ordering, not the exact order of Java method calls. It
+  groups operations to preserve constraints and enable batching. An insert can therefore execute
+  before a delete even if <code>remove</code> was called first. Rely on database constraints and
+  flush deliberately only when an intermediate order is truly required.
+</p>
+
+<h2 id="value-types"><span class="num">08.</span> Basic values, embeddables, and converters</h2>
+<p class="lead">
+  Value types have no independent entity identity. Their lifecycle belongs to the entity that
+  contains them.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mapping</th>
+        <th>Use</th>
+        <th>Key point</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@Basic</code> and <code>@Column</code></td>
+        <td>Scalar field</td>
+        <td>Explicit length, precision, nullability, and mutability matter</td>
+      </tr>
+      <tr>
+        <td><code>@Enumerated</code></td>
+        <td>Java enum</td>
+        <td>Prefer <code>STRING</code>; ordinal values break when constants move</td>
+      </tr>
+      <tr>
+        <td><code>@Embedded</code></td>
+        <td>Reusable value object stored in owner columns</td>
+        <td>No independent identity or table is required</td>
+      </tr>
+      <tr>
+        <td><code>@ElementCollection</code></td>
+        <td>Collection of basic or embeddable values</td>
+        <td>Usually stored in a separate collection table</td>
+      </tr>
+      <tr>
+        <td><code>@Convert</code></td>
+        <td>Application type to database representation</td>
+        <td>Converter must be deterministic and preserve meaning</td>
+      </tr>
+      <tr>
+        <td><code>@Lob</code></td>
+        <td>Large text or binary data</td>
+        <td>Loading and driver behavior need measurement</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Embeddable money value</b></figcaption>
+  <pre><code>@Embeddable
+public record Money(
+    @Column(name = "total_amount", precision = 19, scale = 2)
+    BigDecimal amount,
+
+    @Column(name = "total_currency", length = 3)
+    String currency
+) {
+    public Money {
+        Objects.requireNonNull(amount);
+        Objects.requireNonNull(currency);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Use <code>BigDecimal</code> for exact decimal money, with a deliberate scale and rounding policy.
+  Store instants in UTC and distinguish an instant from a local date-time that has no offset.
+  PostgreSQL types such as <code>jsonb</code>, arrays, ranges, and network addresses may need
+  Hibernate-specific mappings or custom converters. Choose them for a real query or integrity
+  benefit, not only to avoid modeling.
+</p>
+
+<h2 id="relationships"><span class="num">09.</span> Relationships and owning sides</h2>
+<p class="lead">
+  A relationship mapping must express cardinality, foreign-key ownership, fetch behavior, and
+  lifecycle rules. Cardinality alone is not enough.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mapping</th>
+        <th>Typical database shape</th>
+        <th>Default fetch</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@ManyToOne</code></td>
+        <td>Foreign key on this entity's table</td>
+        <td>Eager by JPA default</td>
+      </tr>
+      <tr>
+        <td><code>@OneToMany</code></td>
+        <td>Foreign key on child or join table</td>
+        <td>Lazy</td>
+      </tr>
+      <tr>
+        <td><code>@OneToOne</code></td>
+        <td>Unique foreign key or shared primary key</td>
+        <td>Eager by JPA default</td>
+      </tr>
+      <tr>
+        <td><code>@ManyToMany</code></td>
+        <td>Join table with two foreign keys</td>
+        <td>Lazy</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The owning side writes the relationship columns. In a bidirectional one-to-many relationship, the
+  many side with <code>@ManyToOne</code> owns the foreign key. The parent collection uses
+  <code>mappedBy</code> and is the inverse side. Changing only the inverse collection changes the
+  Java graph but may not change the foreign key.
+</p>
+
+<figure class="code">
+  <figcaption><b>Bidirectional parent-child mapping with helper methods</b></figcaption>
+  <pre><code>@Entity
+class PurchaseOrder {
+    @OneToMany(
+        mappedBy = "order",
+        cascade = CascadeType.ALL,
+        orphanRemoval = true
+    )
+    private final List&lt;OrderLine&gt; lines = new ArrayList&lt;&gt;();
+
+    public void addLine(Product product, int quantity) {
+        OrderLine line = new OrderLine(this, product, quantity);
+        lines.add(line);
+    }
+
+    public void removeLine(OrderLine line) {
+        lines.remove(line);
+        line.detachFromOrder();
+    }
+}
+
+@Entity
+class OrderLine {
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "order_id", nullable = false)
+    private PurchaseOrder order;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "product_id", nullable = false)
+    private Product product;
+}</code></pre>
+</figure>
+
+<p>
+  Helper methods keep both directions consistent in memory. Database foreign keys remain essential
+  because another process, a bug, or a bulk query can bypass the object graph.
+</p>
+
+<h3 id="many-to-many">Why many-to-many often becomes an entity</h3>
+<p>
+  A direct many-to-many is suitable only when the association has no identity, attributes, or
+  lifecycle. Real systems soon need <code>created_at</code>, status, ordering, actor, quantity, or
+  soft deletion. Model the join row as an entity with two many-to-one relationships when that
+  happens. This also makes ownership and deletion safer.
+</p>
+
+<h2 id="cascade-orphans"><span class="num">10.</span> Cascades and orphan removal</h2>
+<p class="lead">
+  Cascades propagate EntityManager operations through an object graph. They are not database
+  <code>ON DELETE CASCADE</code>, and they do not mean that every related entity shares a lifecycle.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Cascade</th>
+        <th>Propagated operation</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>PERSIST</code></td>
+        <td>New parent also persists new child</td>
+        <td>Aggregate-owned children</td>
+      </tr>
+      <tr>
+        <td><code>MERGE</code></td>
+        <td>Copies detached child state during merge</td>
+        <td>Only when merge should cross the boundary</td>
+      </tr>
+      <tr>
+        <td><code>REMOVE</code></td>
+        <td>Removing parent removes target</td>
+        <td>Privately owned dependent entities</td>
+      </tr>
+      <tr>
+        <td><code>REFRESH</code></td>
+        <td>Reload also refreshes target</td>
+        <td>Rare, deliberate graph refresh</td>
+      </tr>
+      <tr>
+        <td><code>DETACH</code></td>
+        <td>Detach also detaches target</td>
+        <td>Rare context management</td>
+      </tr>
+      <tr>
+        <td><code>ALL</code></td>
+        <td>All standard cascade operations</td>
+        <td>True aggregate ownership only</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  <code>orphanRemoval=true</code> means a privately owned child removed from a one-to-one or
+  one-to-many relationship is deleted at flush. It differs from <code>CascadeType.REMOVE</code>:
+  cascade remove acts when the parent itself is removed, while orphan removal acts when the child is
+  disconnected from the parent.
+</p>
+
+<div class="warn">
+  <strong>Do not cascade REMOVE through shared relationships</strong>
+  <p>
+    A product, role, tag, or customer is usually shared independently. Cascading removal from one
+    owner can delete data still needed elsewhere. It is especially dangerous on direct many-to-many
+    relationships.
+  </p>
+</div>
+
+<h2 id="fetching"><span class="num">11.</span> Lazy loading, proxies, and fetch plans</h2>
+<p class="lead">
+  Fetch strategy decides when data is loaded. It is a query-design concern, not a serialization
+  convenience.
+</p>
+
+<p>
+  Lazy associations may be represented by proxies or persistent collection wrappers. Accessing an
+  unloaded association asks the active persistence context to query it. If the context is closed,
+  Hibernate cannot initialize it and may throw <code>LazyInitializationException</code>.
+</p>
+
+<p>
+  JPA defaults to eager for to-one relationships and lazy for to-many relationships. Eager is a
+  requirement that data be available, not a guarantee of one join. Hibernate may use secondary
+  selects, creating an N+1 query problem. Prefer lazy associations in domain mappings where
+  practical, then select an explicit fetch plan per use case.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Fetch tool</th>
+        <th>Good use</th>
+        <th>Risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>JPQL <code>join fetch</code></td>
+        <td>Known associations needed by one query</td>
+        <td>Row multiplication and pagination problems</td>
+      </tr>
+      <tr>
+        <td>Entity graph</td>
+        <td>Reusable dynamic fetch plan</td>
+        <td>Still requires SQL inspection</td>
+      </tr>
+      <tr>
+        <td>DTO projection</td>
+        <td>Read-only API or report shape</td>
+        <td>Not a managed entity graph</td>
+      </tr>
+      <tr>
+        <td>Batch fetching</td>
+        <td>Initialize several lazy associations together</td>
+        <td>Reduces but does not always eliminate extra queries</td>
+      </tr>
+      <tr>
+        <td>Second-level cache</td>
+        <td>Stable, frequently reused shared data</td>
+        <td>Invalidation, memory, and staleness complexity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Purpose-built fetch query</b></figcaption>
+  <pre><code>List&lt;PurchaseOrder&gt; orders = entityManager.createQuery("""
+    select distinct o
+    from PurchaseOrder o
+    left join fetch o.lines l
+    left join fetch l.product
+    where o.id = :id
+    """, PurchaseOrder.class)
+    .setParameter("id", id)
+    .getResultList();</code></pre>
+</figure>
+
+<div class="note">
+  <strong>Disable Open EntityManager in View for explicit boundaries</strong>
+  <p>
+    Keeping the context open through web rendering can hide missing fetch plans and run unexpected
+    queries during JSON serialization. With <code>spring.jpa.open-in-view=false</code>, services
+    load exactly what they need inside a transaction and map it to response DTOs.
+  </p>
+</div>
+
+<h3 id="pagination-fetch-join">Collection fetch joins and pagination</h3>
+<p>
+  A collection join repeats the parent row for each child. Database limit and offset operate on SQL
+  rows, not distinct parent entities, so applying pagination directly can produce incomplete pages
+  or force in-memory work. Page parent identifiers first, then fetch the selected graph in a second
+  query, or use a suitable DTO query.
+</p>
+
+<h2 id="inheritance"><span class="num">12.</span> Inheritance strategies</h2>
+<p class="lead">
+  Relational databases do not model Java inheritance directly. JPA offers strategies with different
+  query, constraint, and storage tradeoffs.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>Schema</th>
+        <th>Strength</th>
+        <th>Cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@MappedSuperclass</code></td>
+        <td>Fields copied into each entity table</td>
+        <td>Simple reuse without polymorphic entity queries</td>
+        <td>Base type is not an entity</td>
+      </tr>
+      <tr>
+        <td><code>SINGLE_TABLE</code></td>
+        <td>One table plus discriminator</td>
+        <td>Fast polymorphic reads and no joins</td>
+        <td>Many nullable subtype columns and weaker subtype constraints</td>
+      </tr>
+      <tr>
+        <td><code>JOINED</code></td>
+        <td>Base table plus one table per subtype</td>
+        <td>Normalized columns and stronger constraints</td>
+        <td>Polymorphic reads and writes need joins</td>
+      </tr>
+      <tr>
+        <td><code>TABLE_PER_CLASS</code></td>
+        <td>Complete columns in each concrete table</td>
+        <td>No joins for concrete-type reads</td>
+        <td>Polymorphic queries require unions and ids are harder</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  <code>SINGLE_TABLE</code> is the JPA default when an entity hierarchy has no explicit strategy.
+  Choose based on actual query patterns and integrity needs. Composition is often simpler than
+  persistence inheritance, especially when subtypes do not need polymorphic queries.
+</p>
+
+<h2 id="optimistic-locking"><span class="num">13.</span> Optimistic locking</h2>
+<p class="lead">
+  Optimistic locking allows concurrent readers and rejects a stale writer instead of holding a
+  database lock for the whole think time.
+</p>
+
+<figure class="code">
+  <figcaption><b>Versioned entity update</b></figcaption>
+  <pre><code>@Version
+@Column(nullable = false)
+private long version;</code></pre>
+</figure>
+
+<p>Hibernate reads the version and generates an update conceptually like:</p>
+
+<figure class="code">
+  <figcaption><b>Version check in SQL</b></figcaption>
+  <pre><code>update purchase_order
+set status = ?, version = version + 1
+where id = ? and version = ?;</code></pre>
+</figure>
+
+<p>
+  If another transaction has already changed the row, zero rows match. The provider throws an
+  optimistic locking exception and the transaction must roll back. Detection may happen at flush or
+  commit. Call <code>flush()</code> inside a try boundary if the application must detect it at a
+  specific point.
+</p>
+
+<ul class="clean">
+  <li>
+    Add <code>@Version</code> to entities that can be edited concurrently or merged when detached.
+  </li>
+  <li>Return a clear conflict response, commonly HTTP 409, when a user submits stale state.</li>
+  <li>Retry only when the whole operation is safe and its inputs can be reevaluated.</li>
+  <li>Use bounded retry with jitter for short machine-driven conflicts.</li>
+  <li>
+    Do not blindly retry a human edit because it can overwrite a meaningful concurrent decision.
+  </li>
+</ul>
+
+<p>
+  <code>OPTIMISTIC_FORCE_INCREMENT</code> can advance the version even when direct fields did not
+  change. It is useful when a logical aggregate change must conflict with another update, but it
+  increases contention and should be applied deliberately.
+</p>
+
+<h2 id="pessimistic-locking"><span class="num">14.</span> Pessimistic locking and PostgreSQL</h2>
+<p class="lead">
+  Pessimistic locking asks the database to lock selected rows now. It trades earlier conflict
+  control for waiting, deadlock risk, and reduced concurrency.
+</p>
+
+<figure class="code">
+  <figcaption><b>JPA pessimistic write lock with timeout hint</b></figcaption>
+  <pre><code>PurchaseOrder order = entityManager.find(
+    PurchaseOrder.class,
+    id,
+    LockModeType.PESSIMISTIC_WRITE,
+    Map.of("jakarta.persistence.lock.timeout", 2_000)
+);</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>JPA lock</th>
+        <th>Intent</th>
+        <th>PostgreSQL-style effect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>PESSIMISTIC_READ</code></td>
+        <td>Prevent incompatible updates while allowing suitable readers</td>
+        <td>Provider selects an appropriate shared row lock</td>
+      </tr>
+      <tr>
+        <td><code>PESSIMISTIC_WRITE</code></td>
+        <td>Reserve the row for update</td>
+        <td>Commonly translates to <code>SELECT ... FOR UPDATE</code></td>
+      </tr>
+      <tr>
+        <td><code>PESSIMISTIC_FORCE_INCREMENT</code></td>
+        <td>Lock and increment a versioned entity</td>
+        <td>Row lock plus version update behavior</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PostgreSQL row locks block conflicting writers and lockers, not ordinary snapshot reads. Locks
+  remain until the transaction ends. Keep locked transactions short, lock rows in a consistent
+  order, set lock and statement timeouts, and handle deadlock or serialization failures by retrying
+  the complete transaction when safe.
+</p>
+
+<p>
+  Lock timeout hints are not equally portable across providers and databases. Verify the generated
+  SQL and deployed behavior. Features such as <code>NOWAIT</code> or <code>SKIP LOCKED</code> can be
+  useful for work queues, but they are database-specific coordination tools and do not replace
+  idempotency.
+</p>
+
+<div class="warn">
+  <strong>Never hold a database transaction while waiting for a user or remote service</strong>
+  <p>
+    The transaction retains a connection, may retain locks, delays cleanup, and increases failure
+    cost. Persist a state transition, commit, perform the external workflow with an idempotent
+    protocol, then use another short transaction.
+  </p>
+</div>
+
+<h2 id="queries"><span class="num">15.</span> JPQL, Criteria API, and native SQL</h2>
+<p class="lead">
+  Choose the highest-level query language that expresses the requirement clearly, then inspect the
+  generated SQL and database plan.
+</p>
+
+<h3 id="jpql">JPQL</h3>
+<p>
+  JPQL queries entities and their mapped attributes, not raw tables and columns. It is concise,
+  portable, supports joins and projections, and is usually the best default for stable queries.
+</p>
+
+<figure class="code">
+  <figcaption><b>Typed JPQL projection</b></figcaption>
+  <pre><code>List&lt;OrderSummary&gt; summaries = entityManager.createQuery("""
+    select new com.example.orders.OrderSummary(
+        o.id, o.orderNumber, o.status, o.total.amount
+    )
+    from PurchaseOrder o
+    where o.status = :status
+    order by o.id
+    """, OrderSummary.class)
+    .setParameter("status", OrderStatus.CONFIRMED)
+    .setMaxResults(100)
+    .getResultList();</code></pre>
+</figure>
+
+<h3 id="criteria-api">Criteria API</h3>
+<p>
+  Criteria builds a query as Java objects. It is verbose for fixed queries but useful for
+  composable, optional filters. The static metamodel improves type safety. Keep predicate assembly
+  in focused query code rather than spreading it through services.
+</p>
+
+<figure class="code">
+  <figcaption><b>Dynamic criteria query</b></figcaption>
+  <pre><code>CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+CriteriaQuery&lt;PurchaseOrder&gt; query = cb.createQuery(PurchaseOrder.class);
+Root&lt;PurchaseOrder&gt; order = query.from(PurchaseOrder.class);
+
+List&lt;Predicate&gt; filters = new ArrayList&lt;&gt;();
+if (status != null) {
+    filters.add(cb.equal(order.get("status"), status));
+}
+if (createdAfter != null) {
+    filters.add(cb.greaterThan(order.get("createdAt"), createdAfter));
+}
+
+query.select(order)
+    .where(filters.toArray(Predicate[]::new))
+    .orderBy(cb.asc(order.get("id")));
+
+List&lt;PurchaseOrder&gt; result = entityManager.createQuery(query)
+    .setMaxResults(100)
+    .getResultList();</code></pre>
+</figure>
+
+<h3 id="native-sql">Native SQL</h3>
+<p>
+  Native SQL is appropriate for PostgreSQL-specific operators, recursive queries, window-heavy
+  reports, carefully optimized joins, data-changing CTEs, or features that JPQL cannot represent. It
+  provides full database power but reduces portability and makes entity result mappings more
+  fragile. DTO or scalar results are often clearer.
+</p>
+
+<figure class="code">
+  <figcaption><b>Parameterized PostgreSQL query</b></figcaption>
+  <pre><code>List&lt;Object[]&gt; rows = entityManager.createNativeQuery("""
+    select id, order_number
+    from purchase_order
+    where search_document @@ websearch_to_tsquery('english', :query)
+    order by id
+    limit :limit
+    """)
+    .setParameter("query", searchText)
+    .setParameter("limit", 50)
+    .getResultList();</code></pre>
+</figure>
+
+<h3 id="query-rules">Rules for every query style</h3>
+<ul class="clean">
+  <li>Bind values as parameters. Never concatenate untrusted input into JPQL or SQL.</li>
+  <li>
+    Allow-list dynamic column names or sort directions because identifiers are not value parameters.
+  </li>
+  <li>Use deterministic ordering for pagination.</li>
+  <li>Set sensible maximum result sizes, timeouts, and transaction boundaries.</li>
+  <li>Use DTO projections when managed state and dirty checking are unnecessary.</li>
+  <li>
+    Inspect generated SQL and run <code>EXPLAIN (ANALYZE, BUFFERS)</code> safely on representative
+    data.
+  </li>
+</ul>
+
+<div class="warn">
+  <strong>Bulk update and delete bypass managed entity state</strong>
+  <p>
+    JPQL bulk operations act directly in the database. They do not run normal per-entity dirty
+    checking or synchronize already managed objects. Flush necessary changes first, then clear the
+    persistence context or refresh affected entities. Lifecycle callbacks and cascades may not run
+    as they do for individual operations.
+  </p>
+</div>
+
+<h2 id="operations"><span class="num">16.</span> persist, merge, save, remove, and refresh</h2>
+<p class="lead">
+  These methods have distinct lifecycle semantics. Choosing by method name alone causes duplicate
+  inserts, lost changes, or continued use of detached objects.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Input</th>
+        <th>Result</th>
+        <th>Main warning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>persist(entity)</code></td>
+        <td>Normally new instance</td>
+        <td>Same instance becomes managed; returns void</td>
+        <td>Detached input can fail</td>
+      </tr>
+      <tr>
+        <td><code>merge(entity)</code></td>
+        <td>New or detached state carrier</td>
+        <td>Returns a managed copy</td>
+        <td>Input instance remains detached</td>
+      </tr>
+      <tr>
+        <td>Hibernate <code>save(entity)</code></td>
+        <td>Historically new instance</td>
+        <td>Historically returned identifier</td>
+        <td>Deprecated since Hibernate 6 and absent from modern Session API</td>
+      </tr>
+      <tr>
+        <td><code>remove(entity)</code></td>
+        <td>Managed entity</td>
+        <td>Marks it removed</td>
+        <td>Detached input is illegal</td>
+      </tr>
+      <tr>
+        <td><code>refresh(entity)</code></td>
+        <td>Managed entity</td>
+        <td>Reloads database values</td>
+        <td>Discards unflushed changes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>The important merge rule</b></figcaption>
+  <pre><code>PurchaseOrder detached = request.toEntity();
+PurchaseOrder managed = entityManager.merge(detached);
+
+// Continue with managed, not detached.
+managed.confirm();</code></pre>
+</figure>
+
+<p>
+  Merge locates or creates a managed target, copies merge-cascaded state from the source graph, and
+  returns the managed target. It can load existing state and can overwrite fields when a partially
+  populated detached object is treated as complete. For request updates, a safer pattern is to load
+  the managed entity and call explicit domain methods with allowed fields.
+</p>
+
+<figure class="code">
+  <figcaption><b>Safer command-style update</b></figcaption>
+  <pre><code>@Transactional
+public void renameOrder(Long id, String requestedNumber) {
+    PurchaseOrder order = entityManager.find(PurchaseOrder.class, id);
+    if (order == null) {
+        throw new OrderNotFoundException(id);
+    }
+    order.rename(requestedNumber);
+}</code></pre>
+</figure>
+
+<p>
+  Hibernate's older <code>save</code> method was provider-specific, returned an identifier, and used
+  Hibernate cascade semantics. It was deprecated in Hibernate 6 in favor of <code>persist</code> and
+  is not part of the current Hibernate <code>Session</code> contract. Do not confuse it with Spring
+  Data repository <code>save</code>, which decides between persistence and merge behavior using
+  repository entity-new detection.
+</p>
+
+<h2 id="transactions"><span class="num">17.</span> Transactions and service boundaries</h2>
+<p class="lead">
+  A persistence context becomes meaningful inside a transaction that defines one atomic business
+  operation.
+</p>
+
+<figure class="code">
+  <figcaption><b>Transaction at the application service boundary</b></figcaption>
+  <pre><code>@Service
+public class OrderService {
+    private final EntityManager entityManager;
+
+    public OrderService(EntityManager entityManager) {
+        this.entityManager = entityManager;
+    }
+
+    @Transactional
+    public OrderReceipt place(PlaceOrder command) {
+        Customer customer = entityManager.find(
+            Customer.class,
+            command.customerId()
+        );
+        PurchaseOrder order = PurchaseOrder.place(customer, command.lines());
+        entityManager.persist(order);
+        return OrderReceipt.from(order);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Spring binds the entity manager and JDBC connection to the transaction. On a normal successful
+  return, the context flushes and the transaction commits. A runtime exception normally triggers
+  rollback. Checked exception rollback rules must be configured when needed.
+</p>
+
+<ul class="clean">
+  <li>Put the boundary around one business use case, not around each DAO method.</li>
+  <li>Keep transactions short but complete enough to protect invariants.</li>
+  <li>
+    Do not assume <code>@Transactional</code> works on same-object self-invocation through a proxy.
+  </li>
+  <li>
+    Do not send emails, publish non-transactional messages, or call slow APIs while holding locks.
+  </li>
+  <li>Use an outbox or transactional event design for reliable external side effects.</li>
+  <li>
+    Use read-only transactions as an intent and optimization hint, not as a security boundary.
+  </li>
+</ul>
+
+<p>
+  Spring's injected entity manager is a proxy, so it can be kept as a singleton bean dependency even
+  though the underlying entity manager is not thread-safe. The proxy routes each call to the
+  transaction-bound instance. An application-created raw entity manager does not gain that behavior
+  automatically.
+</p>
+
+<h2 id="schema-integrity"><span class="num">18.</span> PostgreSQL schema integrity</h2>
+<p class="lead">
+  Object validation improves application feedback. PostgreSQL constraints remain the final
+  concurrency-safe authority for stored data.
+</p>
+
+<figure class="code">
+  <figcaption><b>Schema rules that support the mapping</b></figcaption>
+  <pre><code>create sequence purchase_order_id_seq
+    start with 1
+    increment by 50;
+
+create table purchase_order (
+    id bigint primary key default nextval('purchase_order_id_seq'),
+    version bigint not null,
+    order_number varchar(40) not null,
+    status varchar(24) not null,
+    total_amount numeric(19, 2) not null,
+    total_currency varchar(3) not null,
+    constraint uk_purchase_order_number unique (order_number),
+    constraint ck_purchase_order_amount check (total_amount &gt;= 0)
+);
+
+create table order_line (
+    id bigint primary key,
+    order_id bigint not null references purchase_order(id),
+    product_id bigint not null references product(id),
+    quantity integer not null check (quantity &gt; 0)
+);
+
+create index ix_order_line_order_id on order_line(order_id);
+create index ix_order_line_product_id on order_line(product_id);</code></pre>
+</figure>
+
+<p>
+  PostgreSQL creates indexes for primary keys and unique constraints. It does not automatically add
+  an index for every referencing foreign-key column. Index foreign keys used for joins and parent
+  updates or deletes when the workload justifies it. Keep constraints named so production errors can
+  be diagnosed and translated consistently.
+</p>
+
+<p>
+  Hibernate mapping metadata such as <code>nullable=false</code> describes and can generate schema,
+  but it is not a replacement for an actual constraint in a migration-managed database. Verify both
+  directions: mappings match the schema, and the schema protects all writers.
+</p>
+
+<h2 id="performance"><span class="num">19.</span> Performance engineering</h2>
+<p class="lead">
+  ORM performance is mostly about statement count, rows and columns transferred, query plans,
+  persistence-context size, lock duration, and connection use.
+</p>
+
+<h3 id="n-plus-one">Recognize N+1</h3>
+<p>
+  One query loads N parents, then accessing an association executes one query for each parent.
+  Development data often hides it because N is small. Count statements in integration tests, log SQL
+  with bind values safely in non-production environments, and inspect representative endpoints.
+</p>
+
+<h3 id="batching">JDBC batching</h3>
+<p>
+  Batching groups compatible inserts or updates into fewer driver round trips. Configure
+  <code>hibernate.jdbc.batch_size</code>, optionally order statements, and confirm that the
+  identifier strategy permits batching. Batch size is not a promise that every statement is batched.
+</p>
+
+<figure class="code">
+  <figcaption><b>Bound persistence-context memory in a bulk import</b></figcaption>
+  <pre><code>for (int i = 0; i &lt; commands.size(); i++) {
+    entityManager.persist(toEntity(commands.get(i)));
+
+    if (i &gt; 0 &amp;&amp; i % 50 == 0) {
+        entityManager.flush();
+        entityManager.clear();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Flushing and clearing bounds memory because the context holds strong references and snapshots.
+  After <code>clear()</code>, all prior instances are detached, so later code must not expect dirty
+  checking. For very large streaming or bulk tasks, consider JDBC or Hibernate
+  <code>StatelessSession</code> when entity lifecycle features are unnecessary.
+</p>
+
+<h3 id="performance-checklist">Practical checklist</h3>
+<ul class="clean">
+  <li>Fetch only data needed by the use case.</li>
+  <li>Prefer DTO projections for read-only list and report endpoints.</li>
+  <li>Avoid unbounded result lists and large offset pagination.</li>
+  <li>Use keyset pagination for deep, stable traversal where suitable.</li>
+  <li>Index predicates, joins, foreign keys, and ordering based on real plans.</li>
+  <li>Keep connection-pool size aligned with database capacity and request concurrency.</li>
+  <li>Set statement, lock, and transaction timeouts.</li>
+  <li>Monitor slow SQL, query count, pool saturation, lock waits, and transaction duration.</li>
+  <li>Use a second-level cache only after measuring repeat reads and defining invalidation.</li>
+  <li>Test with production-like row counts and data distribution.</li>
+</ul>
+
+<h2 id="security"><span class="num">20.</span> Security and data exposure</h2>
+<p class="lead">
+  ORM prevents some repetitive SQL mistakes, but it does not provide authorization, tenant
+  isolation, safe serialization, or complete injection protection automatically.
+</p>
+
+<ul class="clean">
+  <li>Bind query values and allow-list any dynamic identifiers or query fragments.</li>
+  <li>Authorize the requested entity, not only the endpoint or supplied identifier.</li>
+  <li>Use DTOs so private fields and lazy graphs are not serialized accidentally.</li>
+  <li>Use a least-privilege PostgreSQL role without schema-owner or superuser rights.</li>
+  <li>Keep database credentials in a protected runtime secret store and rotate them.</li>
+  <li>Encrypt transport with verified TLS and configure certificate validation.</li>
+  <li>Do not log passwords, tokens, personal data, or raw bind parameters indiscriminately.</li>
+  <li>Apply tenant predicates and database protections consistently in multi-tenant systems.</li>
+  <li>Limit query size and complexity to reduce denial-of-service risk.</li>
+</ul>
+
+<p>
+  Mass assignment is a common merge-related security problem. Converting an entire request body to
+  an entity and merging it can overwrite owner, price, role, status, version, or audit fields the
+  caller was never allowed to change. Load the authorized managed entity and expose explicit domain
+  operations for permitted changes.
+</p>
+
+<h2 id="testing"><span class="num">21.</span> Testing persistence behavior</h2>
+<p class="lead">
+  Persistence tests must prove mappings, SQL behavior, constraints, lifecycle transitions, and
+  concurrency against the database used in production.
+</p>
+
+<ul class="clean">
+  <li>Unit-test domain behavior without starting Spring when persistence is irrelevant.</li>
+  <li>Use focused JPA slice tests for mappings and queries.</li>
+  <li>Use Testcontainers with PostgreSQL for database-specific behavior.</li>
+  <li>Apply the same migrations used in production.</li>
+  <li>Flush inside tests so deferred constraint and version failures become visible.</li>
+  <li>
+    Clear before rereading when the assertion must prove stored state rather than cached state.
+  </li>
+  <li>Count statements for important fetch plans to prevent N+1 regressions.</li>
+  <li>Use separate transactions or threads to test real optimistic and pessimistic conflicts.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>A test that proves database state</b></figcaption>
+  <pre><code>@Test
+void confirmsOrder() {
+    PurchaseOrder order = new PurchaseOrder("PO-2042", Money.usd("30.00"));
+    entityManager.persist(order);
+    entityManager.flush();
+    entityManager.clear();
+
+    PurchaseOrder reloaded = entityManager.find(PurchaseOrder.class, order.getId());
+    reloaded.confirm();
+    entityManager.flush();
+    entityManager.clear();
+
+    PurchaseOrder stored = entityManager.find(PurchaseOrder.class, order.getId());
+    assertThat(stored.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Rollback-only tests can hide commit-time failures</strong>
+  <p>
+    A test that never commits may miss deferred constraints, commit callbacks, or conflicts detected
+    during transaction completion. Keep fast rollback tests, but add committed integration tests for
+    behavior whose timing matters.
+  </p>
+</div>
+
+<h2 id="edge-cases"><span class="num">22.</span> Edge cases and hard lessons</h2>
+
+<h3 id="detached-lazy">Detached graphs</h3>
+<p>
+  A detached entity can contain initialized and uninitialized associations. Treating it as a
+  complete snapshot is unsafe. Define a request contract, reload authoritative state, check the
+  version, and apply explicit changes.
+</p>
+
+<h3 id="proxy-type">Proxy type checks</h3>
+<p>
+  A lazy to-one value may be a generated subclass proxy. Strict <code>getClass()</code> equality,
+  final classes, final accessors, and type-based serialization can behave unexpectedly. Use
+  proxy-aware equality or provider utilities where necessary, and avoid exposing proxies outside the
+  persistence layer.
+</p>
+
+<h3 id="collection-replacement">Replacing managed collections</h3>
+<p>
+  Replacing a Hibernate-managed collection wrapper with an arbitrary new list can confuse orphan
+  tracking and generate excessive changes. Prefer domain methods that mutate the managed collection
+  while maintaining both relationship sides.
+</p>
+
+<h3 id="database-defaults">Database defaults</h3>
+<p>
+  An explicitly inserted null can prevent a database default from applying. Generated columns,
+  timestamps, triggers, and defaults also require a clear refresh strategy if Java code needs their
+  values immediately. Make one layer authoritative and test insert behavior.
+</p>
+
+<h3 id="soft-delete">Soft deletion</h3>
+<p>
+  A deleted flag affects every query, unique constraint, association, cache entry, and foreign key.
+  It also retains personal data. Use it only when the domain needs recovery or history. Prefer a
+  dedicated audit trail for immutable history and define partial uniqueness in PostgreSQL when only
+  active rows must be unique.
+</p>
+
+<h3 id="time-zones">Time zones</h3>
+<p>
+  Persist an <code>Instant</code> for a moment on the global timeline. Use
+  <code>LocalDate</code> for a calendar date and <code>LocalDateTime</code> only when the value
+  truly has no zone. Align JVM, JDBC, Hibernate, and PostgreSQL expectations and test
+  daylight-saving boundaries.
+</p>
+
+<h2 id="mistakes"><span class="num">23.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Consequence</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Treating ORM as a reason not to learn SQL</td>
+        <td>Slow and incorrect generated queries</td>
+        <td>Inspect SQL, plans, indexes, and locks</td>
+      </tr>
+      <tr>
+        <td>Making every association eager</td>
+        <td>Over-fetching and N+1 secondary selects</td>
+        <td>Use lazy mappings and use-case fetch plans</td>
+      </tr>
+      <tr>
+        <td>Returning entities from REST endpoints</td>
+        <td>Data leaks, recursion, and lazy queries</td>
+        <td>Map to explicit response DTOs</td>
+      </tr>
+      <tr>
+        <td>Calling merge and continuing with the input</td>
+        <td>Later changes are not tracked</td>
+        <td>Use the managed value returned by merge</td>
+      </tr>
+      <tr>
+        <td>Cascading ALL everywhere</td>
+        <td>Unexpected graph persistence and deletion</td>
+        <td>Cascade only across true lifecycle ownership</td>
+      </tr>
+      <tr>
+        <td>Updating only the inverse relationship side</td>
+        <td>Foreign key does not change as expected</td>
+        <td>Update the owning side and keep both sides consistent</td>
+      </tr>
+      <tr>
+        <td>Using mutable fields in hashCode</td>
+        <td>Entities disappear from hash collections</td>
+        <td>Use a stable equality strategy</td>
+      </tr>
+      <tr>
+        <td>Depending on <code>ddl-auto=update</code></td>
+        <td>Unreviewed and unsafe schema evolution</td>
+        <td>Use versioned migrations and validation</td>
+      </tr>
+      <tr>
+        <td>Ignoring persistence-context growth</td>
+        <td>High memory and dirty-checking cost</td>
+        <td>Flush and clear batches or use a lower-level tool</td>
+      </tr>
+      <tr>
+        <td>No version column</td>
+        <td>Silent lost updates</td>
+        <td>Use optimistic locking on concurrently edited entities</td>
+      </tr>
+      <tr>
+        <td>Long transaction around remote calls</td>
+        <td>Pool exhaustion, lock waits, and deadlocks</td>
+        <td>Use short transactions and reliable side-effect patterns</td>
+      </tr>
+      <tr>
+        <td>Testing only with an in-memory database</td>
+        <td>PostgreSQL behavior is untested</td>
+        <td>Use real PostgreSQL integration tests</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="production"><span class="num">24.</span> Production readiness checklist</h2>
+<ul class="clean">
+  <li>Let the supported Spring Boot platform manage Hibernate and Jakarta dependency versions.</li>
+  <li>Use reviewed, repeatable migrations and validate mappings at startup.</li>
+  <li>Disable Open EntityManager in View and map transaction-loaded results to DTOs.</li>
+  <li>Use explicit transaction boundaries around complete business operations.</li>
+  <li>Add version columns where lost updates matter.</li>
+  <li>Enforce nullability, uniqueness, checks, and referential integrity in PostgreSQL.</li>
+  <li>Index based on representative queries and inspect query plans.</li>
+  <li>Choose and test fetch plans for critical endpoints.</li>
+  <li>Configure batching only after proving it works with the identifier strategy.</li>
+  <li>Set connection, query, lock, and transaction timeouts.</li>
+  <li>Monitor SQL latency, statement counts, pool use, lock waits, and rollback rates.</li>
+  <li>Handle optimistic conflicts, deadlocks, and serialization failures deliberately.</li>
+  <li>Use least-privilege database credentials, TLS, secret rotation, and safe logging.</li>
+  <li>Test migrations and persistence behavior against the supported PostgreSQL version.</li>
+  <li>Review Hibernate and Spring migration guides before upgrades.</li>
+</ul>
+
+<h2 id="interview"><span class="num">25.</span> Interview questions and answers</h2>
+
+<h3 id="qa-1">What problem does ORM solve?</h3>
+<p>
+  ORM maps object state and relationships to relational structures, manages entity identity and
+  lifecycle, translates object changes into SQL, and reduces repetitive JDBC mapping. It does not
+  replace schema design, SQL knowledge, transactions, or performance analysis.
+</p>
+
+<h3 id="qa-2">What is the difference between JPA and Hibernate?</h3>
+<p>
+  Jakarta Persistence is a standard API and specification. Hibernate ORM is a provider that
+  implements it and offers additional native capabilities. Spring integrates either the standard or
+  native API with transactions, resource management, and exception translation.
+</p>
+
+<h3 id="qa-3">What is a persistence context?</h3>
+<p>
+  It is a set of managed entity instances associated with an entity manager. It provides one Java
+  instance per entity identity, tracks changes, coordinates lifecycle operations, and acts as the
+  first-level cache and unit of work.
+</p>
+
+<h3 id="qa-4">What are the entity lifecycle states?</h3>
+<p>
+  New means not managed and without persistent identity. Managed means associated with the current
+  persistence context. Detached means it has identity but is no longer managed. Removed means it is
+  managed and scheduled for deletion.
+</p>
+
+<h3 id="qa-5">How does dirty checking work?</h3>
+<p>
+  Hibernate tracks the loaded state of managed entities. During flush it determines which values
+  changed and schedules the corresponding SQL. No explicit update call is required for a managed
+  entity.
+</p>
+
+<h3 id="qa-6">What is the difference between flush and commit?</h3>
+<p>
+  Flush executes SQL to synchronize in-memory managed state with the database inside the current
+  transaction. Commit completes the transaction. Flushed changes can still roll back.
+</p>
+
+<h3 id="qa-7">What is the first-level cache?</h3>
+<p>
+  It is the mandatory cache inside one persistence context. Repeated identity lookups can return the
+  same managed object without another row load. It is not shared between entity managers and should
+  not be used as an application-wide cache.
+</p>
+
+<h3 id="qa-8">What is the owning side of a relationship?</h3>
+<p>
+  It is the side whose mapping writes the foreign key or join table. In a bidirectional
+  one-to-many/many-to-one relationship, the many-to-one side owns the foreign key and the
+  one-to-many side uses <code>mappedBy</code>.
+</p>
+
+<h3 id="qa-9">How is cascade remove different from orphan removal?</h3>
+<p>
+  Cascade remove deletes a target when the source entity itself is removed. Orphan removal deletes a
+  privately owned child when it is disconnected from a one-to-one or one-to-many relationship.
+</p>
+
+<h3 id="qa-10">What is the N+1 query problem?</h3>
+<p>
+  One query loads N parent rows and then N additional queries initialize an association for each
+  parent. Solve it with a use-case-specific fetch join, entity graph, projection, or appropriate
+  batch fetch, and verify by counting SQL.
+</p>
+
+<h3 id="qa-11">What is the difference between persist and merge?</h3>
+<p>
+  Persist normally makes the same new instance managed and returns nothing. Merge copies state from
+  a new or detached object into a managed instance and returns that instance. The merge input does
+  not become managed.
+</p>
+
+<h3 id="qa-12">How does Hibernate save differ?</h3>
+<p>
+  The older Hibernate-native <code>save</code> operation historically persisted a transient object
+  and returned its identifier. It was deprecated in Hibernate 6 in favor of JPA-style
+  <code>persist</code> and is not part of the current Session contract. Spring Data's repository
+  <code>save</code> is a different abstraction.
+</p>
+
+<h3 id="qa-13">How does optimistic locking prevent lost updates?</h3>
+<p>
+  A version value is read with the entity and included in update or delete conditions. If another
+  transaction changed the row, the old version no longer matches, zero rows are affected, and the
+  provider throws an optimistic locking exception.
+</p>
+
+<h3 id="qa-14">When should pessimistic locking be used?</h3>
+<p>
+  Use it when contention is expected and allowing work to proceed until a late optimistic failure is
+  too expensive, or when a short critical section must reserve rows. Keep the transaction short and
+  handle timeouts and deadlocks.
+</p>
+
+<h3 id="qa-15">Compare the inheritance strategies.</h3>
+<p>
+  Single table gives fast polymorphic reads but nullable subtype columns. Joined normalizes subtype
+  data but requires joins. Table per class duplicates base columns and uses unions for polymorphism.
+  Mapped superclass only shares mappings and has no polymorphic entity hierarchy.
+</p>
+
+<h3 id="qa-16">Why can merge be dangerous for API updates?</h3>
+<p>
+  A detached request-shaped object may omit fields or include fields the caller may not update.
+  Merge treats its state as input to copy, which can overwrite authoritative values. Loading the
+  managed entity and applying allowed commands is safer.
+</p>
+
+<h3 id="qa-17">Why should EntityManager not be shared across threads?</h3>
+<p>
+  It contains mutable identity maps, snapshots, proxies, queued actions, and transaction state and
+  is explicitly not thread-safe. Each transaction or thread needs its own context.
+</p>
+
+<h3 id="qa-18">Why is a DTO projection often faster for reads?</h3>
+<p>
+  It can select only required columns, avoid building a managed entity graph, avoid dirty-checking
+  snapshots, and prevent accidental lazy traversal. Use entities when behavior and updates need a
+  managed model.
+</p>
+
+<h3 id="qa-19">Why can collection fetch joins break pagination?</h3>
+<p>
+  A join produces multiple SQL rows per parent. Limit and offset apply to rows before Hibernate
+  reconstructs distinct parents. Page identifiers first and then fetch the graph, or use an
+  appropriate projection.
+</p>
+
+<h3 id="qa-20">Why use database constraints when entities validate data?</h3>
+<p>
+  The database is the final authority across concurrent transactions and every writer. Application
+  validation improves error messages but can race and can be bypassed.
+</p>
+
+<h2 id="practice"><span class="num">26.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>Map an order aggregate with an embedded money value and owned order lines.</li>
+  <li>Write a test proving new, managed, detached, and removed state transitions.</li>
+  <li>Demonstrate first-level cache identity and then repeat after <code>clear()</code>.</li>
+  <li>Cause a deferred unique constraint violation and observe when flush reveals it.</li>
+  <li>Write helper methods that keep both sides of a bidirectional relationship consistent.</li>
+  <li>Create an N+1 problem, count the statements, and fix it with a purpose-built fetch plan.</li>
+  <li>Compare JPQL, Criteria, and native PostgreSQL implementations of one search screen.</li>
+  <li>
+    Run two transactions that produce an optimistic-lock conflict and design the user response.
+  </li>
+  <li>
+    Run two transactions with opposite lock order, observe deadlock handling, then fix the order.
+  </li>
+  <li>Benchmark sequence and identity identifier strategies with insert batching.</li>
+  <li>Page a one-to-many result safely without a collection fetch-join pagination bug.</li>
+  <li>Test the same migration and mapping against a PostgreSQL Testcontainer.</li>
+</ol>
+
+<h2 id="cheatsheet"><span class="num">27.</span> One-screen cheat sheet</h2>
+<div class="key">
+  <strong>JPA and Hibernate rules</strong>
+  <ul class="clean">
+    <li>JPA is the standard; Hibernate is an implementation and extension.</li>
+    <li>The persistence context is an identity map, first-level cache, and unit of work.</li>
+    <li>Managed entity changes are synchronized by dirty checking at flush.</li>
+    <li>Flush executes SQL inside the transaction; commit completes the transaction.</li>
+    <li>Persist manages the same new object; merge returns a managed copy.</li>
+    <li>The input to merge remains detached.</li>
+    <li>The owning relationship side writes the foreign key.</li>
+    <li>Cascade only across genuine lifecycle ownership.</li>
+    <li>Orphan removal deletes a privately owned disconnected child.</li>
+    <li>Prefer explicit fetch plans and DTOs over global eager loading.</li>
+    <li>Use <code>@Version</code> to detect stale writes.</li>
+    <li>Use pessimistic locks only in short, measured critical sections.</li>
+    <li>Bind query values and allow-list dynamic identifiers.</li>
+    <li>Use migrations and database constraints as the schema authority.</li>
+    <li>Inspect SQL, statement counts, plans, locks, and connection use.</li>
+    <li>Never share an EntityManager across threads.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">28.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://jakarta.ee/specifications/persistence/3.2/jakarta-persistence-spec-3.2"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Jakarta Persistence 3.2 specification</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://jakarta.ee/specifications/persistence/3.2/apidocs/jakarta.persistence/jakarta/persistence/entitymanager"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Jakarta Persistence EntityManager API</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.hibernate.org/orm/7.1/userguide/html_single/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Hibernate ORM User Guide</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.hibernate.org/orm/7.1/javadocs/org/hibernate/Session.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Hibernate Session API</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/orm/jpa.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework JPA integration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/data/sql.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot SQL database and JPA support</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/explicit-locking.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL explicit locking</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/ddl-constraints.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL constraints</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

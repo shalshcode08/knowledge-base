@@ -75,6 +75,10 @@
         {
           "title": "Spring Data JPA",
           "path": "spring/spring-data-jpa"
+        },
+        {
+          "title": "JPA and Hibernate Fundamentals",
+          "path": "spring/jpa-hibernate-fundamentals"
         }
       ]
     }
