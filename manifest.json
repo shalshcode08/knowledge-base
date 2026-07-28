@@ -67,6 +67,10 @@
         {
           "title": "Spring MVC and REST APIs",
           "path": "spring/spring-mvc-rest-apis"
+        },
+        {
+          "title": "Spring Data JPA",
+          "path": "spring/spring-data-jpa"
         }
       ]
     }
