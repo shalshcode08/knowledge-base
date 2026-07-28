@@ -79,6 +79,10 @@
         {
           "title": "JPA and Hibernate Fundamentals",
           "path": "spring/jpa-hibernate-fundamentals"
+        },
+        {
+          "title": "Spring JDBC and Database Access",
+          "path": "spring/spring-jdbc-database-access"
         }
       ]
     }

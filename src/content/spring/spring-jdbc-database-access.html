@@ -1,0 +1,1838 @@
+<h1>Spring JDBC and Database Access - Complete Notes</h1>
+<p class="subtitle">
+  A complete guide to JDBC foundations, DataSource and HikariCP, JdbcTemplate, named parameters, row
+  mapping, batching, generated keys, exception translation, transactions, PostgreSQL, security,
+  testing, performance, production operations, and choosing JDBC instead of an ORM.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The Spring JDBC mental model</h2>
+<p class="lead">
+  Spring JDBC keeps SQL visible while removing repetitive JDBC plumbing. The application still
+  chooses the SQL, parameters, and object mapping. Spring obtains and releases resources, executes
+  the statement, participates in transactions, and translates low-level failures.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of raw JDBC as cooking in a professional kitchen while also opening the building,
+    allocating every tool, washing every pan, and translating every supplier's paperwork. Spring
+    JDBC supplies the managed kitchen. You still write the recipe, which is the SQL, and decide how
+    ingredients become the final object.
+  </p>
+</div>
+
+<div class="key">
+  <strong>The central idea</strong>
+  <p>
+    Spring JDBC is not an ORM. It does not track entities, generate domain queries, perform dirty
+    checking, or maintain a persistence context. It is a thin, predictable abstraction over JDBC
+    that gives application code direct control over relational operations.
+  </p>
+</div>
+
+<p>A useful request-to-database path is:</p>
+<ol class="clean">
+  <li>A controller or message consumer invokes an application service.</li>
+  <li>The service establishes the business and transaction boundary.</li>
+  <li>A repository expresses one database operation with SQL and parameters.</li>
+  <li>A Spring JDBC template obtains the transaction-bound or pooled connection.</li>
+  <li>The PostgreSQL JDBC driver sends the protocol messages to PostgreSQL.</li>
+  <li>PostgreSQL plans and executes the statement.</li>
+  <li>A mapper converts each result row into an application value.</li>
+  <li>Spring closes JDBC resources and returns the connection to the pool.</li>
+</ol>
+
+<h2 id="jdbc-foundation"><span class="num">01.</span> JDBC foundations</h2>
+<p class="lead">
+  JDBC is the standard Java API for connecting to tabular data sources, executing SQL, binding
+  parameters, reading results, controlling transactions, and inspecting database metadata.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>JDBC type</th>
+        <th>Responsibility</th>
+        <th>Important fact</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>DataSource</code></td>
+        <td>Supplies connections</td>
+        <td>Preferred application-level connection factory</td>
+      </tr>
+      <tr>
+        <td><code>Connection</code></td>
+        <td>Represents a database session</td>
+        <td>Also owns transaction state</td>
+      </tr>
+      <tr>
+        <td><code>PreparedStatement</code></td>
+        <td>Represents parameterized SQL</td>
+        <td>Separates SQL structure from values</td>
+      </tr>
+      <tr>
+        <td><code>ResultSet</code></td>
+        <td>Cursor over returned rows</td>
+        <td>Starts before the first row</td>
+      </tr>
+      <tr>
+        <td><code>SQLException</code></td>
+        <td>Reports JDBC or database failure</td>
+        <td>Contains SQL state, vendor code, and chained causes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Raw JDBC usually repeats this workflow for every operation:</p>
+<figure class="code">
+  <figcaption><b>The plumbing behind a small query</b></figcaption>
+  <pre><code>String sql = "select id, email from customer where id = ?";
+
+try (Connection connection = dataSource.getConnection();
+     PreparedStatement statement = connection.prepareStatement(sql)) {
+    statement.setLong(1, customerId);
+
+    try (ResultSet result = statement.executeQuery()) {
+        if (!result.next()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+            new Customer(result.getLong("id"), result.getString("email"))
+        );
+    }
+} catch (SQLException failure) {
+    throw translate(failure);
+}</code></pre>
+</figure>
+
+<p>
+  The code is valid, but the business-specific parts are only the SQL, parameter, expected
+  cardinality, and mapping. The rest is infrastructure that must be correct every time.
+</p>
+
+<h2 id="problems-solved"><span class="num">02.</span> Problems Spring JDBC solves</h2>
+<p class="lead">
+  Spring uses the template and callback pattern. The template controls the stable workflow, while
+  application callbacks supply only the parts that vary.
+</p>
+
+<ul class="clean">
+  <li>Obtains a connection from a configured <code>DataSource</code>.</li>
+  <li>Reuses the connection already bound to the current Spring transaction.</li>
+  <li>Creates, executes, and closes statements.</li>
+  <li>Iterates and closes result sets.</li>
+  <li>Binds ordinary Java values to prepared statements.</li>
+  <li>Converts result rows through <code>RowMapper</code> and related callbacks.</li>
+  <li>Translates checked <code>SQLException</code> failures into Spring's exception hierarchy.</li>
+  <li>Supports updates, generated keys, batches, stored procedures, and streaming callbacks.</li>
+</ul>
+
+<div class="warn">
+  <strong>What Spring cannot decide</strong>
+  <p>
+    Spring cannot make an inefficient query efficient, choose the correct index, infer the intended
+    row cardinality, secure a dynamically concatenated identifier, or decide the right transaction
+    boundary. Those remain design responsibilities.
+  </p>
+</div>
+
+<h2 id="dependencies"><span class="num">03.</span> Dependencies and Boot auto-configuration</h2>
+<p class="lead">
+  A Spring Boot JDBC application normally uses the JDBC starter and a database-specific driver.
+</p>
+
+<figure class="code">
+  <figcaption><b>Maven dependencies for PostgreSQL</b></figcaption>
+  <pre><code>&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-jdbc&lt;/artifactId&gt;
+&lt;/dependency&gt;
+
+&lt;dependency&gt;
+    &lt;groupId&gt;org.postgresql&lt;/groupId&gt;
+    &lt;artifactId&gt;postgresql&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+</figure>
+
+<p>
+  The starter brings Spring JDBC and HikariCP under Spring Boot's dependency management. With a
+  suitable driver and configuration, Boot can create a pooled <code>DataSource</code>,
+  <code>JdbcTemplate</code>, <code>NamedParameterJdbcTemplate</code>, and JDBC transaction manager.
+  Defining an application <code>DataSource</code> bean makes Boot's default back off.
+</p>
+
+<div class="key">
+  <strong>Do not hard-code library versions casually</strong>
+  <p>
+    Use a supported Spring Boot release line and its dependency management. Override the PostgreSQL
+    driver, HikariCP, or Spring Framework version only for a verified compatibility or security
+    reason, with tests that cover the application.
+  </p>
+</div>
+
+<h2 id="data-source"><span class="num">04.</span> DataSource and connection ownership</h2>
+<p class="lead">
+  <code>javax.sql.DataSource</code> is a connection factory. In a production Boot application, its
+  implementation is usually a connection pool rather than a factory that creates a new physical
+  database connection for every call.
+</p>
+
+<p>
+  A physical connection includes a network socket, authentication, PostgreSQL backend process, and
+  session state. Creating one per query is expensive. A pool maintains a bounded set and lends a
+  logical connection handle to a caller.
+</p>
+
+<ol class="clean">
+  <li><code>getConnection()</code> borrows an available pool entry.</li>
+  <li>JDBC work uses the underlying physical session.</li>
+  <li><code>close()</code> on the proxy returns it to the pool.</li>
+  <li>The pool resets important connection state before later reuse.</li>
+</ol>
+
+<div class="warn">
+  <strong>Closing is required even with a pool</strong>
+  <p>
+    Closing a pooled connection usually means returning it, not closing its network socket. Failing
+    to close it leaks a pool slot. Under load, all callers eventually wait and time out.
+  </p>
+</div>
+
+<p>
+  Keep the <code>DataSource</code> as a singleton infrastructure bean. Do not cache a
+  <code>Connection</code> in a repository field. Connections are mutable session resources and may
+  be bound to a particular thread and transaction.
+</p>
+
+<h3 id="transaction-aware-connection">How a transaction gets the same connection</h3>
+<p>
+  A Spring JDBC transaction manager obtains a connection, disables auto-commit as needed, and binds
+  a holder to the current execution thread. <code>JdbcTemplate</code> uses Spring's data-source
+  utilities, so repository calls inside that transaction obtain the same connection. At completion,
+  the manager commits or rolls back, resets state, unbinds, and releases the connection.
+</p>
+
+<p>
+  Code that directly calls <code>dataSource.getConnection()</code> can bypass this coordination.
+  Prefer the template or <code>DataSourceUtils</code> in infrastructure code that must participate
+  in Spring-managed transactions.
+</p>
+
+<h2 id="hikari"><span class="num">05.</span> HikariCP connection pooling</h2>
+<p class="lead">
+  HikariCP is Spring Boot's preferred JDBC pool when it is available. Its purpose is bounded,
+  efficient connection reuse, not making the database capable of unlimited concurrency.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Meaning</th>
+        <th>Production reasoning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>maximumPoolSize</code></td>
+        <td>Maximum total idle plus in-use connections</td>
+        <td>Budget against database capacity across every instance</td>
+      </tr>
+      <tr>
+        <td><code>connectionTimeout</code></td>
+        <td>Maximum wait to borrow a connection</td>
+        <td>Fail within the request's overall time budget</td>
+      </tr>
+      <tr>
+        <td><code>maxLifetime</code></td>
+        <td>Maximum lifetime before an idle returned connection retires</td>
+        <td>Set below infrastructure connection limits</td>
+      </tr>
+      <tr>
+        <td><code>keepaliveTime</code></td>
+        <td>Interval for validating an idle connection</td>
+        <td>Useful when infrastructure silently drops idle sessions</td>
+      </tr>
+      <tr>
+        <td><code>minimumIdle</code></td>
+        <td>Target minimum idle connections</td>
+        <td>Leaving it unset gives fixed-size behavior recommended by HikariCP</td>
+      </tr>
+      <tr>
+        <td><code>leakDetectionThreshold</code></td>
+        <td>Logs connections held longer than a threshold</td>
+        <td>Diagnostic aid, not a permanent substitute for tracing</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Example production-shaped configuration</b></figcaption>
+  <pre><code>spring:
+  datasource:
+    url: jdbc:postgresql://db.internal:5432/orders
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: orders-pool
+      maximum-pool-size: 12
+      connection-timeout: 2000
+      max-lifetime: 1740000
+      keepalive-time: 120000
+  jdbc:
+    template:
+      query-timeout: 5</code></pre>
+</figure>
+
+<p>
+  These are examples, not universal values. The pool size must be load-tested. Twelve application
+  instances with a maximum of 20 can request 240 database connections, before migrations,
+  administration, background jobs, and other applications are counted.
+</p>
+
+<h3 id="pool-sizing">Pool sizing principles</h3>
+<ul class="clean">
+  <li>A larger pool can increase database contention and context switching.</li>
+  <li>Start small, measure connection wait time, database CPU, locks, and query latency.</li>
+  <li>Count every replica, worker process, read pool, and deployment overlap.</li>
+  <li>Keep application request concurrency bounded relative to downstream capacity.</li>
+  <li>A saturated pool is often a symptom of slow SQL or long transactions.</li>
+  <li>Do not use pool growth to hide leaked connections or missing query timeouts.</li>
+</ul>
+
+<h3 id="pool-state">Session state and pool safety</h3>
+<p>
+  PostgreSQL settings, temporary tables, advisory locks, and session variables may outlive one
+  statement. A pool resets standard JDBC state, but cannot understand every custom session change.
+  Prefer transaction-local settings such as <code>SET LOCAL</code>, release advisory locks, and do
+  not assume the next borrow uses a fresh server session.
+</p>
+
+<h2 id="configuration"><span class="num">06.</span> PostgreSQL configuration and credentials</h2>
+<p class="lead">
+  Boot reads ordinary data-source settings under <code>spring.datasource</code> and Hikari-specific
+  settings under <code>spring.datasource.hikari</code>.
+</p>
+
+<ul class="clean">
+  <li>The URL commonly has the form <code>jdbc:postgresql://host:5432/database</code>.</li>
+  <li>The pgJDBC driver is discovered through Java's service-provider mechanism.</li>
+  <li>Boot can infer the driver class from the JDBC URL in normal cases.</li>
+  <li>Credentials should come from a secret manager or protected environment injection.</li>
+  <li>TLS identity verification is required across untrusted networks.</li>
+  <li>Use a least-privilege role specific to the application and environment.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>A URL with explicit TLS behavior</b></figcaption>
+  <pre><code>spring.datasource.url=jdbc:postgresql://db.example.net:5432/orders?sslmode=verify-full
+spring.datasource.username=${DB_USERNAME}
+spring.datasource.password=${DB_PASSWORD}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Do not commit secrets</strong>
+  <p>
+    Property placeholders do not make a value secret by themselves. Prevent credentials from
+    entering source control, command history, exception messages, build artifacts, and logs. Plan
+    rotation and revoke leaked credentials immediately.
+  </p>
+</div>
+
+<h3 id="multiple-data-sources">Multiple data sources</h3>
+<p>
+  Multiple databases require explicit bean names, qualifiers, templates, and transaction managers. A
+  transaction managed for one data source does not automatically make work on another atomic.
+  Distributed atomicity needs a suitable distributed transaction system, or more commonly an
+  application pattern such as an outbox with idempotent consumers.
+</p>
+
+<h2 id="schema"><span class="num">07.</span> Schema ownership and migrations</h2>
+<p class="lead">
+  The database schema is a versioned production contract. Use a migration tool such as Flyway or
+  Liquibase rather than relying on repository code to create tables at runtime.
+</p>
+
+<figure class="code">
+  <figcaption><b>Example PostgreSQL migration</b></figcaption>
+  <pre><code>create table customer (
+    id bigint generated always as identity primary key,
+    email text not null,
+    display_name text not null,
+    status text not null,
+    version integer not null default 0,
+    created_at timestamptz not null default current_timestamp,
+    constraint customer_email_unique unique (email),
+    constraint customer_status_check
+        check (status in ('ACTIVE', 'SUSPENDED'))
+);
+
+create index customer_created_at_id_idx
+    on customer (created_at desc, id desc);</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>Let constraints enforce invariants even if Java validates them too.</li>
+  <li>Use expand-and-contract migrations for zero-downtime compatibility.</li>
+  <li>Test application version N against the schema states seen during rollout.</li>
+  <li>Run migrations once per deployment under controlled credentials.</li>
+  <li>Give the runtime role only the DML and sequence privileges it needs.</li>
+</ul>
+
+<h2 id="jdbc-template"><span class="num">08.</span> JdbcTemplate fundamentals</h2>
+<p class="lead">
+  <code>JdbcTemplate</code> is the central classic Spring JDBC class. Once configured, it is
+  thread-safe and should be shared. Repository methods provide SQL, bind values, and map results.
+</p>
+
+<figure class="code">
+  <figcaption><b>A focused repository</b></figcaption>
+  <pre><code>@Repository
+final class CustomerRepository {
+    private final JdbcTemplate jdbc;
+
+    CustomerRepository(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    List&lt;CustomerSummary&gt; findActive(int limit) {
+        return jdbc.query("""
+            select id, email, display_name
+            from customer
+            where status = ?
+            order by id
+            limit ?
+            """,
+            customerSummaryMapper(),
+            "ACTIVE",
+            limit
+        );
+    }
+
+    private static RowMapper&lt;CustomerSummary&gt; customerSummaryMapper() {
+        return (rs, rowNumber) -&gt; new CustomerSummary(
+            rs.getLong("id"),
+            rs.getString("email"),
+            rs.getString("display_name")
+        );
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The repository owns persistence language. The service owns business orchestration. Avoid a generic
+  repository with methods like <code>runSql(String)</code>, because it spreads SQL and persistence
+  semantics throughout the application.
+</p>
+
+<h3 id="jdbc-client">The newer JdbcClient facade</h3>
+<p>
+  Current Spring Framework versions also provide <code>JdbcClient</code>, a fluent facade that
+  delegates to <code>JdbcTemplate</code> and <code>NamedParameterJdbcTemplate</code>. It can make
+  ordinary query and update code more readable. The classic templates remain important because they
+  expose the complete callback, batch, and lower-level feature set. Choose one consistent repository
+  style rather than wrapping every Spring JDBC API in another generic abstraction.
+</p>
+
+<h3 id="template-operations">Common operations</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Use</th>
+        <th>Return shape</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>query</code></td>
+        <td>Zero to many result rows</td>
+        <td>List or callback result</td>
+      </tr>
+      <tr>
+        <td><code>queryForObject</code></td>
+        <td>Exactly one row or scalar</td>
+        <td>Single mapped value</td>
+      </tr>
+      <tr>
+        <td><code>queryForList</code></td>
+        <td>Simple scalar list or map rows</td>
+        <td>List</td>
+      </tr>
+      <tr>
+        <td><code>update</code></td>
+        <td>Insert, update, or delete</td>
+        <td>Affected row count</td>
+      </tr>
+      <tr>
+        <td><code>batchUpdate</code></td>
+        <td>Repeated DML</td>
+        <td>Update counts</td>
+      </tr>
+      <tr>
+        <td><code>execute</code></td>
+        <td>Lower-level statement callback</td>
+        <td>Callback-defined</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="cardinality"><span class="num">09.</span> Query cardinality and null handling</h2>
+<p class="lead">
+  Choose an API whose contract matches the number of rows the query is allowed to return.
+</p>
+
+<figure class="code">
+  <figcaption><b>Optional lookup with an explicit zero-row contract</b></figcaption>
+  <pre><code>Optional&lt;Customer&gt; findById(long id) {
+    List&lt;Customer&gt; rows = jdbc.query("""
+        select id, email, display_name, status, version, created_at
+        from customer
+        where id = ?
+        """, CUSTOMER_MAPPER, id);
+
+    return DataAccessUtils.optionalResult(rows);
+}</code></pre>
+</figure>
+
+<p>
+  <code>queryForObject</code> expects exactly one row. Zero rows result in an
+  <code>EmptyResultDataAccessException</code>, and multiple rows result in an incorrect-result-size
+  exception. That is useful when absence means a data invariant was violated. For a normal optional
+  lookup, express optionality intentionally.
+</p>
+
+<div class="warn">
+  <strong>SQL NULL and no row are different</strong>
+  <p>
+    A scalar query can return one row whose value is SQL <code>NULL</code>, or no row at all. Java
+    primitive getters such as <code>getLong</code> return zero for SQL NULL, so call
+    <code>wasNull()</code> or use typed <code>getObject</code> for nullable numeric values.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Nullable typed extraction</b></figcaption>
+  <pre><code>Long managerId = rs.getObject("manager_id", Long.class);
+Instant deletedAt = rs.getObject("deleted_at", OffsetDateTime.class) == null
+    ? null
+    : rs.getObject("deleted_at", OffsetDateTime.class).toInstant();</code></pre>
+</figure>
+
+<h2 id="row-mappers"><span class="num">10.</span> RowMapper and result extraction</h2>
+<p class="lead">
+  A <code>RowMapper&lt;T&gt;</code> maps the current row to one object. Spring advances the result
+  set and calls it once per row.
+</p>
+
+<ul class="clean">
+  <li>Read columns by stable alias instead of fragile numeric position.</li>
+  <li>List columns explicitly instead of using <code>select *</code>.</li>
+  <li>Keep mapper code deterministic and free of database calls.</li>
+  <li>Use immutable records or values when they match the result shape.</li>
+  <li>Create purpose-specific projections instead of partially populated domain objects.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>A reusable mapper with explicit aliases</b></figcaption>
+  <pre><code>private static final RowMapper&lt;OrderView&gt; ORDER_VIEW_MAPPER = (rs, rowNum) -&gt;
+    new OrderView(
+        rs.getLong("order_id"),
+        rs.getString("customer_email"),
+        rs.getBigDecimal("total_amount"),
+        rs.getObject("placed_at", OffsetDateTime.class).toInstant()
+    );</code></pre>
+</figure>
+
+<h3 id="one-to-many-mapping">One-to-many results</h3>
+<p>
+  A join can return one order row per item. A <code>RowMapper&lt;Order&gt;</code> would then produce
+  duplicate orders. Use a <code>ResultSetExtractor</code> to aggregate ordered rows, query parent
+  and children separately in a bounded way, or return a flat reporting projection.
+</p>
+
+<figure class="code">
+  <figcaption><b>Ordered aggregation sketch</b></figcaption>
+  <pre><code>return jdbc.query(sql, rs -&gt; {
+    Map&lt;Long, MutableOrder&gt; grouped = new LinkedHashMap&lt;&gt;();
+    while (rs.next()) {
+        long orderId = rs.getLong("order_id");
+        MutableOrder order = grouped.computeIfAbsent(orderId, ignored -&gt;
+            mapOrder(rs)
+        );
+        order.addItem(mapItem(rs));
+    }
+    return grouped.values().stream().map(MutableOrder::freeze).toList();
+});</code></pre>
+</figure>
+
+<p>
+  The SQL should order by the grouping key when the extractor depends on contiguous rows. Bound the
+  result set because aggregation retains objects in memory.
+</p>
+
+<h3 id="automatic-mappers">Automatic property mapping</h3>
+<p>
+  <code>BeanPropertyRowMapper</code> and <code>DataClassRowMapper</code> reduce mapping code for
+  simple projections. Explicit mappers are safer when conversions, required columns, domain types,
+  or schema evolution matter. Reflection convenience should not hide an unclear data contract.
+</p>
+
+<h2 id="named-parameters"><span class="num">11.</span> NamedParameterJdbcTemplate</h2>
+<p class="lead">
+  <code>NamedParameterJdbcTemplate</code> replaces positional question marks with descriptive
+  parameter names and delegates to a wrapped <code>JdbcTemplate</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>Readable named parameters</b></figcaption>
+  <pre><code>List&lt;CustomerSummary&gt; search(Set&lt;String&gt; statuses, Instant createdAfter) {
+    String sql = """
+        select id, email, display_name
+        from customer
+        where status in (:statuses)
+          and created_at &gt;= :createdAfter
+        order by created_at, id
+        """;
+
+    var parameters = new MapSqlParameterSource()
+        .addValue("statuses", statuses)
+        .addValue("createdAfter", Timestamp.from(createdAfter));
+
+    return namedJdbc.query(sql, parameters, CUSTOMER_SUMMARY_MAPPER);
+}</code></pre>
+</figure>
+
+<p>
+  Named parameters reduce swapped-parameter errors and support expanding a collection for an
+  <code>IN</code> predicate. An empty collection may produce invalid SQL or unwanted semantics, so
+  define the empty case in Java. Very large lists should use another design, such as a temporary
+  table, array parameter, staged data, or a joined relation.
+</p>
+
+<div class="key">
+  <strong>Names are rewritten, not sent as native named placeholders</strong>
+  <p>
+    Spring parses named SQL into JDBC positional placeholders and prepares the resulting statement.
+    A value still becomes a bound parameter, with the same separation between SQL and data.
+  </p>
+</div>
+
+<h2 id="updates"><span class="num">12.</span> Updates, row counts, and generated keys</h2>
+<p class="lead">
+  An update's affected-row count is part of its correctness contract. Check it when the operation
+  expects exactly one row.
+</p>
+
+<figure class="code">
+  <figcaption><b>Optimistic update</b></figcaption>
+  <pre><code>boolean rename(long id, int expectedVersion, String newName) {
+    int changed = jdbc.update("""
+        update customer
+        set display_name = ?, version = version + 1
+        where id = ? and version = ?
+        """, newName, id, expectedVersion);
+
+    if (changed &gt; 1) {
+        throw new IncorrectUpdateSemanticsDataAccessException(
+            "Customer identity was not unique"
+        );
+    }
+    return changed == 1;
+}</code></pre>
+</figure>
+
+<p>
+  Zero rows can mean not found, stale version, or a predicate that no longer matches. Decide whether
+  the application needs to distinguish those outcomes. A second query can distinguish them but
+  introduces another concurrency observation, so design the API carefully.
+</p>
+
+<h3 id="generated-keys">Generated keys</h3>
+<figure class="code">
+  <figcaption><b>Portable Spring JDBC key capture</b></figcaption>
+  <pre><code>long insert(CustomerDraft draft) {
+    var keys = new GeneratedKeyHolder();
+
+    jdbc.update(connection -&gt; {
+        PreparedStatement statement = connection.prepareStatement("""
+            insert into customer (email, display_name, status)
+            values (?, ?, ?)
+            """, new String[] {"id"});
+        statement.setString(1, draft.email());
+        statement.setString(2, draft.displayName());
+        statement.setString(3, "ACTIVE");
+        return statement;
+    }, keys);
+
+    Number id = Objects.requireNonNull(keys.getKey(), "Database returned no id");
+    return id.longValue();
+}</code></pre>
+</figure>
+
+<p>
+  PostgreSQL also supports <code>INSERT ... RETURNING</code>, which can return one or several
+  generated or defaulted columns and map them like a query:
+</p>
+
+<figure class="code">
+  <figcaption><b>PostgreSQL RETURNING</b></figcaption>
+  <pre><code>Customer insert(CustomerDraft draft) {
+    return jdbc.queryForObject("""
+        insert into customer (email, display_name, status)
+        values (?, ?, 'ACTIVE')
+        returning id, email, display_name, status, version, created_at
+        """, CUSTOMER_MAPPER, draft.email(), draft.displayName());
+}</code></pre>
+</figure>
+
+<p>
+  <code>RETURNING</code> avoids a follow-up select and captures server defaults from the same
+  statement. It is PostgreSQL-specific, which is acceptable when the system intentionally targets
+  PostgreSQL.
+</p>
+
+<h2 id="batching"><span class="num">13.</span> Batch operations</h2>
+<p class="lead">
+  Batching sends repeated DML work with fewer client-server round trips. It does not automatically
+  make a large operation atomic and it does not remove database work.
+</p>
+
+<figure class="code">
+  <figcaption><b>Named-parameter batch insert</b></figcaption>
+  <pre><code>int[] insertAll(List&lt;CustomerDraft&gt; drafts) {
+    String sql = """
+        insert into customer (email, display_name, status)
+        values (:email, :displayName, 'ACTIVE')
+        """;
+
+    SqlParameterSource[] batch = drafts.stream()
+        .map(draft -&gt; new MapSqlParameterSource()
+            .addValue("email", draft.email())
+            .addValue("displayName", draft.displayName()))
+        .toArray(SqlParameterSource[]::new);
+
+    return namedJdbc.batchUpdate(sql, batch);
+}</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>Choose a bounded chunk size through measurement.</li>
+  <li>Wrap related batches in one intentional transaction if all-or-nothing is required.</li>
+  <li>Inspect returned update counts when individual outcomes matter.</li>
+  <li>Specify SQL types for ambiguous null batch values if driver inference is unreliable.</li>
+  <li>Do not include <code>SELECT</code> statements in a JDBC update batch.</li>
+  <li>For very large PostgreSQL ingestion, benchmark <code>COPY</code> against batches.</li>
+</ul>
+
+<h3 id="postgres-batch-rewrite">pgJDBC batch rewrite</h3>
+<p>
+  The pgJDBC <code>reWriteBatchedInserts=true</code> connection property can rewrite compatible
+  batches into multi-value inserts and reduce round trips. Treat it as a measured driver-level
+  optimization. Verify generated-key behavior, statement compatibility, failure reporting, and
+  memory use for the driver version managed by the application.
+</p>
+
+<div class="warn">
+  <strong>One giant batch is not a strategy</strong>
+  <p>
+    Huge batches retain parameter data, hold locks and a connection longer, create large
+    transactions and WAL bursts, and make retries expensive. Bounded chunks provide predictable
+    memory and failure recovery.
+  </p>
+</div>
+
+<h2 id="exceptions"><span class="num">14.</span> Exception translation</h2>
+<p class="lead">
+  Spring translates checked <code>SQLException</code> failures into the unchecked
+  <code>DataAccessException</code> hierarchy, which expresses failure categories independently of a
+  particular database API.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Exception family</th>
+        <th>Meaning</th>
+        <th>Typical response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>DuplicateKeyException</code></td>
+        <td>Unique or primary-key conflict</td>
+        <td>Map known constraint to a domain conflict</td>
+      </tr>
+      <tr>
+        <td><code>DataIntegrityViolationException</code></td>
+        <td>Broader integrity violation</td>
+        <td>Inspect known operation context, do not expose raw SQL</td>
+      </tr>
+      <tr>
+        <td><code>BadSqlGrammarException</code></td>
+        <td>Invalid SQL or missing object</td>
+        <td>Programming or deployment defect</td>
+      </tr>
+      <tr>
+        <td><code>QueryTimeoutException</code></td>
+        <td>Statement exceeded timeout</td>
+        <td>Abort work, observe, retry only if safe</td>
+      </tr>
+      <tr>
+        <td><code>CannotAcquireLockException</code></td>
+        <td>Lock acquisition failure</td>
+        <td>Bounded retry for an idempotent transaction</td>
+      </tr>
+      <tr>
+        <td><code>PessimisticLockingFailureException</code></td>
+        <td>Broader lock or serialization failure</td>
+        <td>Roll back, diagnose contention, and consider bounded retry</td>
+      </tr>
+      <tr>
+        <td><code>TransientDataAccessException</code></td>
+        <td>Potentially temporary category</td>
+        <td>Retry only with policy, budget, and idempotency</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Current Spring Framework versions use JDBC 4 exception subclasses with SQL-state fallback by
+  default. Translation allows repository code to avoid driver-specific catch blocks. It does not
+  mean every database error can be handled generically.
+</p>
+
+<div class="warn">
+  <strong>Never retry blindly</strong>
+  <p>
+    A retry repeats the whole transaction after rollback, not merely the failed SQL line. Use a
+    small attempt limit, exponential backoff with jitter, an overall deadline, and idempotent
+    business semantics. Connection failures can be ambiguous if the server committed but the
+    acknowledgment was lost.
+  </p>
+</div>
+
+<h2 id="transactions"><span class="num">15.</span> Transaction boundaries</h2>
+<p class="lead">
+  A transaction boundary should surround one business operation that must preserve a database
+  invariant. It normally belongs on a public application-service method, not around each repository
+  statement.
+</p>
+
+<figure class="code">
+  <figcaption><b>A service-owned transaction</b></figcaption>
+  <pre><code>@Service
+final class TransferService {
+    private final AccountRepository accounts;
+    private final OutboxRepository outbox;
+
+    TransferService(AccountRepository accounts, OutboxRepository outbox) {
+        this.accounts = accounts;
+        this.outbox = outbox;
+    }
+
+    @Transactional
+    public void transfer(long fromId, long toId, BigDecimal amount) {
+        int debited = accounts.debitIfEnough(fromId, amount);
+        if (debited != 1) {
+            throw new InsufficientFundsException(fromId);
+        }
+
+        accounts.credit(toId, amount);
+        outbox.append(new TransferCompleted(fromId, toId, amount));
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Spring's default transaction propagation is <code>REQUIRED</code>. The method joins an existing
+  transaction or creates one. By default, unchecked exceptions and <code>Error</code> trigger
+  rollback, while checked exceptions do not. Configure rollback rules when the business exception
+  model requires different behavior.
+</p>
+
+<h3 id="transaction-proxy">Proxy behavior</h3>
+<p>
+  Declarative transactions usually run through a Spring AOP proxy. A call from another bean enters
+  the proxy and receives transaction advice. Self-invocation, where one method calls another method
+  on <code>this</code>, bypasses the proxy, so an annotation on the inner method does not create new
+  transactional behavior in default proxy mode.
+</p>
+
+<h3 id="transaction-duration">Keep transactions short</h3>
+<ul class="clean">
+  <li>Do validation that needs no database access before opening the transaction.</li>
+  <li>Do not hold a database transaction while waiting for a user.</li>
+  <li>Avoid remote HTTP calls inside a transaction.</li>
+  <li>Use database statement and lock timeouts.</li>
+  <li>Access rows in a consistent order to reduce deadlocks.</li>
+  <li>Move reliable external side effects through an outbox or equivalent pattern.</li>
+</ul>
+
+<p>
+  A transaction occupies a connection and may retain locks, row versions, and database resources.
+  Long transactions reduce pool capacity and can interfere with PostgreSQL vacuum progress.
+</p>
+
+<h3 id="programmatic-transaction">Programmatic boundaries</h3>
+<p>
+  <code>TransactionTemplate</code> is useful when code needs an explicit small scope, sequential
+  transactions, or a commit before a later non-transactional action. Keep the boundary readable and
+  do not mix manual <code>Connection.commit()</code> with Spring-managed transactions.
+</p>
+
+<h2 id="query-safety"><span class="num">16.</span> Query safety and SQL injection</h2>
+<p class="lead">
+  Bind every untrusted value through a prepared-statement parameter. Parameters represent data,
+  while the SQL string defines executable structure.
+</p>
+
+<figure class="code">
+  <figcaption><b>Unsafe and safe predicates</b></figcaption>
+  <pre><code>// Unsafe: attacker input becomes SQL syntax.
+String unsafe = "select * from customer where email = '" + email + "'";
+
+// Safe: the driver binds email as a value.
+return jdbc.query(
+    "select id, email from customer where email = ?",
+    CUSTOMER_MAPPER,
+    email
+);</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Parameters cannot replace SQL identifiers</strong>
+  <p>
+    A placeholder cannot safely represent a table name, column name, direction keyword, or arbitrary
+    SQL fragment. Map a client value to a closed server-side allowlist, such as
+    <code>"created" -&gt; "created_at"</code>, then concatenate only the trusted constant.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Allowlisted sorting</b></figcaption>
+  <pre><code>private static final Map&lt;String, String&gt; SORT_COLUMNS = Map.of(
+    "created", "created_at",
+    "email", "email"
+);
+
+String column = Optional.ofNullable(SORT_COLUMNS.get(requestedSort))
+    .orElseThrow(InvalidSortException::new);
+String direction = ascending ? "asc" : "desc";
+
+String sql = """
+    select id, email, display_name
+    from customer
+    order by %s %s, id %s
+    limit ?
+    """.formatted(column, direction, direction);</code></pre>
+</figure>
+
+<p>
+  Prepared statements prevent value injection, but authorization remains separate. A safe query can
+  still disclose another tenant's data if it omits the tenant predicate. Carry trusted tenant
+  identity from authentication and include it in every relevant read and write.
+</p>
+
+<h2 id="resource-management"><span class="num">17.</span> Resource management and streaming</h2>
+<p class="lead">
+  Templates close ordinary JDBC statements and result sets, and release connections correctly.
+  Results that escape as a stream or callback-driven cursor have a longer resource lifetime.
+</p>
+
+<ul class="clean">
+  <li>Consume a JDBC-backed <code>Stream</code> in try-with-resources.</li>
+  <li>Keep the transaction and connection open until streaming is complete.</li>
+  <li>Set an appropriate fetch size and test driver behavior.</li>
+  <li>Do not return a lazy stream through a web layer without explicit lifecycle control.</li>
+  <li>Prefer bounded pagination for ordinary APIs.</li>
+  <li>Cancel or time out abandoned work so the connection returns to the pool.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Scoped stream consumption</b></figcaption>
+  <pre><code>@Transactional(readOnly = true)
+public void exportActiveCustomers(Consumer&lt;CustomerSummary&gt; sink) {
+    try (Stream&lt;CustomerSummary&gt; rows = jdbc.queryForStream(
+        """
+        select id, email, display_name
+        from customer
+        where status = 'ACTIVE'
+        order by id
+        """,
+        CUSTOMER_SUMMARY_MAPPER
+    )) {
+        rows.forEach(sink);
+    }
+}</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Streaming is not free memory</strong>
+  <p>
+    It reduces application materialization but holds a connection and transaction. Slow output can
+    create backpressure all the way to the pool. For large exports, consider an asynchronous job,
+    snapshot strategy, object storage, and bounded chunks.
+  </p>
+</div>
+
+<h2 id="postgresql-types"><span class="num">18.</span> PostgreSQL-specific integration</h2>
+<p class="lead">
+  JDBC covers common relational types, while PostgreSQL offers useful types and SQL features that
+  sometimes require deliberate mapping.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>PostgreSQL type</th>
+        <th>Java direction</th>
+        <th>Guidance</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>bigint</code></td>
+        <td><code>long</code> or <code>Long</code></td>
+        <td>Use wrapper for nullable values</td>
+      </tr>
+      <tr>
+        <td><code>numeric</code></td>
+        <td><code>BigDecimal</code></td>
+        <td>Do not use binary floating point for money</td>
+      </tr>
+      <tr>
+        <td><code>uuid</code></td>
+        <td><code>UUID</code></td>
+        <td>Use typed getObject and setObject where supported</td>
+      </tr>
+      <tr>
+        <td><code>date</code></td>
+        <td><code>LocalDate</code></td>
+        <td>No time zone or time of day</td>
+      </tr>
+      <tr>
+        <td><code>timestamptz</code></td>
+        <td><code>OffsetDateTime</code> or normalized <code>Instant</code></td>
+        <td>Make conversion policy explicit</td>
+      </tr>
+      <tr>
+        <td><code>jsonb</code></td>
+        <td>JSON string, driver object, or custom mapper</td>
+        <td>Validate shape and use JSON operators intentionally</td>
+      </tr>
+      <tr>
+        <td>array</td>
+        <td><code>java.sql.Array</code> or supported binding</td>
+        <td>Free manually created JDBC arrays when responsible</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>PostgreSQL JSONB binding with an explicit cast</b></figcaption>
+  <pre><code>namedJdbc.update("""
+    update customer
+    set preferences = cast(:preferences as jsonb)
+    where id = :id
+    """,
+    new MapSqlParameterSource()
+        .addValue("preferences", objectMapper.writeValueAsString(preferences))
+        .addValue("id", id)
+);</code></pre>
+</figure>
+
+<p>
+  Avoid storing data as JSON only to escape schema design. Use <code>jsonb</code> when document-like
+  attributes genuinely vary, and add expression or GIN indexes for measured access paths.
+</p>
+
+<h3 id="postgresql-upsert">Atomic upsert</h3>
+<figure class="code">
+  <figcaption><b>Conflict-safe insert or update</b></figcaption>
+  <pre><code>insert into idempotency_record (scope, request_key, request_hash, status)
+values (:scope, :key, :hash, 'STARTED')
+on conflict (scope, request_key) do nothing</code></pre>
+</figure>
+
+<p>
+  Let a unique constraint arbitrate concurrency. A preceding "does it exist?" query has a race
+  because another transaction can insert between the check and write.
+</p>
+
+<h3 id="large-objects">Large values</h3>
+<p>
+  JDBC supports binary and character streams, but storing large user files directly in frequently
+  accessed tables can inflate backups, replication, and query I/O. Object storage plus database
+  metadata is often a better architecture. When the database is appropriate, stream with explicit
+  size limits and do not materialize unbounded content.
+</p>
+
+<h2 id="performance"><span class="num">19.</span> Performance engineering</h2>
+<p class="lead">
+  Database performance comes primarily from correct data modeling, selective SQL, useful indexes,
+  bounded work, short transactions, and measured capacity. A template call is rarely the main cost.
+</p>
+
+<h3 id="query-shape">Query shape</h3>
+<ul class="clean">
+  <li>Select only needed columns.</li>
+  <li>Filter and aggregate in PostgreSQL when it reduces transferred data correctly.</li>
+  <li>Use deterministic ordering for pages.</li>
+  <li>Avoid one query per row by fetching the required relation in a set-oriented query.</li>
+  <li>Use <code>EXPLAIN (ANALYZE, BUFFERS)</code> in a safe representative environment.</li>
+  <li>Keep table statistics current and inspect actual versus estimated row counts.</li>
+</ul>
+
+<h3 id="pagination-performance">Pagination</h3>
+<p>
+  Offset pagination is convenient but deep offsets still make PostgreSQL find and discard earlier
+  rows. Keyset pagination continues after the ordered key and is usually more stable for large,
+  changing datasets.
+</p>
+
+<figure class="code">
+  <figcaption><b>Keyset page with a deterministic tie-breaker</b></figcaption>
+  <pre><code>select id, email, created_at
+from customer
+where (created_at, id) &lt; (:cursorCreatedAt, :cursorId)
+order by created_at desc, id desc
+limit :limit</code></pre>
+</figure>
+
+<p>
+  The supporting index should follow the filtering and ordering access path. Encode and validate the
+  cursor as an opaque API token. Request one extra row to determine whether a next cursor exists.
+</p>
+
+<h3 id="timeouts">Timeout hierarchy</h3>
+<ul class="clean">
+  <li>The incoming request deadline is the outer budget.</li>
+  <li>Connection acquisition timeout must leave time for query execution and response work.</li>
+  <li>Statement timeout stops unexpectedly expensive SQL.</li>
+  <li>Lock timeout limits waiting for contested locks.</li>
+  <li>Transaction timeout bounds the complete transactional unit.</li>
+</ul>
+
+<p>
+  A JDBC timeout may rely on driver cancellation and is not a guarantee of instantaneous server-side
+  termination. PostgreSQL <code>statement_timeout</code> provides a server-enforced safeguard. Set
+  it per role, transaction, or connection with clear ownership and verify interaction with pooling.
+</p>
+
+<h3 id="prepared-statements">Prepared statement behavior</h3>
+<p>
+  pgJDBC can switch repeated prepared statements to server-prepared execution based on its
+  <code>prepareThreshold</code>. This may reduce parse work and enable binary transfer, but generic
+  versus custom planning can affect data-skewed queries. Do not tune it without measurements from
+  representative parameters and driver documentation.
+</p>
+
+<h2 id="production"><span class="num">20.</span> Production operations and observability</h2>
+<p class="lead">
+  Operate the pool, driver, SQL, and PostgreSQL as one dependency chain. Observe saturation and
+  latency before users experience timeouts.
+</p>
+
+<ul class="clean">
+  <li>Measure active, idle, maximum, pending, and timed-out pool acquisitions.</li>
+  <li>Measure query latency by operation name, not raw SQL containing values.</li>
+  <li>Track errors by translated category and PostgreSQL SQL state.</li>
+  <li>Watch database connections, CPU, I/O, locks, deadlocks, and long transactions.</li>
+  <li>
+    Use slow-query tooling and <code>pg_stat_statements</code> where operational policy permits.
+  </li>
+  <li>Correlate a request trace with repository operation and database session metadata.</li>
+  <li>Alert on trends and exhausted budgets, not only process health.</li>
+</ul>
+
+<div class="warn">
+  <strong>Do not log secrets or sensitive parameters</strong>
+  <p>
+    SQL debug logging and proxy drivers can expose passwords, tokens, personal data, and financial
+    values. Prefer named operation metrics, normalized SQL fingerprints, parameter counts, and
+    carefully redacted diagnostics.
+  </p>
+</div>
+
+<h3 id="health-checks">Health checks</h3>
+<p>
+  Liveness should answer whether the process must restart. It should not fail only because the
+  database is briefly unavailable. Readiness may reflect whether the instance can serve
+  database-dependent traffic, but frequent probes must not create a connection storm or make a
+  dependency outage worse.
+</p>
+
+<h3 id="shutdown">Graceful shutdown</h3>
+<p>
+  Stop accepting new work, allow bounded in-flight requests to finish, stop workers, and close the
+  application context so HikariCP closes physical connections. Deployment grace periods must exceed
+  the intended request drain window but remain bounded.
+</p>
+
+<h3 id="failure-diagnosis">Connection timeout diagnostic order</h3>
+<ol class="clean">
+  <li>Check pool pending, active, idle, and maximum counts.</li>
+  <li>Find long requests, transactions, streams, and leaked handles.</li>
+  <li>Inspect slow queries, blocked sessions, deadlocks, and database resource pressure.</li>
+  <li>Check network, TLS, authentication, and database connection limits.</li>
+  <li>Compare total connection budgets across application replicas.</li>
+  <li>Change pool size only after identifying the actual bottleneck.</li>
+</ol>
+
+<h2 id="testing"><span class="num">21.</span> Testing database code</h2>
+<p class="lead">
+  Test at several levels. Pure unit tests cover mapping and service decisions quickly. Integration
+  tests against PostgreSQL verify the SQL, schema, driver, constraints, transactions, and type
+  behavior that mocks cannot prove.
+</p>
+
+<h3 id="unit-tests">Unit tests</h3>
+<ul class="clean">
+  <li>Keep complex SQL result calculations in testable domain functions when possible.</li>
+  <li>Test service rollback behavior through integration tests, not only mock verification.</li>
+  <li>Avoid mocking fluent JDBC internals or <code>ResultSet</code> extensively.</li>
+  <li>If a mapper has meaningful conversion logic, test it with a small supported fixture.</li>
+</ul>
+
+<h3 id="jdbc-test-slice">@JdbcTest slice</h3>
+<p>
+  Spring Boot's <code>@JdbcTest</code> loads a focused JDBC test context and is transactional by
+  default. Depending on test configuration, Boot may replace the application data source with an
+  embedded database. That is fast, but an embedded database does not prove PostgreSQL SQL or type
+  behavior.
+</p>
+
+<h3 id="testcontainers">PostgreSQL integration with Testcontainers</h3>
+<figure class="code">
+  <figcaption><b>Real PostgreSQL repository test</b></figcaption>
+  <pre><code>@JdbcTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+class CustomerRepositoryTest {
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer postgres =
+        new PostgreSQLContainer("postgres:18");
+
+    @Autowired JdbcTemplate jdbc;
+
+    @Test
+    void insertReturnsDatabaseGeneratedValues() {
+        CustomerRepository repository = new CustomerRepository(jdbc);
+
+        Customer saved = repository.insert(
+            new CustomerDraft("reader@example.com", "Reader")
+        );
+
+        assertThat(saved.id()).isPositive();
+        assertThat(saved.status()).isEqualTo("ACTIVE");
+        assertThat(saved.createdAt()).isNotNull();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Use the PostgreSQL major version deployed in production, apply real migrations, and let Boot's
+  service-connection support provide dynamic connection details when available. Otherwise,
+  <code>@DynamicPropertySource</code> can publish the container URL, username, and password.
+  <code>@ServiceConnection</code> requires Spring Boot's <code>spring-boot-testcontainers</code>
+  test module. The test also needs the current Testcontainers JUnit and PostgreSQL modules plus the
+  PostgreSQL JDBC driver, preferably under the Boot-managed dependency set.
+</p>
+
+<h3 id="test-isolation">Isolation strategies</h3>
+<ul class="clean">
+  <li>Transactional rollback is fast for tests running on the test thread.</li>
+  <li>
+    Work committed by another thread or server request is not rolled back by the test transaction.
+  </li>
+  <li>Truncate owned tables between tests when commit behavior must be tested.</li>
+  <li>Use unique business keys to allow safe parallel execution.</li>
+  <li>Reset sequences only when exact identifiers are part of the intended contract.</li>
+  <li>Never point automated integration tests at a shared production-like database.</li>
+</ul>
+
+<h3 id="database-test-cases">High-value database test cases</h3>
+<ol class="clean">
+  <li>Zero, one, and multiple-row cardinality.</li>
+  <li>SQL NULL mapping for every nullable type.</li>
+  <li>Unique, foreign-key, check, and not-null constraint translation.</li>
+  <li>Generated defaults and PostgreSQL <code>RETURNING</code>.</li>
+  <li>Rollback after a later statement fails.</li>
+  <li>Optimistic update conflict under concurrent versions.</li>
+  <li>Batch partial failure and retry semantics.</li>
+  <li>Time zone, decimal precision, UUID, JSONB, and array mappings.</li>
+  <li>Pagination stability with duplicate sort values.</li>
+  <li>Migration compatibility with the application build.</li>
+</ol>
+
+<h2 id="jdbc-vs-orm"><span class="num">22.</span> When JDBC is preferable to an ORM</h2>
+<p class="lead">
+  Choose the abstraction that makes the important behavior clearest. JDBC favors explicit SQL and
+  result shapes. An ORM favors entity state, relationships, and persistence-context behavior.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Prefer Spring JDBC when</th>
+        <th>Consider JPA or another ORM when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>SQL control is central to performance or correctness</td>
+        <td>The domain has rich entity relationships and aggregate updates</td>
+      </tr>
+      <tr>
+        <td>Queries return reporting or API-specific projections</td>
+        <td>Most work is ordinary entity create, read, update, and delete</td>
+      </tr>
+      <tr>
+        <td>The application uses PostgreSQL-specific SQL deliberately</td>
+        <td>Database portability is an actual supported requirement</td>
+      </tr>
+      <tr>
+        <td>Bulk updates and set-oriented operations dominate</td>
+        <td>Dirty checking simplifies a stateful transactional use case</td>
+      </tr>
+      <tr>
+        <td>Predictable queries and no persistence context are desired</td>
+        <td>Identity mapping and managed entity lifecycle provide value</td>
+      </tr>
+      <tr>
+        <td>The team is strong in SQL and relational modeling</td>
+        <td>The team accepts ORM internals and query-plan responsibility</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Both approaches can coexist. A system might use JPA for an aggregate write model and Spring JDBC
+  for reporting projections. Keep transaction ownership and data-source use coherent, and do not
+  hide one abstraction behind misleading repository contracts.
+</p>
+
+<div class="key">
+  <strong>JDBC does not eliminate object-relational design</strong>
+  <p>
+    You still decide how rows become values, where aggregate boundaries live, how concurrency is
+    controlled, and how schema evolution affects code. JDBC makes these choices explicit.
+  </p>
+</div>
+
+<h2 id="architecture"><span class="num">23.</span> Production repository design</h2>
+<p class="lead">
+  A good repository exposes domain-relevant persistence operations and keeps SQL close to its
+  mapping and cardinality rules.
+</p>
+
+<figure class="code">
+  <figcaption><b>Repository with named SQL and explicit contracts</b></figcaption>
+  <pre><code>@Repository
+final class AccountRepository {
+    private static final String FIND_FOR_UPDATE = """
+        select id, balance, version
+        from account
+        where id = :id
+        for update
+        """;
+
+    private final NamedParameterJdbcTemplate jdbc;
+
+    AccountRepository(NamedParameterJdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    Optional&lt;AccountBalance&gt; findForUpdate(long id) {
+        List&lt;AccountBalance&gt; rows = jdbc.query(
+            FIND_FOR_UPDATE,
+            Map.of("id", id),
+            (rs, rowNum) -&gt; new AccountBalance(
+                rs.getLong("id"),
+                rs.getBigDecimal("balance"),
+                rs.getInt("version")
+            )
+        );
+        return DataAccessUtils.optionalResult(rows);
+    }
+
+    int debitIfEnough(long id, BigDecimal amount) {
+        return jdbc.update("""
+            update account
+            set balance = balance - :amount,
+                version = version + 1
+            where id = :id and balance &gt;= :amount
+            """,
+            Map.of("id", id, "amount", amount)
+        );
+    }
+}</code></pre>
+</figure>
+
+<h3 id="atomic-statements">Prefer atomic SQL when it expresses the invariant</h3>
+<p>
+  The conditional debit combines check and update in one statement, so concurrent transactions
+  cannot both pass a stale Java-side balance check. Database constraints should still protect
+  invariants such as non-negative balance where the business rule is universal.
+</p>
+
+<h3 id="sql-organization">Organizing SQL</h3>
+<ul class="clean">
+  <li>Keep short SQL next to the repository operation.</li>
+  <li>Give long statements descriptive constants or dedicated resource files.</li>
+  <li>Format and review SQL as first-class code.</li>
+  <li>Version SQL changes with application and migration changes.</li>
+  <li>Use stable operation names for metrics.</li>
+  <li>Do not create a homemade string-concatenation query language.</li>
+</ul>
+
+<h2 id="edge-cases"><span class="num">24.</span> Edge cases to understand</h2>
+
+<h3 id="edge-ddl">DDL and transactions</h3>
+<p>
+  PostgreSQL supports transactional DDL for many operations, but migration tools, locks, concurrent
+  index operations, and external effects have special behavior. Keep schema migration ownership
+  separate from request-time repository transactions.
+</p>
+
+<h3 id="edge-cancel">Cancellation and ambiguous outcomes</h3>
+<p>
+  If a network connection fails after a write was sent, the client may not know whether PostgreSQL
+  committed it. Use idempotency keys, unique constraints, and an operation-status lookup for
+  retryable commands. A transport error does not always mean "nothing happened."
+</p>
+
+<h3 id="edge-time">Time zones</h3>
+<p>
+  Define what every timestamp means. Store instants for events, use <code>timestamptz</code>, and
+  convert at presentation boundaries. A calendar date or local appointment time is a different
+  domain type and should not be forced into an instant.
+</p>
+
+<h3 id="edge-decimals">Numeric precision</h3>
+<p>
+  Use <code>BigDecimal</code> with deliberate scale and rounding for decimal business values.
+  PostgreSQL <code>numeric</code> can exceed Java decimal expectations, so validate ranges and
+  preserve the database constraint.
+</p>
+
+<h3 id="edge-concurrency">Lost updates</h3>
+<p>
+  A read-modify-write sequence can overwrite a concurrent change. Use a version predicate, a row
+  lock for a short transaction, or an atomic update expression. Choose based on contention, conflict
+  handling, and the invariant.
+</p>
+
+<h3 id="edge-read-only">Read-only transactions</h3>
+<p>
+  <code>@Transactional(readOnly = true)</code> communicates intent and may allow optimizations, but
+  do not treat it as the sole authorization control. Enforce write restrictions with architecture,
+  database roles, routing, and tests where required.
+</p>
+
+<h3 id="edge-in-clause">Dynamic predicates</h3>
+<p>
+  Build optional filters from a controlled set of SQL fragments and keep values bound. If filter
+  combinations become complex, use a deliberate query builder or specification layer that still
+  preserves parameterization and inspectable SQL.
+</p>
+
+<h2 id="mistakes"><span class="num">25.</span> Common mistakes and fixes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Concatenating request values into SQL</td>
+        <td>Creates injection and quoting defects</td>
+        <td>Bind values and allowlist identifiers</td>
+      </tr>
+      <tr>
+        <td>Using <code>queryForObject</code> for optional data</td>
+        <td>Normal absence becomes an exception path</td>
+        <td>Express zero-or-one cardinality</td>
+      </tr>
+      <tr>
+        <td>Ignoring update counts</td>
+        <td>Not-found and concurrency conflicts look successful</td>
+        <td>Assert the expected count</td>
+      </tr>
+      <tr>
+        <td>Caching a connection in a field</td>
+        <td>Shares mutable session and transaction state</td>
+        <td>Let the template acquire it per operation</td>
+      </tr>
+      <tr>
+        <td>Remote calls inside a transaction</td>
+        <td>Holds locks and pool capacity during network waits</td>
+        <td>Use short database work plus an outbox</td>
+      </tr>
+      <tr>
+        <td>Making the pool very large</td>
+        <td>Moves contention into PostgreSQL</td>
+        <td>Budget and load-test the whole system</td>
+      </tr>
+      <tr>
+        <td>Testing PostgreSQL SQL only on H2</td>
+        <td>Dialect, types, constraints, and locking differ</td>
+        <td>Use real PostgreSQL integration tests</td>
+      </tr>
+      <tr>
+        <td>Mapping joined rows one by one</td>
+        <td>Duplicates parent objects</td>
+        <td>Aggregate with a result extractor or projection</td>
+      </tr>
+      <tr>
+        <td>Using <code>select *</code></td>
+        <td>Couples mapping to unintended schema changes</td>
+        <td>Select and alias the contract explicitly</td>
+      </tr>
+      <tr>
+        <td>Retrying every data-access exception</td>
+        <td>Repeats permanent or non-idempotent failures</td>
+        <td>Retry a narrow transient category with a budget</td>
+      </tr>
+      <tr>
+        <td>Assuming self-invoked <code>@Transactional</code> works</td>
+        <td>The default proxy is bypassed</td>
+        <td>Move the boundary to an externally invoked service</td>
+      </tr>
+      <tr>
+        <td>No statement timeout</td>
+        <td>Runaway work can monopolize resources</td>
+        <td>Set layered, tested time budgets</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="security"><span class="num">26.</span> Security checklist</h2>
+<ul class="clean">
+  <li>Use prepared parameters for every untrusted value.</li>
+  <li>Allowlist dynamic identifiers, operators, and directions.</li>
+  <li>Authorize at the service boundary and include tenant scope in SQL.</li>
+  <li>Use separate least-privilege runtime and migration roles.</li>
+  <li>Require verified TLS across untrusted networks.</li>
+  <li>Keep credentials out of source control, logs, and diagnostics.</li>
+  <li>Rotate secrets and use short-lived credentials when the platform supports them.</li>
+  <li>Limit returned columns and redact sensitive values.</li>
+  <li>Enforce critical invariants with constraints.</li>
+  <li>Bound query cost, page size, batch size, and timeout.</li>
+  <li>Patch the JDK, Spring, HikariCP, and pgJDBC through supported release lines.</li>
+  <li>Audit privileged operations with identities and safe metadata.</li>
+</ul>
+
+<h2 id="interview"><span class="num">27.</span> Interview questions and answers</h2>
+
+<h3 id="qa-1">What problems does JdbcTemplate solve?</h3>
+<p>
+  It controls repetitive JDBC resource acquisition, statement execution, result-set iteration,
+  cleanup, transaction participation, and exception translation. Application code retains control of
+  SQL, binding, cardinality, and result mapping.
+</p>
+
+<h3 id="qa-2">Is JdbcTemplate thread-safe?</h3>
+<p>
+  A fully configured <code>JdbcTemplate</code> is thread-safe and normally shared as a singleton. It
+  does not store one mutable connection per caller. It obtains the appropriate connection for each
+  operation, including a transaction-bound connection.
+</p>
+
+<h3 id="qa-3">DataSource versus DriverManager?</h3>
+<p>
+  Both can obtain JDBC connections, but <code>DataSource</code> is the preferred application
+  abstraction. It supports container configuration, pooling, and indirection without embedding
+  driver connection logic in repository code.
+</p>
+
+<h3 id="qa-4">What happens when a pooled connection is closed?</h3>
+<p>
+  Application code closes a proxy handle. The pool resets important state and makes the underlying
+  physical connection available for reuse. Failing to close the handle leaks pool capacity.
+</p>
+
+<h3 id="qa-5">JdbcTemplate versus NamedParameterJdbcTemplate?</h3>
+<p>
+  <code>JdbcTemplate</code> uses positional JDBC placeholders.
+  <code>NamedParameterJdbcTemplate</code> rewrites descriptive named placeholders into positional
+  placeholders and is clearer for many parameters or collections.
+</p>
+
+<h3 id="qa-6">What does RowMapper do?</h3>
+<p>
+  It maps the current result-set row into one object. Spring moves the cursor and calls the mapper
+  for every row. One-to-many aggregation usually needs a <code>ResultSetExtractor</code> or a
+  different query shape.
+</p>
+
+<h3 id="qa-7">How does Spring translate SQLExceptions?</h3>
+<p>
+  Spring's <code>SQLExceptionTranslator</code> examines JDBC exception subclasses, SQL state, and
+  configured vendor details to produce an unchecked <code>DataAccessException</code> subtype. This
+  gives callers useful categories without depending directly on a driver.
+</p>
+
+<h3 id="qa-8">Where should @Transactional be placed?</h3>
+<p>
+  Usually on a public application-service method that represents one business operation. Putting it
+  on every repository method creates statement-sized transactions and cannot protect a multi-step
+  invariant.
+</p>
+
+<h3 id="qa-9">Why can self-invocation break @Transactional?</h3>
+<p>
+  In default proxy mode, transaction advice runs when a call enters through the proxy. A method
+  calling another annotated method on the same instance does not cross that proxy.
+</p>
+
+<h3 id="qa-10">How do prepared statements prevent SQL injection?</h3>
+<p>
+  The SQL structure and parameter values travel through separate APIs. The database interprets the
+  value as data, not executable SQL syntax. Identifiers cannot be parameters and must come from
+  trusted allowlists.
+</p>
+
+<h3 id="qa-11">How do you size HikariCP?</h3>
+<p>
+  Start with a small bounded pool, account for every application replica and database consumer, then
+  load-test while observing acquisition wait, query latency, database CPU, I/O, and locks. More
+  connections can reduce performance by increasing database contention.
+</p>
+
+<h3 id="qa-12">How do you retrieve generated keys?</h3>
+<p>
+  Use a <code>KeyHolder</code> with a prepared-statement creator for JDBC-generated keys, or use
+  PostgreSQL <code>INSERT ... RETURNING</code> and map the returned row. Verify exactly which
+  columns and cardinality the operation guarantees.
+</p>
+
+<h3 id="qa-13">What is the benefit of batching?</h3>
+<p>
+  Batching reduces round trips for repeated DML. It does not remove server work, guarantee
+  atomicity, or justify unbounded input. Use bounded chunks and an explicit transaction policy.
+</p>
+
+<h3 id="qa-14">Why test with PostgreSQL instead of only an embedded database?</h3>
+<p>
+  SQL dialect, type mapping, constraints, query planning, isolation, locking, generated values, and
+  error states differ. A real PostgreSQL integration test proves the production-relevant contract.
+</p>
+
+<h3 id="qa-15">When is Spring JDBC better than JPA?</h3>
+<p>
+  It is often better when explicit SQL, predictable query shape, reporting projections, bulk
+  operations, or PostgreSQL-specific features dominate. JPA can be stronger when managed entity
+  lifecycle and relationship persistence provide real value.
+</p>
+
+<h3 id="qa-16">Why is a huge connection pool dangerous?</h3>
+<p>
+  It permits more concurrent database work, which can increase CPU scheduling, memory use, lock
+  contention, and latency. It can also exceed PostgreSQL's total connection budget during scaling or
+  rolling deployments.
+</p>
+
+<h3 id="qa-17">How should deadlocks be handled?</h3>
+<p>
+  Keep transactions short, access resources in consistent order, inspect the conflicting SQL, and
+  fix the design where possible. A bounded retry of the complete idempotent transaction can handle
+  unavoidable transient deadlock victims.
+</p>
+
+<h3 id="qa-18">What is the N+1 query problem in JDBC?</h3>
+<p>
+  It occurs when code runs one query for a collection and then one additional query per row. JDBC
+  does not create it automatically, but repository loops can. Replace it with a set-oriented join,
+  batched lookup, or bounded two-query assembly.
+</p>
+
+<h3 id="qa-19">How do transaction and connection pools interact?</h3>
+<p>
+  A local JDBC transaction borrows and retains one connection until completion. Therefore slow or
+  blocked transactions reduce available pool capacity even when they execute little Java code.
+</p>
+
+<h3 id="qa-20">Why are unique constraints still needed after validation?</h3>
+<p>
+  Two concurrent requests can both pass an application-side existence check. The unique constraint
+  arbitrates at the database serialization point. Translate its known violation into the domain
+  outcome.
+</p>
+
+<h2 id="practice"><span class="num">28.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>
+    Build a customer repository with create, optional find, update, and delete row-count checks.
+  </li>
+  <li>Map a joined order and items result with a <code>ResultSetExtractor</code>.</li>
+  <li>Implement allowlisted sorting and keyset pagination with duplicate timestamps.</li>
+  <li>Add PostgreSQL <code>RETURNING</code> for identity, defaults, and version.</li>
+  <li>Compare individual inserts, JDBC batching, rewritten batching, and PostgreSQL COPY.</li>
+  <li>Write a transfer service whose invariant is enforced atomically and transactionally.</li>
+  <li>Produce a deadlock in a test, inspect it, then enforce consistent lock order.</li>
+  <li>Test unique-constraint translation and decide the public domain error.</li>
+  <li>Use Testcontainers and real migrations for JSONB, UUID, and time-zone mapping tests.</li>
+  <li>Load-test different pool sizes and explain the observed throughput and latency.</li>
+  <li>Design safe retry behavior for an ambiguous connection failure after a write.</li>
+  <li>Add pool and repository-operation metrics without logging sensitive values.</li>
+</ol>
+
+<h2 id="cheatsheet"><span class="num">29.</span> One-screen cheat sheet</h2>
+<div class="key">
+  <strong>Spring JDBC rules</strong>
+  <ul class="clean">
+    <li>Spring manages JDBC workflow; you own SQL, parameters, cardinality, and mapping.</li>
+    <li>Use one pooled <code>DataSource</code> and shared template instances.</li>
+    <li>Close every resource you own, including streams and pooled connection handles.</li>
+    <li>Bind values. Allowlist identifiers. Never concatenate untrusted SQL fragments.</li>
+    <li>Use explicit columns, aliases, immutable projections, and correct null mapping.</li>
+    <li>Check update counts and let constraints arbitrate concurrent invariants.</li>
+    <li>Use bounded batches and measure pgJDBC-specific optimizations.</li>
+    <li>Put transactions around business operations and keep them short.</li>
+    <li>Retry only transient, idempotent operations within a strict budget.</li>
+    <li>Size HikariCP across all replicas and monitor pending acquisitions.</li>
+    <li>Optimize schema, SQL, indexes, and result size before pool size.</li>
+    <li>Test PostgreSQL behavior with PostgreSQL and real migrations.</li>
+    <li>Choose JDBC when explicit relational control is the simpler design.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">30.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/jdbc/core.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework JDBC core and exception handling</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/jdbc/advanced.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework JDBC batch operations</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/jdbc/choose-style.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework JDBC access approaches</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework declarative transactions</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/data/sql.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot SQL database support</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/testing/testcontainers.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot Testcontainers service connections</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/en/java/javase/21/docs/api/java.sql/java/sql/package-summary.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Java SE JDBC API</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/javase/tutorial/jdbc/basics/prepared.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Java JDBC prepared statements</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://jdbc.postgresql.org/documentation/use/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >pgJDBC connection and driver properties</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://java.testcontainers.org/modules/databases/postgres/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Testcontainers PostgreSQL module</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/dml-returning.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL RETURNING</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/transaction-iso.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL transaction isolation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/runtime-config-client.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL statement and lock timeouts</a
+    >
+  </li>
+  <li>
+    <a href="https://github.com/brettwooldridge/HikariCP" target="_blank" rel="noopener noreferrer"
+      >HikariCP configuration reference</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
