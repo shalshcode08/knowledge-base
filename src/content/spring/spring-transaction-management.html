@@ -1,0 +1,1015 @@
+<h1>Spring Transaction Management - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to local database transactions, Spring transaction
+  abstractions, declarative boundaries, propagation, isolation, rollback rules, proxies, savepoints,
+  testing, connection pools, external side effects, and production troubleshooting.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The transaction mental model</h2>
+<p class="lead">
+  A transaction is one business state change with one database outcome: every required database
+  operation commits, or the database rolls the operations back.
+</p>
+
+<p>
+  Imagine transferring money between two accounts. Debiting one account without crediting the other
+  is not a partial success. Both updates belong inside one transaction because the business
+  invariant is that money is neither created nor lost. The transaction boundary should surround the
+  complete invariant, not each individual SQL statement.
+</p>
+
+<div class="analogy">
+  <p>
+    A transaction is like editing a document in a private draft. Other users continue to see an
+    allowed committed version while you work. Commit publishes the complete draft. Rollback throws
+    the draft away. The exact visibility rules depend on the database isolation level.
+  </p>
+</div>
+
+<p>
+  Spring does not replace the database transaction engine. PostgreSQL, a JDBC driver, or another
+  resource manager still performs begin, commit, rollback, locking, and isolation. Spring supplies a
+  consistent boundary model, chooses the appropriate transaction manager, binds resources to the
+  execution context, and applies commit or rollback rules around application methods.
+</p>
+
+<div class="key">
+  <strong>The most useful design rule</strong>
+  <p>
+    Place the transaction at the service operation that represents one business use case. Repository
+    methods perform persistence work, but a service normally knows which operations must succeed
+    together.
+  </p>
+</div>
+
+<h2 id="acid"><span class="num">01.</span> ACID and local transactions</h2>
+<p class="lead">
+  ACID describes guarantees of a transactional resource, not a promise that every distributed side
+  effect is magically included.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Meaning</th>
+        <th>Engineering consequence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Atomicity</td>
+        <td>The transaction commits as a unit or rolls back as a unit.</td>
+        <td>Keep all database changes for one invariant in the same boundary.</td>
+      </tr>
+      <tr>
+        <td>Consistency</td>
+        <td>A successful transaction preserves declared and application invariants.</td>
+        <td>Use constraints as the final guard, not service validation alone.</td>
+      </tr>
+      <tr>
+        <td>Isolation</td>
+        <td>Concurrent work observes results allowed by the selected isolation level.</td>
+        <td>Choose locking, optimistic checks, or retries for sensitive workflows.</td>
+      </tr>
+      <tr>
+        <td>Durability</td>
+        <td>A committed result survives failures according to resource guarantees.</td>
+        <td>Do not report success before commit has completed.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A local transaction coordinates one transactional resource, commonly one relational database.
+  Updating PostgreSQL and calling a payment provider are not one local transaction. A database
+  rollback cannot unsend an HTTP request, email, Kafka message, or object-store write. Distributed
+  work needs explicit patterns discussed later.
+</p>
+
+<h3 id="autocommit">JDBC autocommit</h3>
+<p>
+  A JDBC connection normally starts with autocommit enabled, so each statement becomes its own
+  transaction. A Spring transaction manager temporarily configures and controls the connection for
+  the surrounding boundary. Code using Spring-aware JDBC or JPA infrastructure receives the
+  transaction-bound resource, and Spring restores and releases it afterward.
+</p>
+
+<h2 id="spring-abstraction"><span class="num">02.</span> Spring transaction abstractions</h2>
+<p class="lead">Spring separates transaction policy from the technology that implements it.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Responsibility</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>TransactionDefinition</code></td>
+        <td>Describes propagation, isolation, timeout, read-only status, and name.</td>
+      </tr>
+      <tr>
+        <td><code>TransactionStatus</code></td>
+        <td>
+          Represents the current transaction and supports rollback-only or savepoint operations.
+        </td>
+      </tr>
+      <tr>
+        <td><code>PlatformTransactionManager</code></td>
+        <td>Begins, commits, and rolls back imperative transactions.</td>
+      </tr>
+      <tr>
+        <td><code>TransactionTemplate</code></td>
+        <td>Runs imperative callbacks with programmatic transaction policy.</td>
+      </tr>
+      <tr>
+        <td><code>ReactiveTransactionManager</code></td>
+        <td>Manages reactive transactions through Reactor context instead of a thread local.</td>
+      </tr>
+      <tr>
+        <td><code>TransactionalOperator</code></td>
+        <td>Applies programmatic boundaries to reactive publishers.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Common implementations include <code>DataSourceTransactionManager</code> for a JDBC
+  <code>DataSource</code>, <code>JdbcTransactionManager</code> with JDBC exception translation,
+  <code>JpaTransactionManager</code> for JPA, and <code>JtaTransactionManager</code> when a real JTA
+  environment coordinates supported resources. Spring Boot usually auto-configures the manager
+  implied by the available persistence infrastructure.
+</p>
+
+<div class="note">
+  <strong>One abstraction does not mean identical capability</strong>
+  <p>
+    Nested savepoints, isolation choices, suspension, timeouts, and read-only enforcement depend on
+    the transaction manager, driver, and database. Always verify the behavior of the actual stack.
+  </p>
+</div>
+
+<h2 id="declarative"><span class="num">03.</span> Declarative transactions with @Transactional</h2>
+<p class="lead">
+  Declarative management describes transaction policy as metadata while an interceptor performs the
+  boundary work.
+</p>
+
+<figure class="code">
+  <figcaption><b>A service-level write boundary</b></figcaption>
+  <pre><code>@Service
+public class TransferService {
+    private final AccountRepository accounts;
+    private final TransferRepository transfers;
+
+    public TransferService(
+            AccountRepository accounts,
+            TransferRepository transfers) {
+        this.accounts = accounts;
+        this.transfers = transfers;
+    }
+
+    @Transactional
+    public UUID transfer(UUID fromId, UUID toId, BigDecimal amount) {
+        Account from = accounts.findForUpdate(fromId)
+                .orElseThrow(AccountNotFoundException::new);
+        Account to = accounts.findForUpdate(toId)
+                .orElseThrow(AccountNotFoundException::new);
+
+        from.debit(amount);
+        to.credit(amount);
+
+        Transfer transfer = Transfer.completed(fromId, toId, amount);
+        transfers.save(transfer);
+        return transfer.id();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  With proxy-based transaction management, the call enters a Spring proxy. The transaction
+  interceptor resolves the method metadata, asks the selected manager for a transaction, calls the
+  target, then commits or rolls back. The connection or persistence context is usually bound to the
+  current thread for imperative code.
+</p>
+
+<p>
+  Default <code>@Transactional</code> behavior is <code>REQUIRED</code> propagation, database
+  default isolation, read-write mode, the manager's default timeout, rollback for
+  <code>RuntimeException</code> and <code>Error</code>, and commit for checked exceptions unless a
+  rule says otherwise.
+</p>
+
+<figure class="code">
+  <figcaption><b>Explicit policy where the use case needs it</b></figcaption>
+  <pre><code>@Transactional(
+        propagation = Propagation.REQUIRED,
+        isolation = Isolation.READ_COMMITTED,
+        timeout = 10,
+        rollbackFor = PaymentFileException.class)
+public Receipt importPaymentFile(Path file) throws PaymentFileException {
+    // Parse before the boundary when possible, then persist atomically.
+}</code></pre>
+</figure>
+
+<h3 id="placement">Where to place the annotation</h3>
+<ul class="clean">
+  <li>Prefer public service methods that represent complete application use cases.</li>
+  <li>Use class-level metadata for a sensible default and method-level metadata for exceptions.</li>
+  <li>Avoid placing every repository call in its own independent boundary.</li>
+  <li>Do not put remote calls, user interaction, or slow file processing inside a transaction.</li>
+  <li>
+    Keep domain decisions inside the boundary when they depend on locked or freshly read data.
+  </li>
+</ul>
+
+<h2 id="proxy-behavior"><span class="num">04.</span> Proxy behavior and self-invocation</h2>
+<p class="lead">
+  In the normal proxy mode, transaction advice runs only when a call crosses the proxy.
+</p>
+
+<figure class="code">
+  <figcaption><b>A self-invocation bug</b></figcaption>
+  <pre><code>@Service
+class InvoiceService {
+
+    public void importAll(List&lt;InvoiceCommand&gt; commands) {
+        for (InvoiceCommand command : commands) {
+            saveOne(command); // direct call on this, no proxy interception
+        }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveOne(InvoiceCommand command) {
+        // The annotation is not applied through this direct call.
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Refactor the transactional operation into another injected bean, make the outer method the correct
+  boundary, or use <code>TransactionTemplate</code> for a loop that intentionally needs independent
+  transactions. Self-injecting a proxy obscures the design and creates circular dependencies.
+  AspectJ weaving can advise self-invocation, but it introduces a different build and runtime model.
+</p>
+
+<p>
+  Private methods are not useful proxy entry points. Interface-based JDK proxies expose interface
+  methods. Class-based proxies subclass the target and cannot override final methods. Spring Boot
+  commonly uses class-based proxies, but code should not depend on an annotation attached to a call
+  path the proxy cannot intercept.
+</p>
+
+<div class="warning">
+  <strong>Thread boundaries also matter</strong>
+  <p>
+    Imperative transaction context is normally thread-bound. Starting a new thread, using
+    <code>@Async</code>, or dispatching work to an executor does not carry the original database
+    transaction into that thread. Give asynchronous work its own explicit boundary.
+  </p>
+</div>
+
+<h2 id="propagation"><span class="num">05.</span> Propagation modes</h2>
+<p class="lead">
+  Propagation answers: what should this method do when its caller already has a transaction?
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>When a transaction exists</th>
+        <th>When none exists</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>REQUIRED</code></td>
+        <td>Join it.</td>
+        <td>Create one.</td>
+        <td>Default business write.</td>
+      </tr>
+      <tr>
+        <td><code>REQUIRES_NEW</code></td>
+        <td>Suspend it and create an independent transaction.</td>
+        <td>Create one.</td>
+        <td>Rare independent unit with carefully sized pool.</td>
+      </tr>
+      <tr>
+        <td><code>SUPPORTS</code></td>
+        <td>Participate.</td>
+        <td>Run without one.</td>
+        <td>Operation that can use either context.</td>
+      </tr>
+      <tr>
+        <td><code>MANDATORY</code></td>
+        <td>Participate.</td>
+        <td>Throw an exception.</td>
+        <td>Enforce that a higher layer owns the boundary.</td>
+      </tr>
+      <tr>
+        <td><code>NOT_SUPPORTED</code></td>
+        <td>Suspend it.</td>
+        <td>Run without one.</td>
+        <td>Work that must not hold database resources.</td>
+      </tr>
+      <tr>
+        <td><code>NEVER</code></td>
+        <td>Throw an exception.</td>
+        <td>Run without one.</td>
+        <td>Assert that a call is non-transactional.</td>
+      </tr>
+      <tr>
+        <td><code>NESTED</code></td>
+        <td>Create a savepoint in one physical transaction when supported.</td>
+        <td>Behave like <code>REQUIRED</code>.</td>
+        <td>Partial rollback with JDBC savepoint support.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="required">REQUIRED and rollback-only</h3>
+<p>
+  Each advised <code>REQUIRED</code> method has a logical transaction scope, but joined scopes map
+  to the same physical database transaction. If an inner scope marks that transaction rollback-only
+  and the outer scope later tries to commit, Spring throws <code>UnexpectedRollbackException</code>.
+  This prevents the outer caller from believing a commit happened.
+</p>
+
+<h3 id="requires-new">REQUIRES_NEW and connection pressure</h3>
+<p>
+  <code>REQUIRES_NEW</code> needs an independent physical transaction. The outer transaction keeps
+  its connection while the inner transaction requests another. Under concurrency, a pool sized only
+  for worker threads can be exhausted: every thread holds one connection and waits for a second. Use
+  the mode sparingly, size from measured concurrency, and consider whether the supposed independent
+  work belongs in an outbox instead.
+</p>
+
+<h3 id="nested">NESTED is not a second commit</h3>
+<p>
+  <code>NESTED</code> normally maps to a JDBC savepoint. Rolling back the inner scope can undo work
+  after the savepoint while the outer transaction continues. There is still one physical transaction
+  and one final commit. If the outer transaction rolls back, every nested change is lost. Support
+  depends on the manager and resource, so do not assume JPA behaves like direct JDBC.
+</p>
+
+<h2 id="isolation"><span class="num">06.</span> Isolation levels and anomalies</h2>
+<p class="lead">
+  Isolation controls which concurrent outcomes a transaction may observe. Stronger isolation is not
+  a substitute for understanding invariants and retries.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Spring level</th>
+        <th>Main idea</th>
+        <th>PostgreSQL note</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>DEFAULT</code></td>
+        <td>Use the database or connection default.</td>
+        <td>Normally <code>READ COMMITTED</code>.</td>
+      </tr>
+      <tr>
+        <td><code>READ_UNCOMMITTED</code></td>
+        <td>SQL level that may permit dirty reads.</td>
+        <td>Treated as <code>READ COMMITTED</code>.</td>
+      </tr>
+      <tr>
+        <td><code>READ_COMMITTED</code></td>
+        <td>Each statement sees a snapshot of committed rows at statement start.</td>
+        <td>Non-repeatable observations can occur across statements.</td>
+      </tr>
+      <tr>
+        <td><code>REPEATABLE_READ</code></td>
+        <td>Use a stable transaction snapshot.</td>
+        <td>
+          Prevents dirty, non-repeatable, and phantom reads but not every serialization anomaly.
+        </td>
+      </tr>
+      <tr>
+        <td><code>SERIALIZABLE</code></td>
+        <td>Require an outcome equivalent to some serial execution.</td>
+        <td>May abort with a serialization failure, so retry the complete transaction.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A dirty read observes uncommitted data. A non-repeatable read gets different committed values for
+  the same row. A phantom changes the set of rows matching a predicate. A lost update overwrites
+  another result. Write skew occurs when separate rows are changed after reads that jointly enforce
+  an invariant. Standard isolation labels describe minimum phenomena, while real database behavior
+  is vendor-specific.
+</p>
+
+<div class="note">
+  <strong>Isolation applies when a new physical transaction starts</strong>
+  <p>
+    An inner <code>REQUIRED</code> method joins the outer transaction. Its isolation declaration
+    cannot replace characteristics already chosen by the outer boundary. Put the required policy on
+    the use-case entry point.
+  </p>
+</div>
+
+<h3 id="retry">Safe serialization and deadlock retries</h3>
+<p>
+  Retry the complete business transaction after a serialization failure or deadlock, not only the
+  final SQL statement. Use a small bounded attempt count, exponential backoff with jitter, and
+  idempotency protections for externally retried requests. Do not retry constraint violations,
+  authentication failures, or arbitrary bugs.
+</p>
+
+<h2 id="read-only"><span class="num">07.</span> Read-only transactions and timeouts</h2>
+<p class="lead">
+  Read-only is a policy hint and possible optimization, not a universal security boundary.
+</p>
+
+<figure class="code">
+  <figcaption><b>A query-oriented service</b></figcaption>
+  <pre><code>@Transactional(readOnly = true)
+public OrderSummary getOrder(UUID id) {
+    return orders.findSummary(id)
+            .orElseThrow(OrderNotFoundException::new);
+}</code></pre>
+</figure>
+
+<p>
+  Depending on the manager and provider, read-only may set a JDBC flag, request a read-only database
+  transaction, or optimize persistence-context flushing. It should communicate intent and reduce
+  accidental work, but database privileges remain the reliable authorization control.
+</p>
+
+<p>
+  A transaction timeout limits how long transactional work may run when the manager and resource
+  support it. It is distinct from connection-acquisition timeout, JDBC query timeout, lock timeout,
+  HTTP timeout, and request timeout. Production systems often need several coordinated limits.
+  Ensure the outer request budget is larger than the database budget plus cleanup time.
+</p>
+
+<h2 id="rollback"><span class="num">08.</span> Rollback rules and exception design</h2>
+<p class="lead">
+  By default, unchecked exceptions and errors trigger rollback; checked exceptions do not.
+</p>
+
+<figure class="code">
+  <figcaption><b>Declaring a checked rollback rule</b></figcaption>
+  <pre><code>@Transactional(rollbackFor = InventoryImportException.class)
+public ImportResult importInventory(InputStream source)
+        throws InventoryImportException {
+    // Any escaped InventoryImportException marks this transaction for rollback.
+}</code></pre>
+</figure>
+
+<p>
+  <code>rollbackFor</code> and <code>noRollbackFor</code> accept exception classes and are safer
+  than name-pattern rules. Pattern matching can unintentionally match similarly named exceptions.
+  Keep rules close to a deliberate business decision, and document why a failure should still
+  commit.
+</p>
+
+<div class="warning">
+  <strong>Catching an exception changes what the interceptor sees</strong>
+  <p>
+    If application code catches an exception and returns normally, the transaction interceptor
+    cannot infer that rollback is required. Rethrow an appropriate exception, or explicitly call
+    <code>TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()</code> when a rare
+    design truly requires it. Prefer exception-driven rollback because it keeps business code less
+    coupled to Spring.
+  </p>
+</div>
+
+<p>
+  Once participating work marks a transaction rollback-only, catching the exception does not restore
+  the transaction. Continuing to write can waste work and end in
+  <code>UnexpectedRollbackException</code>. Treat rollback-only as a terminal outcome for that
+  physical transaction.
+</p>
+
+<h2 id="programmatic"><span class="num">09.</span> Programmatic transaction management</h2>
+<p class="lead">
+  Use <code>TransactionTemplate</code> when the boundary must be expressed inside an algorithm
+  rather than around a whole method.
+</p>
+
+<figure class="code">
+  <figcaption><b>Independent batches with a short transaction each</b></figcaption>
+  <pre><code>@Component
+class ImportCoordinator {
+    private final TransactionTemplate transactions;
+    private final InvoiceRepository invoices;
+
+    ImportCoordinator(
+            PlatformTransactionManager manager,
+            InvoiceRepository invoices) {
+        this.transactions = new TransactionTemplate(manager);
+        this.transactions.setTimeout(15);
+        this.invoices = invoices;
+    }
+
+    void importBatches(List&lt;List&lt;InvoiceRow&gt;&gt; batches) {
+        for (List&lt;InvoiceRow&gt; batch : batches) {
+            transactions.executeWithoutResult(status -&gt; {
+                invoices.upsertAll(batch);
+            });
+        }
+    }
+}</code></pre>
+</figure>
+
+<p>
+  This makes the per-batch boundary explicit without relying on self-invocation. A template is
+  thread-safe for shared use when its configuration is not mutated. Use separate templates for
+  distinct policies. Declarative management remains clearer for most service methods.
+</p>
+
+<h2 id="long-running"><span class="num">10.</span> Long transactions and pool effects</h2>
+<p class="lead">
+  A transaction holds scarce resources and can retain locks or old row versions even while the
+  application is doing no database work.
+</p>
+
+<ul class="clean">
+  <li>A checked-out connection is unavailable to other requests.</li>
+  <li>Locks can block writers and increase deadlock risk.</li>
+  <li>PostgreSQL snapshots can delay removal of dead tuples and contribute to bloat.</li>
+  <li>A large persistence context consumes memory and makes dirty checking expensive.</li>
+  <li>Failure near the end discards more work and increases retry cost.</li>
+</ul>
+
+<p>
+  Do not open a transaction before parsing a large file, waiting for user input, making an HTTP
+  request, sleeping, or performing CPU-heavy transformation. Prepare data first, then open the
+  shortest boundary that can safely validate current state and write results. For large imports,
+  choose bounded chunks only when partial commit semantics are acceptable.
+</p>
+
+<h3 id="pool-math">Connection-pool reasoning</h3>
+<p>
+  Pool size is not an arbitrary throughput knob. It must reflect database capacity, query latency,
+  concurrent request demand, and the number of connections one call can hold. Instrument active,
+  idle, pending, acquisition time, and transaction duration. A huge pool can move queuing into the
+  database and make latency worse.
+</p>
+
+<h2 id="locking"><span class="num">11.</span> Transactions, locking, and lost updates</h2>
+<p class="lead">
+  A transaction boundary provides atomicity, but it does not automatically protect every
+  read-modify-write decision from races.
+</p>
+
+<p>
+  Use a database constraint when the invariant can be expressed declaratively. Use optimistic
+  locking with a version column when collisions are unusual and retry or conflict reporting is
+  acceptable. Use <code>SELECT ... FOR UPDATE</code> or pessimistic JPA locking when a row must be
+  reserved before a decision. Use serializable isolation for multi-row predicate invariants when the
+  workload can handle complete transaction retries.
+</p>
+
+<figure class="code">
+  <figcaption><b>Optimistic update concept</b></figcaption>
+  <pre><code>UPDATE product
+SET stock = stock - :quantity,
+    version = version + 1
+WHERE id = :id
+  AND version = :expectedVersion
+  AND stock &gt;= :quantity;</code></pre>
+</figure>
+
+<p>
+  Check the affected row count. Zero means the state changed or the invariant failed. Never assume
+  that wrapping an unsafe read followed by an unconditional write in <code>@Transactional</code>
+  alone prevents a lost update.
+</p>
+
+<h2 id="external-effects">
+  <span class="num">12.</span> External side effects and the outbox pattern
+</h2>
+<p class="lead">A database transaction cannot atomically roll back an ordinary network call.</p>
+
+<p>
+  The unsafe sequence "commit order, then publish message" can lose the message if the process
+  crashes after commit. The reverse sequence can publish a message for an order that later rolls
+  back. The transactional outbox solves this by writing both the business row and an outbox row in
+  the same local database transaction.
+</p>
+
+<ol class="clean">
+  <li>Handle an idempotent request inside one database transaction.</li>
+  <li>Write the domain state.</li>
+  <li>Write an outbox record containing a stable event ID and payload.</li>
+  <li>Commit both rows atomically.</li>
+  <li>A separate publisher reads committed outbox rows and sends them.</li>
+  <li>Mark delivery progress and retry failures.</li>
+  <li>Consumers deduplicate by event ID because delivery can be repeated.</li>
+</ol>
+
+<p>
+  This provides atomic state plus eventual publication, not magical exactly-once delivery. For a
+  payment API, use an idempotency key and model a saga or compensating action. A compensating action
+  is a new business operation, not a rollback in time.
+</p>
+
+<h3 id="events">Transactional events</h3>
+<p>
+  <code>@TransactionalEventListener</code> can bind an in-process listener to
+  <code>BEFORE_COMMIT</code>, <code>AFTER_COMMIT</code>, <code>AFTER_ROLLBACK</code>, or
+  <code>AFTER_COMPLETION</code>. The default is after commit. If no transaction exists, the listener
+  is skipped unless fallback execution is enabled. Use this for local coordination, not as a durable
+  replacement for an outbox. A process crash can still lose an after-commit action.
+</p>
+
+<h2 id="testing"><span class="num">13.</span> Testing transaction behavior</h2>
+<p class="lead">
+  Test the committed database outcome, not only the in-memory state inside a test transaction.
+</p>
+
+<p>
+  Spring test-managed <code>@Transactional</code> tests normally roll back at the end. This keeps
+  tests isolated, but it can hide failures that occur only at flush or commit. Force a flush when
+  verifying constraints, or end the test transaction with <code>TestTransaction</code> and inspect
+  state afterward.
+</p>
+
+<figure class="code">
+  <figcaption><b>Testing a rollback boundary</b></figcaption>
+  <pre><code>@SpringBootTest
+class TransferServiceTest {
+    @Autowired TransferService service;
+    @Autowired JdbcTemplate jdbc;
+
+    @Test
+    void failedCreditRollsBackDebit() {
+        assertThrows(AccountNotFoundException.class,
+                () -&gt; service.transfer(FROM, MISSING, TEN));
+
+        BigDecimal balance = jdbc.queryForObject(
+                "select balance from account where id = ?",
+                BigDecimal.class,
+                FROM);
+
+        assertEquals(STARTING_BALANCE, balance);
+    }
+}</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>Use a real supported database with Testcontainers for isolation and locking behavior.</li>
+  <li>Run concurrent tests with separate threads and connections for race conditions.</li>
+  <li>Verify rollback rules for checked and unchecked exceptions.</li>
+  <li>Test serialization retries and deadlock handling with bounded attempts.</li>
+  <li>Verify outbox and domain rows appear in the same commit.</li>
+  <li>
+    Avoid preemptive test timeouts that move work to another thread outside the test transaction.
+  </li>
+</ul>
+
+<h2 id="production"><span class="num">14.</span> Production practices</h2>
+<p class="lead">
+  Good transaction management is visible, bounded, measurable, and aligned with business invariants.
+</p>
+
+<ul class="clean">
+  <li>Use one clear service boundary for each command or use case.</li>
+  <li>Keep transactions short and remove remote calls from the boundary.</li>
+  <li>Set realistic lock, statement, and transaction timeouts.</li>
+  <li>Order row locks consistently across code paths to reduce deadlocks.</li>
+  <li>Use constraints, idempotency keys, and version checks as durable guards.</li>
+  <li>Record transaction latency, database time, pool wait, retries, and rollback categories.</li>
+  <li>Log a correlation ID and operation name, but never sensitive SQL parameters.</li>
+  <li>
+    Alert on long-running transactions, pool saturation, deadlocks, and serialization failures.
+  </li>
+  <li>Retry only known transient conflicts and cap the retry budget.</li>
+  <li>Document intentional uses of <code>REQUIRES_NEW</code> and <code>NESTED</code>.</li>
+</ul>
+
+<h3 id="multiple-managers">Multiple transaction managers</h3>
+<p>
+  An application can define multiple managers and select one with
+  <code>@Transactional(transactionManager = "ordersTransactionManager")</code>. This does not make
+  two independent databases atomic. If one method talks to both under separate local managers, one
+  may commit while the other fails. Use a carefully justified distributed transaction system or,
+  more commonly, local transactions plus durable messaging and reconciliation.
+</p>
+
+<h2 id="diagnostics"><span class="num">15.</span> Troubleshooting guide</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely cause</th>
+        <th>What to inspect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Annotation appears ignored</td>
+        <td>Self-invocation, non-managed object, or non-interceptable method.</td>
+        <td>Bean creation, call path, proxy type, method visibility.</td>
+      </tr>
+      <tr>
+        <td><code>UnexpectedRollbackException</code></td>
+        <td>Joined inner work marked the physical transaction rollback-only.</td>
+        <td>Earlier exception and caught failure in the same call chain.</td>
+      </tr>
+      <tr>
+        <td>Pool timeouts under load</td>
+        <td>Long boundaries, slow SQL, leaks, or nested <code>REQUIRES_NEW</code>.</td>
+        <td>Active connections, pending count, acquisition and transaction time.</td>
+      </tr>
+      <tr>
+        <td>Data remains after a failed operation</td>
+        <td>
+          Exception was caught, checked exception committed, or work used another transaction.
+        </td>
+        <td>Rollback rules, propagation, thread changes, manager selection.</td>
+      </tr>
+      <tr>
+        <td>Constraint error appears after method logic</td>
+        <td>JPA flush occurred during commit.</td>
+        <td>Explicit flush point and exception translation.</td>
+      </tr>
+      <tr>
+        <td>Test passes but production commit fails</td>
+        <td>Rollback-only test never exercised a real commit.</td>
+        <td>Flush, commit-aware integration test, real database behavior.</td>
+      </tr>
+      <tr>
+        <td>Messages missing or duplicated</td>
+        <td>Non-atomic publication or at-least-once delivery.</td>
+        <td>Outbox persistence, publisher retries, consumer deduplication.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="mistakes"><span class="num">16.</span> Common mistakes</h2>
+<ol class="clean">
+  <li><strong>Annotating private helpers:</strong> proxy advice never sees the direct call.</li>
+  <li>
+    <strong>One transaction per repository call:</strong> the business operation loses atomicity.
+  </li>
+  <li>
+    <strong>One transaction for a huge batch:</strong> locks, memory, snapshots, and retry cost
+    grow.
+  </li>
+  <li>
+    <strong>Catching every exception:</strong> failures can commit or end as unexpected rollback.
+  </li>
+  <li>
+    <strong>Using REQUIRES_NEW for logging:</strong> it consumes another connection and may deadlock
+    the pool.
+  </li>
+  <li><strong>Assuming read-only forbids writes:</strong> enforcement depends on the stack.</li>
+  <li>
+    <strong>Making remote calls inside the boundary:</strong> locks and connections wait on the
+    network.
+  </li>
+  <li>
+    <strong>Retrying any exception:</strong> permanent failures create load and duplicate effects.
+  </li>
+  <li>
+    <strong>Confusing nested with independent:</strong> a savepoint does not survive outer rollback.
+  </li>
+  <li>
+    <strong>Testing only under automatic rollback:</strong> commit-time behavior remains untested.
+  </li>
+</ol>
+
+<h2 id="worked-design"><span class="num">17.</span> Worked order design</h2>
+<p class="lead">
+  Consider an API that reserves stock, creates an order, and asks a broker to publish
+  <code>OrderPlaced</code>.
+</p>
+
+<ol class="clean">
+  <li>Validate request shape before starting a transaction.</li>
+  <li>Enter an idempotent <code>placeOrder</code> service boundary.</li>
+  <li>Insert or find the request's idempotency record.</li>
+  <li>Reserve stock with a guarded update or explicit lock.</li>
+  <li>Insert the order and lines.</li>
+  <li>Insert the outbox event with a stable ID.</li>
+  <li>Commit and return the created resource.</li>
+  <li>Publish the outbox record independently with retry.</li>
+  <li>Let consumers deduplicate the event ID.</li>
+</ol>
+
+<p>
+  A unique constraint on the idempotency key handles concurrent duplicates. A guarded stock update
+  prevents overselling. The local transaction makes the order, reservation, and outbox atomic. The
+  publisher does not hold an order transaction open while waiting for the broker.
+</p>
+
+<h2 id="practice"><span class="num">18.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>
+    Explain why two repository methods with separate autocommit statements can violate an invariant.
+  </li>
+  <li>Build a transfer service and prove that the debit rolls back when the credit fails.</li>
+  <li>Reproduce self-invocation with <code>REQUIRES_NEW</code>, then refactor it safely.</li>
+  <li>
+    Demonstrate <code>UnexpectedRollbackException</code> with joined <code>REQUIRED</code> scopes.
+  </li>
+  <li>
+    Compare <code>REQUIRES_NEW</code> with <code>NESTED</code> using commit and rollback cases.
+  </li>
+  <li>
+    Run two PostgreSQL transactions that produce a serialization failure and add a bounded retry.
+  </li>
+  <li>
+    Measure connection-pool behavior when an outer transaction calls an inner new transaction.
+  </li>
+  <li>Write a commit-aware integration test using Testcontainers.</li>
+  <li>Implement an order plus outbox write and an idempotent publisher.</li>
+  <li>
+    Choose transaction boundaries for a large file import and justify the partial failure semantics.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">19.</span> Interview questions and answers</h2>
+
+<h3>What does @Transactional actually do?</h3>
+<p>
+  It supplies metadata to Spring transaction advice. Normally a proxy intercepts an external method
+  call, resolves the policy, obtains or joins a transaction through a manager, invokes the target,
+  and commits or rolls back according to the outcome.
+</p>
+
+<h3>Why does self-invocation break transactional behavior?</h3>
+<p>
+  A call from one method to another on the same object does not cross the proxy. Proxy-based advice
+  therefore does not run for the inner method. Move the boundary, delegate to another bean, or use a
+  programmatic template.
+</p>
+
+<h3>Where should a transaction boundary live?</h3>
+<p>
+  Usually at the service method representing one complete business use case. That layer understands
+  which reads and writes preserve the invariant together.
+</p>
+
+<h3>What is the difference between REQUIRED and REQUIRES_NEW?</h3>
+<p>
+  <code>REQUIRED</code> joins an existing transaction or creates one. <code>REQUIRES_NEW</code>
+  suspends an existing transaction and starts an independent physical transaction, normally using
+  another connection.
+</p>
+
+<h3>What is the difference between REQUIRES_NEW and NESTED?</h3>
+<p>
+  A new transaction can commit independently. A nested scope normally uses a savepoint inside the
+  same physical transaction, so its work is still lost if the outer transaction rolls back.
+</p>
+
+<h3>Why can UnexpectedRollbackException occur?</h3>
+<p>
+  Inner joined work marked the shared physical transaction rollback-only. The outer scope attempted
+  to commit without realizing that decision, so Spring reports that no commit occurred.
+</p>
+
+<h3>Which exceptions cause rollback by default?</h3>
+<p>
+  Escaped <code>RuntimeException</code> and <code>Error</code> types. Checked exceptions commit by
+  default unless configured with a rollback rule or a changed global policy.
+</p>
+
+<h3>Does readOnly = true guarantee that no write occurs?</h3>
+<p>
+  No. It expresses intent and can enable driver, database, or ORM behavior, but exact enforcement is
+  stack-specific. Use database privileges and constraints for security and integrity.
+</p>
+
+<h3>Why are long transactions harmful?</h3>
+<p>
+  They hold connections and locks, retain snapshots and row versions, grow persistence contexts,
+  amplify failure cost, and increase contention. Keep remote and CPU-heavy work outside.
+</p>
+
+<h3>How should serialization failures be retried?</h3>
+<p>
+  Retry the complete transaction with a bounded count and jittered backoff. External effects must be
+  idempotent or deferred through a durable pattern.
+</p>
+
+<h3>Can one @Transactional method atomically update two databases?</h3>
+<p>
+  Not with two unrelated local transaction managers. Atomic coordination requires an appropriate
+  distributed transaction environment, or the design should use local commits, durable messaging,
+  idempotency, compensation, and reconciliation.
+</p>
+
+<h3>How do you publish an event reliably after a database update?</h3>
+<p>
+  Write the domain state and an outbox row in one local transaction. A separate publisher delivers
+  committed outbox records with retries, and consumers deduplicate stable event IDs.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">20.</span> Concise cheat sheet</h2>
+<div class="key">
+  <ul class="clean">
+    <li>Boundary follows one business invariant.</li>
+    <li>Spring coordinates; the database provides actual transaction guarantees.</li>
+    <li>Default policy is REQUIRED, DEFAULT isolation, read-write, unchecked rollback.</li>
+    <li>Proxy mode needs an external call through a Spring-managed proxy.</li>
+    <li>Self-invocation and new threads bypass the original advice or context.</li>
+    <li>REQUIRED joins; REQUIRES_NEW is independent; NESTED usually means savepoint.</li>
+    <li>REQUIRES_NEW can require a second pool connection.</li>
+    <li>
+      Isolation behavior is database-specific; PostgreSQL maps READ UNCOMMITTED to READ COMMITTED.
+    </li>
+    <li>Retry complete transactions only for known transient concurrency failures.</li>
+    <li>Read-only is intent and possible optimization, not universal write security.</li>
+    <li>Keep transactions short and keep network calls outside.</li>
+    <li>Use constraints, locking, or versions to protect concurrent invariants.</li>
+    <li>Use an outbox for atomic database state plus durable event publication.</li>
+    <li>Test flush and commit behavior against the real database engine.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">21.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework transaction management</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Using @Transactional</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-propagation.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring transaction propagation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/programmatic.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Programmatic transaction management</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing/testcontext-framework/tx.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring test-managed transactions</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Transaction-bound application events</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/transaction-iso.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL transaction isolation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/sql-savepoint.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL savepoints</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
