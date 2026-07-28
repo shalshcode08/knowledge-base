@@ -156,8 +156,10 @@ function rootPrefix(pagePath) {
 
 function buildSidebar(activePath, prefix) {
   return manifest.topics
-    .map((topic) => {
+    .map((topic, topicIndex) => {
       const collapsible = topic.pages.length > SIDEBAR_VISIBLE;
+      const groupId = `sidebar-group-${topicIndex}`;
+      const storageKey = encodeURIComponent(topic.name);
       // Never hide the page you're on — expand the group if it lives in the tail.
       const activeIdx = topic.pages.findIndex((p) => p.path === activePath);
       const expanded = collapsible && activeIdx >= SIDEBAR_VISIBLE;
@@ -181,8 +183,13 @@ function buildSidebar(activePath, prefix) {
 
       return (
         `      <div ${attrs}>\n` +
-        `        <p class="label">${topic.name}</p>\n` +
-        `        <ul>\n${items}\n        </ul>${more}\n` +
+        `        <button type="button" class="nav-group-toggle label" aria-expanded="true" aria-controls="${groupId}" data-nav-key="${storageKey}">\n` +
+        `          <span>${topic.name}</span>\n` +
+        `          ${chevronDown("nav-group-chevron", 14)}\n` +
+        `        </button>\n` +
+        `        <div class="nav-group-content" id="${groupId}">\n` +
+        `          <ul>\n${items}\n          </ul>${more}\n` +
+        `        </div>\n` +
         `      </div>`
       );
     })
