@@ -1,0 +1,1448 @@
+<h1>Spring Data JPA - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth, practical, and interview-focused guide to repository abstractions, query methods,
+  projections, dynamic queries, pagination, auditing, custom repositories, transactions, locking,
+  PostgreSQL-specific SQL, performance, testing, and production design.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The Spring Data JPA mental model</h2>
+<p class="lead">
+  Spring Data JPA creates a data-access proxy from a repository interface. The proxy delegates
+  common persistence operations to a base implementation and turns declared methods into JPA
+  queries.
+</p>
+
+<p>
+  Jakarta Persistence defines entities, the persistence context, JPQL, and the
+  <code>EntityManager</code>. Hibernate is a common provider that implements that specification.
+  Spring Framework integrates JPA with dependency injection, exception translation, and transaction
+  management. Spring Data JPA sits above those layers and removes repetitive repository code. It
+  does not replace JPA, hide relational modeling, or make every query efficient.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of JPA as the database access engine and a Spring Data repository as a control panel.
+    Simple controls are already wired. A method name or annotation describes a query, and a proxy
+    operates the engine. The panel is convenient, but the engine still follows persistence-context,
+    transaction, SQL, index, and locking rules.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Main responsibility</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>PostgreSQL</td>
+        <td>
+          Stores rows, enforces constraints, plans SQL, and coordinates concurrent transactions
+        </td>
+      </tr>
+      <tr>
+        <td>Hibernate</td>
+        <td>
+          Maps objects, manages entity state, generates SQL, flushes changes, and loads relations
+        </td>
+      </tr>
+      <tr>
+        <td>Jakarta Persistence</td>
+        <td>Standard contracts for entities, entity managers, queries, and locks</td>
+      </tr>
+      <tr>
+        <td>Spring ORM</td>
+        <td>Connects JPA to Spring transactions and translates persistence exceptions</td>
+      </tr>
+      <tr>
+        <td>Spring Data JPA</td>
+        <td>
+          Builds repositories, derives queries, composes fragments, and adds data-access conventions
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Central rule</strong>
+  <p>
+    A repository is an adapter around a persistence model. Keep business use cases in services or
+    domain objects, make transaction boundaries explicit, and inspect the generated SQL for
+    important paths.
+  </p>
+</div>
+
+<h2 id="setup"><span class="num">01.</span> Setup and configuration</h2>
+<p class="lead">
+  Spring Boot can configure the data source, entity manager factory, transaction manager, Hibernate,
+  and repository scanning from the classpath and application properties.
+</p>
+
+<figure class="code">
+  <figcaption><b>Maven starter and PostgreSQL driver</b></figcaption>
+  <pre><code>&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-data-jpa&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.postgresql&lt;/groupId&gt;
+    &lt;artifactId&gt;postgresql&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Production-oriented baseline</b></figcaption>
+  <pre><code>spring:
+  datasource:
+    url: jdbc:postgresql://db.internal:5432/orders
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc.batch_size: 50
+        order_inserts: true
+        order_updates: true</code></pre>
+</figure>
+
+<p>
+  Boot normally scans entities and repositories below the application's auto-configuration package.
+  Use <code>@EntityScan</code> or <code>@EnableJpaRepositories</code> only when package boundaries,
+  multiple persistence units, or custom repository settings require it. Prefer Flyway or Liquibase
+  migrations for production schema changes. <code>ddl-auto=validate</code> checks mappings without
+  treating runtime startup as a migration tool.
+</p>
+
+<div class="warn">
+  <strong>Disable accidental web-layer persistence</strong>
+  <p>
+    Boot enables Open EntityManager in View for servlet web applications by default. Setting
+    <code>spring.jpa.open-in-view=false</code> makes the service layer define what must be fetched.
+    This prevents controllers and JSON serialization from silently issuing queries after the
+    intended transaction.
+  </p>
+</div>
+
+<h2 id="repository-abstractions"><span class="num">02.</span> Repository abstractions</h2>
+<p class="lead">
+  Select the smallest repository contract that expresses the operations the application should
+  expose.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Interface</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Repository&lt;T, ID&gt;</code></td>
+        <td>Marker used for selective method exposure and repository discovery</td>
+      </tr>
+      <tr>
+        <td><code>CrudRepository&lt;T, ID&gt;</code></td>
+        <td>Generic save, find, count, existence, and delete operations</td>
+      </tr>
+      <tr>
+        <td><code>ListCrudRepository&lt;T, ID&gt;</code></td>
+        <td>CRUD variant returning lists where applicable</td>
+      </tr>
+      <tr>
+        <td><code>PagingAndSortingRepository&lt;T, ID&gt;</code></td>
+        <td>Paging and sorting fragment, commonly combined with CRUD</td>
+      </tr>
+      <tr>
+        <td><code>JpaRepository&lt;T, ID&gt;</code></td>
+        <td>JPA-specific list, flush, batch delete, and reference operations</td>
+      </tr>
+      <tr>
+        <td><code>JpaSpecificationExecutor&lt;T&gt;</code></td>
+        <td>Execution and composition of Criteria-based specifications</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>A focused repository</b></figcaption>
+  <pre><code>public interface OrderRepository
+        extends JpaRepository&lt;Order, UUID&gt;,
+                JpaSpecificationExecutor&lt;Order&gt; {
+
+    Optional&lt;Order&gt; findByIdAndTenantId(UUID id, UUID tenantId);
+}</code></pre>
+</figure>
+
+<p>
+  The domain type and identifier type are repository metadata. At startup, Spring creates a proxy
+  whose composition normally includes <code>SimpleJpaRepository</code>, query-method interceptors,
+  and any custom fragments. Calling an inherited method reaches the base fragment. Calling a query
+  method reaches query resolution and execution logic.
+</p>
+
+<p>
+  A shared base interface should use <code>@NoRepositoryBean</code> so Spring does not try to create
+  a repository for its unresolved generic domain type. Exposing every
+  <code>JpaRepository</code> operation is convenient, but a restricted <code>Repository</code> can
+  prevent application code from calling dangerous operations such as unbounded
+  <code>findAll()</code>.
+</p>
+
+<h2 id="save-semantics"><span class="num">03.</span> Save, entity state, and flush</h2>
+<p class="lead">
+  <code>save</code> chooses between <code>EntityManager.persist</code> and
+  <code>EntityManager.merge</code> by deciding whether the entity appears new.
+</p>
+
+<p>
+  Spring Data JPA normally inspects a non-primitive <code>@Version</code> property first and then
+  the identifier. A null version or identifier indicates a new entity. Entities with manually
+  assigned identifiers can implement <code>Persistable</code> and provide <code>isNew()</code>. For
+  a new entity, <code>persist</code> makes that instance managed. For an existing or detached
+  entity, <code>merge</code> copies state into a managed instance and returns that managed instance.
+</p>
+
+<figure class="code">
+  <figcaption><b>Use the returned value when merge may occur</b></figcaption>
+  <pre><code>Order managed = orderRepository.save(detachedOrder);
+// detachedOrder can remain detached; managed is the returned managed copy.</code></pre>
+</figure>
+
+<p>
+  Inside a transaction, a loaded entity is managed. Mutating it is detected by JPA dirty checking,
+  so calling <code>save</code> after every setter is not required by JPA. A flush synchronizes
+  pending changes to the database but does not commit the transaction. <code>saveAndFlush</code> can
+  expose a constraint violation earlier, but frequent flushing destroys batching and adds round
+  trips.
+</p>
+
+<div class="note">
+  <strong>Repository save is not an upsert guarantee</strong>
+  <p>
+    It follows entity-state semantics. Concurrent inserts can still violate unique constraints, and
+    merging a detached graph can copy stale or unintended state. A database-specific atomic upsert
+    needs explicit SQL and clearly defined conflict behavior.
+  </p>
+</div>
+
+<h2 id="derived-queries"><span class="num">04.</span> Derived query methods</h2>
+<p class="lead">
+  Query derivation parses a method name into a subject, result modifiers, property path, operators,
+  and ordering.
+</p>
+
+<figure class="code">
+  <figcaption><b>Representative derived queries</b></figcaption>
+  <pre><code>Optional&lt;User&gt; findByTenantIdAndEmailIgnoreCase(UUID tenantId, String email);
+
+List&lt;Order&gt; findTop20ByStatusAndCreatedAtBeforeOrderByCreatedAtDesc(
+    OrderStatus status, Instant cursor);
+
+boolean existsByTenantIdAndExternalReference(UUID tenantId, String reference);
+
+long countByStatusIn(Collection&lt;OrderStatus&gt; statuses);
+
+List&lt;Customer&gt; findByAddress_City(String city);</code></pre>
+</figure>
+
+<p>
+  Common predicates include <code>Between</code>, <code>LessThan</code>,
+  <code>GreaterThanEqual</code>, <code>Like</code>, <code>Containing</code>,
+  <code>StartingWith</code>, <code>In</code>, <code>IsNull</code>, <code>True</code>,
+  <code>IgnoreCase</code>, <code>Not</code>, <code>And</code>, and <code>Or</code>. Modifiers
+  include <code>Distinct</code>, <code>First</code>, and <code>Top</code>. An underscore can make an
+  intended nested path explicit when property names would otherwise be ambiguous.
+</p>
+
+<p>
+  The default query lookup strategy is normally <code>CREATE_IF_NOT_FOUND</code>: try a declared
+  query first, then derive one. <code>USE_DECLARED_QUERY</code> fails when no declared query exists,
+  while <code>CREATE</code> derives queries. Invalid property paths usually fail during application
+  startup, which is useful feedback.
+</p>
+
+<div class="warn">
+  <strong>Do not encode a query language in Java names</strong>
+  <p>
+    Short, stable predicates are readable. A long method containing many mixed
+    <code>And</code>/<code>Or</code> clauses is hard to review and cannot express parentheses
+    freely. Move complex logic to JPQL, a specification, Querydsl, or a custom implementation.
+  </p>
+</div>
+
+<h2 id="return-types"><span class="num">05.</span> Parameters, nulls, and return types</h2>
+<p class="lead">
+  Method signatures communicate cardinality, absence, streaming behavior, and the cost of a query.
+</p>
+
+<ul class="clean">
+  <li>
+    Use <code>Optional&lt;T&gt;</code> when zero or one row is valid. More than one match causes an
+    incorrect-result-size exception.
+  </li>
+  <li>Collection-returning methods normally return an empty collection, not <code>null</code>.</li>
+  <li>
+    <code>Page&lt;T&gt;</code> normally runs both a content query and a count query.
+    <code>Slice&lt;T&gt;</code> only asks whether another slice exists and avoids the total count.
+  </li>
+  <li>
+    <code>Stream&lt;T&gt;</code> holds persistence and database resources. Consume it inside a
+    transaction and close it with try-with-resources.
+  </li>
+  <li>
+    <code>Window&lt;T&gt;</code> supports scrolling through chunks using offset or keyset positions.
+  </li>
+  <li>
+    <code>Limit</code>, <code>Sort</code>, and <code>Pageable</code> are special parameters
+    interpreted by the repository infrastructure rather than bound as query values.
+  </li>
+</ul>
+
+<p>
+  Use named <code>@Param</code> bindings in declared queries for clarity. Never concatenate user
+  input into JPQL or SQL. Bound parameters protect values, but identifiers and sort expressions
+  cannot generally be bound. Map client sort keys through an allowlist of known application fields.
+</p>
+
+<h2 id="jpql-query"><span class="num">06.</span> JPQL with @Query</h2>
+<p class="lead">
+  JPQL queries entities and mapped attributes, not database table and column names.
+</p>
+
+<figure class="code">
+  <figcaption><b>Explicit JPQL with a DTO projection</b></figcaption>
+  <pre><code>@Query("""
+    select new com.example.orders.OrderSummary(
+        o.id, o.status, o.total, o.createdAt
+    )
+    from Order o
+    where o.tenantId = :tenantId
+      and o.status in :statuses
+    order by o.createdAt desc, o.id desc
+    """)
+List&lt;OrderSummary&gt; findSummaries(
+    @Param("tenantId") UUID tenantId,
+    @Param("statuses") Set&lt;OrderStatus&gt; statuses,
+    Pageable pageable);</code></pre>
+</figure>
+
+<p>
+  JPQL is portable across providers and databases for standard features. It supports joins,
+  aggregates, constructor expressions, subqueries, and entity navigation. It does not directly
+  expose every PostgreSQL operator, index expression, common table expression, or window-function
+  feature. Prefer explicit joins when readability matters, and remember that joining a collection
+  multiplies root rows.
+</p>
+
+<p>
+  <code>#{#entityName}</code> can substitute a repository domain entity name in reusable generic
+  queries. Restricted value expressions can also access parameters, but complicated SpEL inside
+  query strings makes behavior harder to validate and maintain. Do not use expressions to build
+  untrusted query fragments.
+</p>
+
+<h2 id="native-queries"><span class="num">07.</span> Native SQL and named queries</h2>
+<p class="lead">
+  Native queries trade portability for exact access to database features and execution plans.
+</p>
+
+<figure class="code">
+  <figcaption><b>PostgreSQL JSONB containment query</b></figcaption>
+  <pre><code>@Query(
+    value = """
+        select o.*
+        from purchase_order o
+        where o.tenant_id = :tenantId
+          and o.attributes @&gt; cast(:filter as jsonb)
+        order by o.created_at desc, o.id desc
+        """,
+    nativeQuery = true
+)
+List&lt;Order&gt; findByAttributes(
+    @Param("tenantId") UUID tenantId,
+    @Param("filter") String jsonFilter,
+    Pageable pageable);</code></pre>
+</figure>
+
+<p>
+  Modern Spring Data JPA also offers <code>@NativeQuery</code> as a composed form of
+  <code>@Query(nativeQuery = true)</code>. For paged complex SQL, supply an explicit count query
+  when automatic count derivation is unreliable. Map results to managed entities only when every
+  required mapped column is present and aliases match. For reports, use an interface projection, DTO
+  mapping, or custom <code>EntityManager</code>/<code>JdbcClient</code> code.
+</p>
+
+<p>
+  JPA named queries live in annotations or <code>META-INF/orm.xml</code>. The conventional name is
+  <code>DomainType.methodName</code>. They can be validated early and reused, but placing many query
+  strings on entities couples the domain model to read concerns. Repository-local
+  <code>@Query</code>
+  is usually easier to discover for a query used by one method.
+</p>
+
+<div class="key">
+  <strong>Native SQL safety</strong>
+  <p>
+    Bind values, allowlist dynamic identifiers, test against the real PostgreSQL version, inspect
+    <code>EXPLAIN (ANALYZE, BUFFERS)</code> with production-like data, and document which index
+    makes the query viable.
+  </p>
+</div>
+
+<h2 id="projections"><span class="num">08.</span> Projections</h2>
+<p class="lead">
+  A projection returns a purpose-built view instead of a full aggregate when a use case needs only a
+  subset of data.
+</p>
+
+<figure class="code">
+  <figcaption><b>Closed interface and record projections</b></figcaption>
+  <pre><code>public interface OrderListView {
+    UUID getId();
+    OrderStatus getStatus();
+    BigDecimal getTotal();
+}
+
+public record OrderSummary(
+    UUID id,
+    OrderStatus status,
+    BigDecimal total
+) {}
+
+List&lt;OrderListView&gt; findByTenantId(UUID tenantId);
+
+&lt;T&gt; List&lt;T&gt; findByTenantId(UUID tenantId, Class&lt;T&gt; type);</code></pre>
+</figure>
+
+<p>
+  Closed interface projections expose accessors that match entity properties and are implemented by
+  runtime proxies. Nested projections may join and materialize more than expected. Open projections
+  use <code>@Value</code> expressions and may require the full entity because Spring cannot know
+  which attributes the expression will access. Class or record projections use constructor-based
+  materialization and make a strong API boundary. Dynamic projections select the target type at the
+  call site.
+</p>
+
+<p>
+  Projections reduce selected columns only when the query and provider can optimize them. They do
+  not automatically solve N+1 queries, unsafe lazy navigation, or expensive joins. Avoid returning
+  entities directly from controllers. DTO projections prevent accidental mutation and make the
+  persistence boundary explicit.
+</p>
+
+<h2 id="specifications"><span class="num">09.</span> Specifications and Criteria</h2>
+<p class="lead">
+  A specification represents a reusable predicate and is most useful when optional filters must be
+  composed dynamically.
+</p>
+
+<figure class="code">
+  <figcaption><b>Composable tenant-safe specifications</b></figcaption>
+  <pre><code>static Specification&lt;Order&gt; belongsTo(UUID tenantId) {
+    return (root, query, cb) -&gt;
+        cb.equal(root.get("tenantId"), tenantId);
+}
+
+static Specification&lt;Order&gt; hasStatus(OrderStatus status) {
+    return (root, query, cb) -&gt;
+        status == null ? cb.conjunction() : cb.equal(root.get("status"), status);
+}
+
+static Specification&lt;Order&gt; createdAfter(Instant from) {
+    return (root, query, cb) -&gt;
+        from == null ? cb.conjunction() : cb.greaterThanOrEqualTo(root.get("createdAt"), from);
+}
+
+Specification&lt;Order&gt; filter = belongsTo(tenantId)
+    .and(hasStatus(request.status()))
+    .and(createdAfter(request.from()));
+
+Page&lt;Order&gt; page = repository.findAll(filter, pageable);</code></pre>
+</figure>
+
+<p>
+  <code>JpaSpecificationExecutor</code> executes specifications for find, count, existence, and
+  delete operations, with capabilities depending on the Spring Data version. The Criteria API is
+  type-safe only when a generated static metamodel is used; string paths otherwise fail at runtime.
+  Keep tenant and authorization predicates mandatory rather than accepting arbitrary client-built
+  specifications.
+</p>
+
+<p>
+  Specifications become difficult when they mutate the query to add fetch joins, grouping, or
+  selection. The same specification can be used for a count query where collection fetch joins are
+  invalid or totals differ. Prefer a custom repository for complex reporting or use APIs that let
+  the count specification be supplied separately.
+</p>
+
+<h2 id="query-by-example"><span class="num">10.</span> Query by Example</h2>
+<p class="lead">
+  Query by Example builds predicates from a probe object plus an
+  <code>ExampleMatcher</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>A guarded search form</b></figcaption>
+  <pre><code>Customer probe = new Customer();
+probe.setTenantId(tenantId);
+probe.setName(request.name());
+
+ExampleMatcher matcher = ExampleMatcher.matchingAll()
+    .withIgnoreNullValues()
+    .withMatcher("name", match -&gt; match.ignoreCase().contains());
+
+Example&lt;Customer&gt; example = Example.of(probe, matcher);
+Page&lt;Customer&gt; result = repository.findAll(example, pageable);</code></pre>
+</figure>
+
+<p>
+  QBE is approachable for simple form-like equality and string matching. Null properties are ignored
+  by default, while primitive fields are included unless ignored because they cannot be null. A
+  matcher can configure case sensitivity, starts/ends/contains behavior, ignored paths, value
+  transformation, and matching all versus any predicates.
+</p>
+
+<div class="warn">
+  <strong>Know QBE's limits</strong>
+  <p>
+    It cannot express grouped predicates such as <code>A or (B and C)</code>, does not match
+    collections or maps, and gives non-string properties exact matching. It is not a replacement for
+    specifications, joins, ranges, aggregates, or database-specific search.
+  </p>
+</div>
+
+<h2 id="pagination-sorting"><span class="num">11.</span> Pagination, sorting, and scrolling</h2>
+<p class="lead">
+  Pagination is correct only when ordering is deterministic and the chosen strategy matches the size
+  and navigation requirements.
+</p>
+
+<figure class="code">
+  <figcaption><b>Stable offset page</b></figcaption>
+  <pre><code>PageRequest page = PageRequest.of(
+    0,
+    50,
+    Sort.by(
+        Sort.Order.desc("createdAt"),
+        Sort.Order.desc("id")
+    )
+);</code></pre>
+</figure>
+
+<p>
+  Page indexes are zero-based. Always cap client-provided page sizes. Add a unique tie-breaker such
+  as the identifier because sorting only by a repeated timestamp allows rows to move between pages.
+  Validate sort properties against an allowlist. Function-based sorts may require
+  <code>JpaSort.unsafe</code>, which should contain only server-controlled expressions.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>Best use</th>
+        <th>Main cost or constraint</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Page</code></td>
+        <td>UI requires page numbers and exact total</td>
+        <td>Runs a count query, which can be costly</td>
+      </tr>
+      <tr>
+        <td><code>Slice</code></td>
+        <td>Next/previous navigation without exact total</td>
+        <td>Still uses offset for deep pages</td>
+      </tr>
+      <tr>
+        <td>Offset scrolling</td>
+        <td>Simple chunk iteration</td>
+        <td>Database must skip earlier rows</td>
+      </tr>
+      <tr>
+        <td>Keyset scrolling</td>
+        <td>Large, ordered feeds and batch processing</td>
+        <td>Needs stable non-null sort keys and cursor state</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  For a PostgreSQL keyset ordered by <code>created_at desc, id desc</code>, request the next window
+  with a row comparison such as <code>where (created_at, id) &lt; (:lastCreatedAt, :lastId)</code>.
+  Support it with a matching multicolumn index and include tenant or other fixed prefixes where
+  appropriate.
+</p>
+
+<h2 id="entity-graphs"><span class="num">12.</span> Entity graphs and fetch planning</h2>
+<p class="lead">
+  An entity graph selects relationships needed for one query without changing the mapping's global
+  fetch mode.
+</p>
+
+<figure class="code">
+  <figcaption><b>Ad hoc entity graph</b></figcaption>
+  <pre><code>@EntityGraph(attributePaths = {"customer", "lines.product"})
+Optional&lt;Order&gt; findDetailedByIdAndTenantId(UUID id, UUID tenantId);</code></pre>
+</figure>
+
+<p>
+  A named graph is declared on an entity and referenced by name. An ad hoc graph lists attribute
+  paths on the repository method. A fetch graph treats listed attributes as eager for that
+  operation, while a load graph keeps mapping defaults for unspecified attributes. Provider behavior
+  around eager defaults should be verified.
+</p>
+
+<p>
+  Entity graphs help avoid N+1 reads for known object shapes. Fetching multiple to-many collections
+  can create a Cartesian product, duplicate root data, and huge result sets. Collection fetch joins
+  and pagination are especially dangerous because limiting joined rows is not the same as limiting
+  root entities. Prefer a two-step query, DTO projection, batch fetching, or a dedicated read query.
+</p>
+
+<h2 id="auditing"><span class="num">13.</span> Auditing</h2>
+<p class="lead">
+  Spring Data auditing fills who-created, who-modified, created-time, and modified-time metadata
+  during entity lifecycle events.
+</p>
+
+<figure class="code">
+  <figcaption><b>Audited base type</b></figcaption>
+  <pre><code>@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+abstract class AuditedEntity {
+
+    @CreatedDate
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @LastModifiedDate
+    @Column(nullable = false)
+    private Instant updatedAt;
+
+    @CreatedBy
+    @Column(nullable = false, updatable = false)
+    private UUID createdBy;
+
+    @LastModifiedBy
+    @Column(nullable = false)
+    private UUID updatedBy;
+}
+
+@Configuration
+@EnableJpaAuditing
+class JpaAuditConfiguration {
+
+    @Bean
+    AuditorAware&lt;UUID&gt; auditorAware(CurrentActor actor) {
+        return () -&gt; actor.id();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Use <code>Instant</code> for a timezone-independent timeline and configure a controllable clock
+  for deterministic tests where supported. An asynchronous job or message consumer has no HTTP
+  security principal, so define a system actor or propagate authenticated identity deliberately.
+  <code>AuditorAware</code> returning empty can conflict with non-null columns.
+</p>
+
+<div class="note">
+  <strong>Auditing metadata is not an audit log</strong>
+  <p>
+    These four fields describe the latest state. They do not record previous values, failed changes,
+    bulk SQL executed outside entity callbacks, or who viewed data. Use history tables, Envers,
+    domain events, or a dedicated immutable audit trail for compliance requirements.
+  </p>
+</div>
+
+<h2 id="custom-repositories"><span class="num">14.</span> Custom repository fragments</h2>
+<p class="lead">
+  A custom fragment is the escape hatch for behavior that method names, annotations, specifications,
+  and examples cannot express cleanly.
+</p>
+
+<figure class="code">
+  <figcaption><b>Fragment interface and implementation</b></figcaption>
+  <pre><code>public interface OrderSearch {
+    List&lt;OrderSearchRow&gt; search(OrderSearchRequest request);
+}
+
+class OrderSearchImpl implements OrderSearch {
+
+    private final EntityManager entityManager;
+
+    OrderSearchImpl(EntityManager entityManager) {
+        this.entityManager = entityManager;
+    }
+
+    @Override
+    public List&lt;OrderSearchRow&gt; search(OrderSearchRequest request) {
+        // Build focused Criteria, JPQL, or native query here.
+        return List.of();
+    }
+}
+
+public interface OrderRepository
+        extends JpaRepository&lt;Order, UUID&gt;, OrderSearch {
+}</code></pre>
+</figure>
+
+<p>
+  The implementation name convention is the fragment interface name plus <code>Impl</code>. Keep it
+  beneath the repository scan package. Fragment composition is reusable, and custom fragments take
+  precedence over the base implementation. The older single implementation named after the
+  repository interface is deprecated in current Spring Data guidance.
+</p>
+
+<p>
+  A fragment may inject <code>EntityManager</code>, <code>JdbcClient</code>,
+  <code>NamedParameterJdbcTemplate</code>, or another adapter. JDBC is often clearer for window
+  functions, recursive CTEs, vendor operators, bulk ingestion, and reporting that does not need
+  managed entities. Use <code>JpaContext</code> when a reusable fragment must find the entity
+  manager for a domain type across multiple persistence units.
+</p>
+
+<h2 id="bulk-updates"><span class="num">15.</span> Bulk update and delete queries</h2>
+<p class="lead">
+  A bulk query changes database rows directly and bypasses normal per-entity state management.
+</p>
+
+<figure class="code">
+  <figcaption><b>Scoped bulk transition</b></figcaption>
+  <pre><code>@Modifying(flushAutomatically = true, clearAutomatically = true)
+@Query("""
+    update Order o
+       set o.status = :next,
+           o.updatedAt = :now,
+           o.version = o.version + 1
+     where o.tenantId = :tenantId
+       and o.status = :expected
+       and o.createdAt &lt; :cutoff
+    """)
+int transitionOldOrders(
+    UUID tenantId,
+    OrderStatus expected,
+    OrderStatus next,
+    Instant cutoff,
+    Instant now);</code></pre>
+</figure>
+
+<p>
+  <code>@Modifying</code> tells Spring Data that an annotated query performs update or delete and
+  returns an affected-row count. <code>flushAutomatically</code> can send pending changes before the
+  query. <code>clearAutomatically</code> detaches managed objects afterward so stale state is not
+  reused, but clearing also discards unflushed in-memory changes if they were not flushed.
+</p>
+
+<p>
+  Jakarta Persistence bulk operations do not synchronize the persistence context, do not perform
+  optimistic-lock checks automatically, and do not invoke normal entity callbacks. Bulk delete does
+  not apply entity cascade semantics. A derived <code>deleteBy...</code> normally loads matching
+  entities and removes them one by one, allowing callbacks but using more memory and SQL. An
+  explicit bulk delete is faster but has different semantics.
+</p>
+
+<div class="warn">
+  <strong>Version and audit fields need deliberate handling</strong>
+  <p>
+    If bulk SQL changes data protected by <code>@Version</code>, update the version or otherwise
+    enforce concurrency rules. Set audit fields explicitly, and account for database triggers and
+    second-level cache invalidation.
+  </p>
+</div>
+
+<h2 id="transactions"><span class="num">16.</span> Transactionality and boundaries</h2>
+<p class="lead">
+  Put the transaction around the complete business use case, not around isolated repository calls.
+</p>
+
+<p>
+  Inherited read methods from <code>SimpleJpaRepository</code> are read-only transactions. Other
+  inherited CRUD methods use ordinary transactional configuration. Declared query methods do not
+  automatically receive transaction settings, so define them at the service boundary or annotate the
+  repository/interface where appropriate.
+</p>
+
+<figure class="code">
+  <figcaption><b>Service-owned unit of work</b></figcaption>
+  <pre><code>@Service
+public class CheckoutService {
+
+    private final OrderRepository orders;
+    private final InventoryRepository inventory;
+
+    @Transactional
+    public Receipt checkout(UUID tenantId, UUID orderId) {
+        Order order = orders.findByIdAndTenantId(orderId, tenantId)
+            .orElseThrow(OrderNotFoundException::new);
+        inventory.reserve(order.requestedItems());
+        order.markPaid();
+        return Receipt.from(order);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The outer transaction configuration governs participating repository calls. A read-only
+  transaction is a performance hint, not a security boundary or universal write prohibition. With
+  Hibernate, Spring can reduce dirty-checking work by changing flush behavior. Do not assume that an
+  entity remains initialized after leaving the transaction.
+</p>
+
+<ul class="clean">
+  <li>Keep transactions short and free of user think time.</li>
+  <li>Avoid remote HTTP calls while holding database locks and a pool connection.</li>
+  <li>Do not return lazy entities to serialization code.</li>
+  <li>Remember that proxy-based <code>@Transactional</code> can be bypassed by self-invocation.</li>
+  <li>
+    Use an outbox or another reliable pattern when a database change must coordinate with messaging.
+  </li>
+</ul>
+
+<h2 id="locking"><span class="num">17.</span> Locking and concurrency</h2>
+<p class="lead">
+  Choose optimistic locking for conflict detection and pessimistic locking only when immediate
+  database serialization is justified.
+</p>
+
+<figure class="code">
+  <figcaption><b>Pessimistic lock on a query method</b></figcaption>
+  <pre><code>@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("""
+    select o from Order o
+    where o.id = :id and o.tenantId = :tenantId
+    """)
+Optional&lt;Order&gt; findForUpdate(UUID id, UUID tenantId);</code></pre>
+</figure>
+
+<p>
+  <code>@Lock</code> applies a JPA <code>LockModeType</code> to a derived or declared query. A CRUD
+  method can be redeclared and annotated too. Locking queries require an active transaction.
+  <code>OPTIMISTIC</code> checks a versioned entity, while
+  <code>OPTIMISTIC_FORCE_INCREMENT</code> also advances the version. PostgreSQL normally implements
+  <code>PESSIMISTIC_WRITE</code> with row-level locking behavior such as
+  <code>SELECT ... FOR UPDATE</code>, subject to provider translation.
+</p>
+
+<p>
+  Locks do not replace unique constraints. Acquire multiple locks in a consistent order, keep locked
+  transactions short, configure a finite lock/query timeout, and retry deadlock or serialization
+  failures only when the entire use case is idempotent. <code>SKIP LOCKED</code> can support
+  competing workers through native SQL, but skipped work needs lease, retry, and starvation
+  policies.
+</p>
+
+<h2 id="postgresql"><span class="num">18.</span> PostgreSQL-specific repository queries</h2>
+<p class="lead">
+  Use PostgreSQL features when they provide clear correctness or performance value, and isolate the
+  vendor-specific contract.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th>Repository use</th>
+        <th>Index or caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>jsonb</code> <code>@&gt;</code></td>
+        <td>Containment within semi-structured attributes</td>
+        <td>Use a suitable GIN index and validate JSON input</td>
+      </tr>
+      <tr>
+        <td><code>to_tsvector</code>/<code>@@</code></td>
+        <td>Language-aware full-text search</td>
+        <td>Store or index the same configured text-search expression</td>
+      </tr>
+      <tr>
+        <td><code>ILIKE</code></td>
+        <td>Case-insensitive pattern matching</td>
+        <td>Leading wildcards need trigram indexing for scale</td>
+      </tr>
+      <tr>
+        <td><code>ON CONFLICT</code></td>
+        <td>Atomic insert-or-update or insert-if-absent</td>
+        <td>Conflict target must match a unique constraint or index</td>
+      </tr>
+      <tr>
+        <td><code>RETURNING</code></td>
+        <td>Return changed rows without a second round trip</td>
+        <td>Mapping may fit JDBC/custom code better than repository annotation</td>
+      </tr>
+      <tr>
+        <td><code>FOR UPDATE SKIP LOCKED</code></td>
+        <td>Concurrent database-backed work claiming</td>
+        <td>Design retries, ordering, visibility timeout, and failure recovery</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Atomic claim query in a custom repository</b></figcaption>
+  <pre><code>with candidates as (
+    select id
+    from job
+    where status = 'READY'
+    order by created_at, id
+    for update skip locked
+    limit :batchSize
+)
+update job j
+set status = 'RUNNING',
+    claimed_at = clock_timestamp(),
+    worker_id = :workerId
+from candidates c
+where j.id = c.id
+returning j.*;</code></pre>
+</figure>
+
+<p>
+  Prefer a custom fragment with JDBC or carefully mapped native SQL for this shape. An H2 test does
+  not validate PostgreSQL casts, locking, planner behavior, collations, extensions, or JSON
+  operators. Use Testcontainers with PostgreSQL for integration coverage.
+</p>
+
+<h2 id="performance"><span class="num">19.</span> Performance and query diagnosis</h2>
+<p class="lead">
+  Repository convenience is safe only when query count, selected data, execution plan, and object
+  materialization remain visible.
+</p>
+
+<ul class="clean">
+  <li>
+    Detect N+1 queries by counting SQL in integration tests or traces. Fix with a projection, entity
+    graph, fetch join, or measured batch fetching.
+  </li>
+  <li>
+    Use an index whose leading columns match selective equality predicates and whose remaining order
+    supports filtering and sorting.
+  </li>
+  <li>
+    Avoid unbounded <code>findAll</code>, huge <code>IN</code> lists, and loading entities for
+    read-only reports.
+  </li>
+  <li>
+    Batch writes, but flush and clear in chunks so the persistence context does not grow without
+    bound. Identifier generation strategy can affect insert batching.
+  </li>
+  <li>Use <code>Slice</code> or keyset navigation when exact totals are unnecessary.</li>
+  <li>
+    Monitor query latency, rows returned, pool wait time, transaction duration, lock waits, and
+    deadlocks.
+  </li>
+</ul>
+
+<p>
+  Enable SQL logging only carefully because bind values can contain secrets and high-volume logging
+  is expensive. Prefer structured slow-query observations and database statistics. Run
+  <code>EXPLAIN (ANALYZE, BUFFERS)</code> on representative data, remembering that
+  <code>ANALYZE</code> executes the statement.
+</p>
+
+<div class="warn">
+  <strong>Fetch size is not page size</strong>
+  <p>
+    JDBC fetch size controls how rows travel from database to client. Pagination changes which rows
+    the database returns. Hibernate batch fetching controls how multiple lazy entities or
+    collections are initialized. These solve different problems.
+  </p>
+</div>
+
+<h2 id="security"><span class="num">20.</span> Security and data boundaries</h2>
+<p class="lead">
+  Repository code must enforce data ownership and query safety even when higher layers validate
+  input.
+</p>
+
+<ul class="clean">
+  <li>
+    Include tenant or owner predicates in every relevant lookup. <code>findById(id)</code> followed
+    by an ownership check can expose existence and is easy to misuse.
+  </li>
+  <li>
+    Bind values and never insert client text into query strings. Allowlist sort keys and query
+    modes.
+  </li>
+  <li>
+    Apply least-privilege database roles. The application user should not own the schema or have
+    unnecessary administrative rights.
+  </li>
+  <li>
+    Do not log credentials, full SQL parameters, personal data, access tokens, or sensitive entity
+    <code>toString()</code> output.
+  </li>
+  <li>
+    Treat bulk update and custom fragments as authorization-sensitive paths because they can bypass
+    entity-level checks and callbacks.
+  </li>
+  <li>
+    Consider PostgreSQL row-level security as defense in depth, while understanding connection
+    identity and session-variable pooling risks.
+  </li>
+</ul>
+
+<p>
+  Database constraints remain the final guard for uniqueness, foreign keys, non-null requirements,
+  valid ranges, and other invariants that must survive concurrency. Catch translated Spring
+  exceptions at a boundary that can convert known constraint failures into domain outcomes without
+  exposing SQL details.
+</p>
+
+<h2 id="testing"><span class="num">21.</span> Testing repositories</h2>
+<p class="lead">
+  Test query meaning and mapping against the database behavior the application actually depends on.
+</p>
+
+<figure class="code">
+  <figcaption><b>Focused repository test with PostgreSQL</b></figcaption>
+  <pre><code>@DataJpaTest
+@Testcontainers
+class OrderRepositoryTest {
+
+    @Container
+    static PostgreSQLContainer&lt;?&gt; postgres =
+        new PostgreSQLContainer&lt;&gt;("postgres:17-alpine");
+
+    @DynamicPropertySource
+    static void database(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+    }
+
+    @Autowired OrderRepository orders;
+    @Autowired TestEntityManager entityManager;
+
+    @Test
+    void query_is_scoped_to_tenant_and_has_stable_order() {
+        // Arrange rows for two tenants, flush, clear, query, and assert ordering.
+    }
+}</code></pre>
+</figure>
+
+<p>
+  <code>@DataJpaTest</code> loads a focused JPA slice and normally rolls each test back. Flush
+  before asserting a constraint failure, because SQL may otherwise be delayed until transaction
+  completion. Clear the persistence context before reads when the test must prove database mapping
+  rather than first-level-cache behavior. Import only required auditing or custom configuration.
+</p>
+
+<ul class="clean">
+  <li>Test zero, one, and many result cardinality.</li>
+  <li>Test nulls, boundary timestamps, duplicate sort keys, and empty filter collections.</li>
+  <li>Test tenant isolation and unauthorized identifiers.</li>
+  <li>Test projection column mapping and native-query aliases.</li>
+  <li>
+    Test optimistic conflicts and pessimistic behavior with separate transactions and threads.
+  </li>
+  <li>Test bulk-query persistence-context clearing and affected-row counts.</li>
+  <li>Use migration scripts in tests so schema drift is visible.</li>
+</ul>
+
+<h2 id="mistakes"><span class="num">22.</span> Common mistakes and fixes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Better approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Returning entities from REST endpoints</td>
+        <td>Leaks schema, lazy loading, cycles, and accidental fields</td>
+        <td>Map to response DTOs inside the transaction</td>
+      </tr>
+      <tr>
+        <td>One repository call per loop item</td>
+        <td>Creates N+1 round trips</td>
+        <td>Load or update in a set-oriented operation</td>
+      </tr>
+      <tr>
+        <td>Deep offset pagination</td>
+        <td>Database scans and discards earlier rows</td>
+        <td>Use stable keyset scrolling where suitable</td>
+      </tr>
+      <tr>
+        <td>Unbounded user sorting</td>
+        <td>Invalid paths, injection-like expressions, costly plans</td>
+        <td>Map public sort keys through an allowlist</td>
+      </tr>
+      <tr>
+        <td>Bulk update with managed entities loaded</td>
+        <td>Persistence context becomes stale</td>
+        <td>Flush deliberately, bulk update, then clear</td>
+      </tr>
+      <tr>
+        <td>Assuming read-only forbids writes</td>
+        <td>It is mainly an optimization hint</td>
+        <td>Use permissions, architecture, and tests for enforcement</td>
+      </tr>
+      <tr>
+        <td>Fetch-joining collections in a page</td>
+        <td>Row multiplication breaks efficient root pagination</td>
+        <td>Page IDs first, then fetch details</td>
+      </tr>
+      <tr>
+        <td>Using H2 for PostgreSQL-specific SQL</td>
+        <td>Syntax, types, locks, and plans differ</td>
+        <td>Run integration tests with PostgreSQL</td>
+      </tr>
+      <tr>
+        <td>Calling save after every entity mutation</td>
+        <td>Obscures dirty checking and may encourage wrong boundaries</td>
+        <td>Change managed entities in one service transaction</td>
+      </tr>
+      <tr>
+        <td>Putting business workflow in repository defaults</td>
+        <td>Mixes persistence with orchestration and transaction intent</td>
+        <td>Keep repository methods focused on persistence</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="when-not-repositories">
+  <span class="num">23.</span> When repository abstractions should not be used
+</h2>
+<p class="lead">
+  A repository is valuable for aggregate persistence and common queries, but it is not the best tool
+  for every database interaction.
+</p>
+
+<ul class="clean">
+  <li>
+    Use JDBC or a SQL-focused library for complex reports, many joins, window functions, CTEs, bulk
+    data movement, and results that are not aggregates.
+  </li>
+  <li>
+    Use a dedicated search engine when relevance, typo tolerance, facets, or large-scale text search
+    exceed PostgreSQL requirements.
+  </li>
+  <li>
+    Use batch or copy APIs for high-throughput ingestion instead of materializing an entity per row.
+  </li>
+  <li>
+    Use an explicit adapter around a stored procedure or database API when that is the real domain
+    boundary.
+  </li>
+  <li>
+    Avoid generic repositories that expose arbitrary CRUD for append-only ledgers, immutable events,
+    or carefully controlled aggregate transitions.
+  </li>
+</ul>
+
+<p>
+  The choice is not all-or-nothing. A service can use Spring Data JPA for aggregate changes and a
+  JDBC read adapter for a dashboard. Keep both behind intention-revealing ports and share the same
+  Spring transaction manager where the technologies and data source allow safe participation.
+</p>
+
+<h2 id="production-checklist"><span class="num">24.</span> Production checklist</h2>
+<ul class="clean">
+  <li>Use versioned schema migrations and validate mappings at startup.</li>
+  <li>Disable Open EntityManager in View and fetch DTO requirements deliberately.</li>
+  <li>Define use-case transaction boundaries with timeouts where appropriate.</li>
+  <li>Cap page size, allowlist sorting, and require stable unique ordering.</li>
+  <li>Apply tenant predicates, database constraints, and least-privilege credentials.</li>
+  <li>Inspect important generated SQL and PostgreSQL execution plans.</li>
+  <li>Measure query count, slow queries, pool saturation, lock waits, and transaction duration.</li>
+  <li>Use projections for reads and prevent accidental unbounded aggregate loading.</li>
+  <li>Handle bulk-query versions, audit values, callbacks, and persistence-context clearing.</li>
+  <li>Test vendor-specific behavior with the supported PostgreSQL version.</li>
+  <li>Make retries idempotent and coordinate external side effects through reliable patterns.</li>
+  <li>Upgrade Spring Boot as a managed dependency set and run migration plus repository tests.</li>
+</ul>
+
+<h2 id="interview"><span class="num">25.</span> Interview questions and answers</h2>
+
+<h3 id="qa-1">What does Spring Data JPA generate from a repository interface?</h3>
+<p>
+  It creates a Spring proxy composed from a store-specific base implementation, query-method
+  handling, and custom fragments. The proxy delegates inherited CRUD operations and resolves
+  declared methods into derived, named, annotated, or custom queries.
+</p>
+
+<h3 id="qa-2">JPA versus Hibernate versus Spring Data JPA?</h3>
+<p>
+  Jakarta Persistence is a specification. Hibernate is a provider implementing it. Spring Data JPA
+  is a repository abstraction built on JPA that reduces boilerplate and integrates with Spring.
+</p>
+
+<h3 id="qa-3">How does save decide between persist and merge?</h3>
+<p>
+  It uses entity information to decide whether the entity is new, commonly checking a nullable
+  version and then its identifier. New entities use <code>persist</code>; otherwise
+  <code>merge</code> is used. A manually assigned-ID entity can implement
+  <code>Persistable.isNew()</code>.
+</p>
+
+<h3 id="qa-4">When should @Query be preferred over a derived method?</h3>
+<p>
+  Use it when a readable method name cannot express joins, grouping, projections, or predicate
+  precedence clearly. Use a custom fragment when even an annotated query becomes dynamic or
+  database-specific enough to need programmatic control.
+</p>
+
+<h3 id="qa-5">Page versus Slice?</h3>
+<p>
+  A page usually executes a count query to provide totals. A slice fetches enough information to
+  report whether another slice exists and avoids the total count. Choose based on the UI contract,
+  not habit.
+</p>
+
+<h3 id="qa-6">What problem does an entity graph solve?</h3>
+<p>
+  It defines a query-specific fetch plan for associations, helping avoid lazy N+1 reads without
+  changing global mapping fetch modes. It must still be checked for row multiplication and
+  pagination problems.
+</p>
+
+<h3 id="qa-7">Specification versus Query by Example?</h3>
+<p>
+  Specifications compose arbitrary Criteria predicates and can express ranges, joins, and nested
+  logic. QBE creates simple equality or string predicates from a probe and matcher, but cannot
+  express grouped logic or collection matching.
+</p>
+
+<h3 id="qa-8">Why can a bulk @Modifying query be dangerous?</h3>
+<p>
+  It changes rows directly, bypasses managed entity synchronization, automatic optimistic-lock
+  checks, callbacks, and entity cascade behavior. Flush and clear deliberately, update version and
+  audit fields, and test affected-row counts.
+</p>
+
+<h3 id="qa-9">Where should @Transactional normally be placed?</h3>
+<p>
+  Place it on the service operation that defines the complete unit of work. Repository defaults are
+  useful, but they cannot describe a business transaction spanning multiple repositories or
+  operations.
+</p>
+
+<h3 id="qa-10">How do you prevent N+1 queries?</h3>
+<p>
+  First measure query count. Then select the smallest fitting solution: DTO projection, entity
+  graph, fetch join, batch fetching, or a separate set-oriented query. Do not globally mark every
+  association eager.
+</p>
+
+<h3 id="qa-11">Why is keyset pagination faster for deep navigation?</h3>
+<p>
+  It resumes after the last ordered key, allowing an index to seek forward. Offset pagination asks
+  the database to locate and discard all previous rows. Keyset pagination requires deterministic,
+  stable, typically non-null sort keys.
+</p>
+
+<h3 id="qa-12">When would you use JDBC beside Spring Data JPA?</h3>
+<p>
+  Use JDBC for SQL-centric reporting, CTEs, window functions, PostgreSQL-specific operations, bulk
+  ingestion, and DTO results where persistence-context behavior provides no value.
+</p>
+
+<h2 id="practice"><span class="num">26.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>Create a focused repository that never exposes unbounded <code>findAll()</code>.</li>
+  <li>Write and test a tenant-scoped derived query with stable ordering.</li>
+  <li>Replace a long derived method with readable JPQL and a record projection.</li>
+  <li>Build optional search filters with composable specifications.</li>
+  <li>Implement the same simple filter with QBE and document what it cannot express.</li>
+  <li>Compare <code>Page</code>, <code>Slice</code>, and keyset query SQL on 100,000 rows.</li>
+  <li>Reproduce an N+1 query, then fix it with a projection and an entity graph.</li>
+  <li>
+    Demonstrate stale managed state after a bulk update, then apply safe flush/clear behavior.
+  </li>
+  <li>Write an optimistic-lock conflict test using two independent transactions.</li>
+  <li>Implement PostgreSQL JSONB search in a custom fragment and verify its GIN index plan.</li>
+  <li>Test auditing for an authenticated actor and a background system actor.</li>
+  <li>
+    Design an atomic <code>SKIP LOCKED</code> worker claim with retry and abandoned-job recovery.
+  </li>
+</ol>
+
+<h2 id="cheatsheet"><span class="num">27.</span> One-screen cheat sheet</h2>
+<div class="key">
+  <strong>Core rules</strong>
+  <ul class="clean">
+    <li>Repository proxies reduce boilerplate; JPA and SQL semantics still control behavior.</li>
+    <li>
+      Use derived queries for short stable predicates and explicit queries for complex intent.
+    </li>
+    <li>
+      Use projections to shape reads and avoid exposing entities outside the service boundary.
+    </li>
+    <li>Use specifications for composable filters and QBE for simple probe-based matching.</li>
+    <li>
+      <code>Page</code> counts, <code>Slice</code> avoids totals, and keyset navigation seeks.
+    </li>
+    <li>Entity graphs are query-specific fetch plans, not automatic performance guarantees.</li>
+    <li>Bulk queries bypass entity synchronization, callbacks, and automatic version checks.</li>
+    <li>Put transactions around use cases and keep them short.</li>
+    <li>Use optimistic versions by default; apply pessimistic locks deliberately.</li>
+    <li>Bind values, allowlist sorts, scope by tenant, and rely on database constraints.</li>
+    <li>Test PostgreSQL-specific behavior on PostgreSQL and inspect important plans.</li>
+    <li>
+      Choose JDBC or custom adapters when the problem is SQL-centric rather than aggregate-centric.
+    </li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">28.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA reference documentation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/commons/reference/repositories.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data repository abstraction</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/jpa/query-methods.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA query methods</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/jpa/specifications.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA specifications</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/repositories/query-by-example.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA Query by Example</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/repositories/projections.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA projections</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/auditing.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA auditing</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/repositories/custom-implementations.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Custom repository implementations</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/jpa/transactions.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA transactionality</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/jpa/reference/jpa/locking.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data JPA locking</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/data/sql.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot SQL database and JPA support</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://jakarta.ee/specifications/persistence/3.2/jakarta-persistence-spec-3.2"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Jakarta Persistence specification</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.hibernate.org/orm/current/userguide/html_single/Hibernate_User_Guide.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Hibernate ORM user guide</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/functions-json.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL JSON functions and operators</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/textsearch.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL full-text search</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/sql-select.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL SELECT and locking clauses</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
