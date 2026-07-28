@@ -186,6 +186,29 @@ a {
   color: var(--faint);
   margin: 0 0 6px 8px;
 }
+.nav-group-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: calc(100% - 8px);
+  padding: 0;
+  border: 0;
+  background: none;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.nav-group-chevron {
+  display: block;
+  flex: none;
+  transition: transform 0.2s ease;
+}
+.nav-group-toggle[aria-expanded="false"] .nav-group-chevron {
+  transform: rotate(-90deg);
+}
+.nav-group-toggle[aria-expanded="false"] + .nav-group-content {
+  display: none;
+}
 .nav-group ul {
   list-style: none;
   margin: 0;
@@ -843,7 +866,8 @@ footer.doc-footer {
   html {
     scroll-behavior: auto;
   }
-  .sidebar {
+  .sidebar,
+  .nav-group-chevron {
     transition: none;
   }
 }

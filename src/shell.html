@@ -135,6 +135,56 @@
             if (e.target.closest("ol a")) setToc(false);
           });
 
+        var navStateKey = "knowledge-base:collapsed-sidebar-groups";
+        if (document.body.classList.contains("is-home")) {
+          try {
+            window.localStorage.removeItem(navStateKey);
+          } catch (e) {
+            // No saved sidebar state exists when storage is unavailable.
+          }
+        }
+
+        function readCollapsedNavGroups() {
+          try {
+            var saved = JSON.parse(window.localStorage.getItem(navStateKey) || "[]");
+            if (!Array.isArray(saved)) return [];
+            return saved.filter(function (key, index) {
+              return typeof key === "string" && saved.indexOf(key) === index;
+            });
+          } catch (e) {
+            return [];
+          }
+        }
+        function writeCollapsedNavGroups(groups) {
+          try {
+            window.localStorage.setItem(navStateKey, JSON.stringify(groups));
+          } catch (e) {
+            // The sidebar still works for this page when storage is unavailable.
+          }
+        }
+
+        var collapsedNavGroups = readCollapsedNavGroups();
+        document.querySelectorAll(".nav-group-toggle").forEach(function (btn) {
+          var key = btn.dataset.navKey;
+          if (key && collapsedNavGroups.indexOf(key) !== -1) {
+            btn.setAttribute("aria-expanded", "false");
+          }
+
+          btn.addEventListener("click", function () {
+            var open = btn.getAttribute("aria-expanded") === "true";
+            btn.setAttribute("aria-expanded", open ? "false" : "true");
+
+            if (!key) return;
+            var savedIndex = collapsedNavGroups.indexOf(key);
+            if (open && savedIndex === -1) {
+              collapsedNavGroups.push(key);
+            } else if (!open && savedIndex !== -1) {
+              collapsedNavGroups.splice(savedIndex, 1);
+            }
+            writeCollapsedNavGroups(collapsedNavGroups);
+          });
+        });
+
         document.querySelectorAll(".show-more").forEach(function (btn) {
           btn.addEventListener("click", function () {
             var open = btn.getAttribute("aria-expanded") === "true";
