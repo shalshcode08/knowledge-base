@@ -67,6 +67,10 @@
         {
           "title": "Spring MVC and REST APIs",
           "path": "spring/spring-mvc-rest-apis"
+        },
+        {
+          "title": "Spring JDBC and Database Access",
+          "path": "spring/spring-jdbc-database-access"
         }
       ]
     }
