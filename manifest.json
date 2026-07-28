@@ -69,6 +69,10 @@
           "path": "spring/spring-mvc-rest-apis"
         },
         {
+          "title": "Spring Transaction Management",
+          "path": "spring/spring-transaction-management"
+        },
+        {
           "title": "Spring Data JPA",
           "path": "spring/spring-data-jpa"
         }
