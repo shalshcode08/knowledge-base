@@ -69,28 +69,24 @@
           "path": "spring/spring-mvc-rest-apis"
         },
         {
-          "title": "Spring Transaction Management",
-          "path": "spring/spring-transaction-management"
-        },
-        {
-          "title": "Spring Data JPA",
-          "path": "spring/spring-data-jpa"
+          "title": "Spring JDBC and Database Access",
+          "path": "spring/spring-jdbc-database-access"
         },
         {
           "title": "JPA and Hibernate Fundamentals",
           "path": "spring/jpa-hibernate-fundamentals"
         },
         {
-          "title": "Spring JDBC and Database Access",
-          "path": "spring/spring-jdbc-database-access"
+          "title": "Spring Data JPA",
+          "path": "spring/spring-data-jpa"
+        },
+        {
+          "title": "Spring Transaction Management",
+          "path": "spring/spring-transaction-management"
         },
         {
           "title": "Spring Security",
           "path": "spring/spring-security"
-        },
-        {
-          "title": "Observability and Production Operations",
-          "path": "spring/observability-production-operations"
         },
         {
           "title": "Testing Spring Applications",
@@ -99,6 +95,10 @@
         {
           "title": "Caching, Scheduling, Async Processing, and Events",
           "path": "spring/caching-scheduling-async-events"
+        },
+        {
+          "title": "Observability and Production Operations",
+          "path": "spring/observability-production-operations"
         }
       ]
     }
