@@ -1,0 +1,1506 @@
+<h1>Spring Security - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to authentication, authorization, the servlet security
+  filter chain, sessions, passwords, JWTs, OAuth 2.0, OpenID Connect, method security, browser
+  protections, testing, and production hardening.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The security mental model</h2>
+<p class="lead">
+  Spring Security is a framework for deciding who a caller is, what that caller may do, and how an
+  application resists common attacks while making those decisions.
+</p>
+
+<p>
+  Security is not one login page. It is a chain of controls around every protected operation. A
+  request may need transport security, credential extraction, credential validation, identity
+  persistence, authorization, safe error handling, audit events, and browser protections. A defect
+  in any layer can defeat correct code in another layer.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of an airport. Authentication checks that the passport belongs to the traveler.
+    Authorization checks whether the boarding pass permits entry to this flight and gate. Security
+    controls also protect the building, luggage, records, and staff workflows. A valid passport does
+    not grant access everywhere.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Concept</th>
+        <th>Question</th>
+        <th>Typical Spring representation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Authentication</td>
+        <td>Who or what is calling?</td>
+        <td><code>Authentication</code>, <code>AuthenticationManager</code></td>
+      </tr>
+      <tr>
+        <td>Authorization</td>
+        <td>May this identity perform this action on this resource?</td>
+        <td><code>AuthorizationManager</code>, request and method rules</td>
+      </tr>
+      <tr>
+        <td>Credential</td>
+        <td>What evidence supports the identity?</td>
+        <td>Password, session cookie, bearer token, client certificate</td>
+      </tr>
+      <tr>
+        <td>Principal</td>
+        <td>Whose identity was established?</td>
+        <td><code>UserDetails</code>, OIDC user, JWT subject, custom object</td>
+      </tr>
+      <tr>
+        <td>Authority</td>
+        <td>What named capability or role was granted?</td>
+        <td><code>GrantedAuthority</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Deny by default</strong>
+  <p>
+    Start with every request and operation denied, then explicitly permit the smallest required
+    surface. Authentication alone is never an authorization policy. Validate ownership, tenant,
+    state, amount, and other business facts at the service boundary.
+  </p>
+</div>
+
+<h2 id="boot-start"><span class="num">01.</span> Spring Boot starting point</h2>
+<p class="lead">
+  Spring Boot supplies dependency management and safe defaults, while the application owns its
+  actual access policy.
+</p>
+
+<p>
+  Adding <code>spring-boot-starter-security</code> makes a servlet web application secure by
+  default. Boot creates a generated development password and protects requests when the application
+  has not supplied its own web-security configuration. Real applications should declare a
+  <code>SecurityFilterChain</code> bean and identity infrastructure appropriate to their trust
+  model. Defining the bean causes Boot's default web policy to back off.
+</p>
+
+<figure class="code">
+  <figcaption><b>A clear session-based policy</b></figcaption>
+  <pre><code>@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain applicationSecurity(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers("/", "/assets/**", "/login").permitAll()
+                .requestMatchers(HttpMethod.GET, "/api/catalog/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())
+            .formLogin(form -&gt; form
+                .loginPage("/login")
+                .permitAll())
+            .logout(logout -&gt; logout
+                .logoutSuccessUrl("/?logout"))
+            .sessionManagement(session -&gt; session
+                .sessionFixation(fixation -&gt; fixation.changeSessionId()));
+
+        return http.build();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Match specific routes before <code>anyRequest()</code>. Rules are evaluated in declaration order,
+  and the first matching authorization rule decides. A broad <code>permitAll()</code> placed too
+  early can expose every route below it. Static resources may be permitted through the chain so
+  Spring Security can still write headers; completely ignoring them bypasses all security filters.
+</p>
+
+<h2 id="filter-chain"><span class="num">02.</span> Security filter chain architecture</h2>
+<p class="lead">
+  Servlet security runs mainly before controllers, through filters assembled and ordered by Spring
+  Security.
+</p>
+
+<p>
+  The servlet container delegates to <code>DelegatingFilterProxy</code>, which looks up the Spring
+  bean named <code>springSecurityFilterChain</code>. That bean is normally a
+  <code>FilterChainProxy</code>. It chooses the first matching <code>SecurityFilterChain</code> and
+  invokes that chain's security filters in a defined order.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>Representative filter or component</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Load context</td>
+        <td><code>SecurityContextHolderFilter</code></td>
+        <td>Makes the stored authentication available for the request.</td>
+      </tr>
+      <tr>
+        <td>Browser defenses</td>
+        <td><code>HeaderWriterFilter</code>, <code>CsrfFilter</code></td>
+        <td>Writes security headers and validates CSRF tokens.</td>
+      </tr>
+      <tr>
+        <td>Logout</td>
+        <td><code>LogoutFilter</code></td>
+        <td>Clears authentication and configured client state.</td>
+      </tr>
+      <tr>
+        <td>Authentication</td>
+        <td>Form, Basic, bearer, or custom authentication filters</td>
+        <td>Extracts a credential and attempts authentication.</td>
+      </tr>
+      <tr>
+        <td>Error translation</td>
+        <td><code>ExceptionTranslationFilter</code></td>
+        <td>Turns security exceptions into login, 401, or 403 responses.</td>
+      </tr>
+      <tr>
+        <td>Request authorization</td>
+        <td><code>AuthorizationFilter</code></td>
+        <td>Applies the matching endpoint rule before application code.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Filter order is part of the security design. Authentication must happen before authorization.
+  Exception translation must surround later filters that can deny access. Prefer built-in DSL hooks.
+  If a custom filter is unavoidable, use <code>addFilterBefore</code>, <code>addFilterAfter</code>,
+  or <code>addFilterAt</code> relative to a known filter and document why that location is correct.
+</p>
+
+<h3 id="multiple-chains">Multiple filter chains</h3>
+<p>
+  Separate chains are useful when, for example, <code>/api/**</code> uses bearer tokens and browser
+  pages use sessions. Give each chain a <code>securityMatcher</code> and an explicit
+  <code>@Order</code>. The first chain whose matcher accepts the request wins. Include a final
+  catch-all chain, or unmatched requests receive no Spring Security protection.
+</p>
+
+<figure class="code">
+  <figcaption><b>Independent API and browser chains</b></figcaption>
+  <pre><code>@Bean
+@Order(1)
+SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http
+        .securityMatcher("/api/**")
+        .authorizeHttpRequests(auth -&gt; auth.anyRequest().authenticated())
+        .oauth2ResourceServer(oauth -&gt; oauth.jwt(Customizer.withDefaults()))
+        .sessionManagement(session -&gt;
+            session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .csrf(AbstractHttpConfigurer::disable);
+    return http.build();
+}
+
+@Bean
+@Order(2)
+SecurityFilterChain browser(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers("/", "/assets/**").permitAll()
+            .anyRequest().authenticated())
+        .formLogin(Customizer.withDefaults());
+    return http.build();
+}</code></pre>
+</figure>
+
+<h2 id="authentication"><span class="num">03.</span> Authentication internals</h2>
+<p class="lead">
+  Authentication converts untrusted credential input into a trusted application identity.
+</p>
+
+<p>
+  An authentication filter creates an unauthenticated <code>Authentication</code> token and sends it
+  to an <code>AuthenticationManager</code>. The common <code>ProviderManager</code> tries compatible
+  <code>AuthenticationProvider</code> instances. A username/password provider may load
+  <code>UserDetails</code> through a <code>UserDetailsService</code> and compare the submitted
+  password with a <code>PasswordEncoder</code>. A bearer provider instead validates a JWT or
+  introspects an opaque token. Successful authentication returns an authenticated object containing
+  a principal and authorities.
+</p>
+
+<div class="note">
+  <strong>Trust boundary</strong>
+  <p>
+    Never set <code>authenticated=true</code> merely because a request contains a username or token.
+    Only a trusted provider should produce an authenticated result after verification. Erase raw
+    credentials after authentication and never log them.
+  </p>
+</div>
+
+<p>
+  <code>UserDetailsService</code> loads account facts. It does not itself verify the submitted
+  password. Account locked, disabled, expired, and credential-expired flags are separate checks.
+  Return generic failures such as "invalid credentials" to clients so an attacker cannot enumerate
+  usernames, while recording safe diagnostic detail internally.
+</p>
+
+<h2 id="security-context"><span class="num">04.</span> SecurityContext and identity propagation</h2>
+<p class="lead">
+  The <code>SecurityContext</code> holds the current <code>Authentication</code> for the execution.
+</p>
+
+<p>
+  Imperative servlet applications normally access it through
+  <code>SecurityContextHolder</code>, backed by thread-local storage. Spring's filters load the
+  context before application work and clear it after the request. Clearing is essential because
+  servlet-container threads are reused. Prefer method arguments such as
+  <code>@AuthenticationPrincipal</code> or an injected facade over scattering static context access
+  throughout domain code.
+</p>
+
+<figure class="code">
+  <figcaption><b>Read the established principal at the web boundary</b></figcaption>
+  <pre><code>@GetMapping("/api/me")
+UserProfile me(@AuthenticationPrincipal(expression = "subject") String subject) {
+    return profiles.findBySubject(subject);
+}</code></pre>
+</figure>
+
+<p>
+  A thread local does not automatically cross to <code>@Async</code>, a custom executor, a new
+  thread, or a messaging consumer. Use Spring's security-context-aware executors where appropriate,
+  or explicitly pass the identity facts needed by the operation. Do not blindly propagate an entire
+  user context into background jobs. For Reactor applications, identity lives in Reactor
+  <code>Context</code>, not a thread local.
+</p>
+
+<h2 id="passwords"><span class="num">05.</span> Password storage and login defense</h2>
+<p class="lead">
+  Store a slow, salted, one-way password hash, never plaintext and never reversible encryption.
+</p>
+
+<p>
+  Spring Security's <code>DelegatingPasswordEncoder</code> uses a storage prefix such as
+  <code>{bcrypt}</code> to select an encoder. This permits old hashes to remain verifiable while new
+  passwords use the current algorithm. Adaptive algorithms such as bcrypt, PBKDF2, scrypt, and
+  Argon2 deliberately consume work. Tune the cost on production-class hardware so verification is
+  expensive to attack but acceptable for real login traffic.
+</p>
+
+<figure class="code">
+  <figcaption><b>Encoding and transparent upgrade</b></figcaption>
+  <pre><code>PasswordEncoder encoder =
+        PasswordEncoderFactories.createDelegatingPasswordEncoder();
+
+String stored = encoder.encode(rawPassword);
+
+if (encoder.matches(loginPassword, stored)
+        &amp;&amp; encoder.upgradeEncoding(stored)) {
+    users.replacePasswordHash(userId, encoder.encode(loginPassword));
+}</code></pre>
+</figure>
+
+<ul>
+  <li>Generate no application-level salt for encoders that already create a random salt.</li>
+  <li>Never compare encoded strings directly because a random salt changes the result.</li>
+  <li>Reject <code>{noop}</code> and plaintext outside tightly isolated demonstrations.</li>
+  <li>Rate-limit by several signals, add increasing delay, and alert on credential stuffing.</li>
+  <li>
+    Use MFA or passkeys for sensitive accounts and step-up authentication for dangerous actions.
+  </li>
+  <li>
+    Make reset tokens random, single-use, short-lived, securely stored, and invalid after use.
+  </li>
+  <li>Do not log passwords, reset links, session IDs, authorization codes, or bearer tokens.</li>
+</ul>
+
+<p>
+  A very high hash cost can exhaust the server under attack. Isolate password verification capacity,
+  apply rate limits before expensive work where safe, and monitor latency and rejection counts.
+  Error responses should not reveal whether a username, email, or tenant exists.
+</p>
+
+<h2 id="authorization"><span class="num">06.</span> Authorization, roles, and authorities</h2>
+<p class="lead">
+  Good authorization models capabilities and resource relationships, not only job titles.
+</p>
+
+<p>
+  A <code>GrantedAuthority</code> is a string understood by policy, such as
+  <code>invoice:read</code>. <code>hasRole("ADMIN")</code> normally checks for
+  <code>ROLE_ADMIN</code>; <code>hasAuthority("ADMIN")</code> checks the exact string. Mixing these
+  conventions causes accidental denials or grants. Pick one documented vocabulary.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Example</th>
+        <th>Strength and limitation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>RBAC</td>
+        <td>Role <code>BILLING_ADMIN</code></td>
+        <td>Easy to understand, but broad roles grow quickly.</td>
+      </tr>
+      <tr>
+        <td>Permission</td>
+        <td><code>invoice:approve</code></td>
+        <td>Precise and reusable, but needs lifecycle governance.</td>
+      </tr>
+      <tr>
+        <td>Relationship</td>
+        <td>User owns order 42</td>
+        <td>Protects individual resources and prevents IDOR.</td>
+      </tr>
+      <tr>
+        <td>Attribute-based</td>
+        <td>Tenant, region, amount, time, device risk</td>
+        <td>Expressive, but policy needs careful testing and explanation.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Request rules protect routes. Service-level rules protect business operations even when reached
+  from a controller, message listener, scheduled task, or another service. Object-level checks stop
+  insecure direct object reference attacks: a caller who may read orders in general must still be
+  allowed to read this order. Query data with tenant and ownership predicates, then enforce again at
+  the service boundary for sensitive changes.
+</p>
+
+<h2 id="method-security"><span class="num">07.</span> Method security</h2>
+<p class="lead">
+  <code>@EnableMethodSecurity</code> activates authorization around Spring-managed method calls.
+</p>
+
+<figure class="code">
+  <figcaption><b>Capabilities and object ownership at the service layer</b></figcaption>
+  <pre><code>@Service
+public class InvoiceService {
+
+    @PreAuthorize("hasAuthority('invoice:read') and "
+            + "@invoiceAccess.canRead(#invoiceId, authentication)")
+    public InvoiceView find(UUID invoiceId) {
+        return repository.findView(invoiceId)
+                .orElseThrow(InvoiceNotFoundException::new);
+    }
+
+    @PreAuthorize("hasAuthority('invoice:approve')")
+    public void approve(UUID invoiceId) {
+        // Enforce business state and tenant constraints here too.
+    }
+}</code></pre>
+</figure>
+
+<p>
+  <code>@PreAuthorize</code> checks before invocation. <code>@PostAuthorize</code> can inspect a
+  returned object, but work has already run and data has already been loaded, so prefer pre-checks
+  when possible. <code>@PreFilter</code> and <code>@PostFilter</code> may be convenient for small
+  collections but can load data that should have been filtered in the database.
+</p>
+
+<p>
+  Method security uses Spring AOP. A call from one method to another method on the same instance can
+  bypass the proxy, as can manually constructed objects. Put protected operations on a
+  Spring-managed service reached through its proxy. Be deliberate about advice ordering when
+  <code>@Transactional</code> and authorization share a method, especially if authorization queries
+  the database.
+</p>
+
+<h2 id="sessions"><span class="num">08.</span> Stateful session security</h2>
+<p class="lead">
+  In session-based security, the browser holds an opaque session cookie and the server holds the
+  authenticated state.
+</p>
+
+<p>
+  After login, Spring stores the <code>SecurityContext</code> through a
+  <code>SecurityContextRepository</code>, commonly in <code>HttpSession</code>. On later requests
+  the browser sends the session cookie, the server resolves the session, and the security filters
+  restore authentication. This makes immediate server-side revocation and logout natural, at the
+  cost of shared session storage or sticky routing in a cluster.
+</p>
+
+<ul>
+  <li>
+    Use cookies with <code>Secure</code>, <code>HttpOnly</code>, and an appropriate
+    <code>SameSite</code> value.
+  </li>
+  <li>Rotate or change the session ID after authentication to resist session fixation.</li>
+  <li>
+    Define idle and absolute timeouts according to risk, and require reauthentication for critical
+    actions.
+  </li>
+  <li>
+    Consider concurrent-session limits for privileged users, but understand clustered registry
+    requirements.
+  </li>
+  <li>Do not place sensitive domain objects or unbounded data in the session.</li>
+  <li>Invalidate server state on logout and credential-risk events.</li>
+</ul>
+
+<p>
+  Session cookies are credentials. CSRF matters because a browser attaches them automatically.
+  Horizontal scaling needs a shared store such as Spring Session with Redis or a load-balancer
+  design whose failure behavior is understood. Monitor session count, store latency, expiration, and
+  serialization compatibility during deployments.
+</p>
+
+<h2 id="stateless"><span class="num">09.</span> Stateless APIs</h2>
+<p class="lead">
+  Stateless security means each request carries enough credential material to authenticate without a
+  server login session.
+</p>
+
+<figure class="code">
+  <figcaption><b>OAuth 2.0 resource server policy</b></figcaption>
+  <pre><code>@Bean
+SecurityFilterChain apiSecurity(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers(HttpMethod.GET, "/api/public/**").permitAll()
+            .requestMatchers("/api/admin/**").hasAuthority("SCOPE_admin")
+            .anyRequest().authenticated())
+        .oauth2ResourceServer(oauth -&gt; oauth.jwt(Customizer.withDefaults()))
+        .sessionManagement(session -&gt;
+            session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .requestCache(RequestCacheConfigurer::disable)
+        .csrf(AbstractHttpConfigurer::disable);
+    return http.build();
+}</code></pre>
+</figure>
+
+<p>
+  Do not call an API stateless merely because it uses a JWT. If a filter stores authentication in an
+  HTTP session, or the API accepts an automatically attached authentication cookie, state and CSRF
+  concerns remain. Disabling CSRF is reasonable for an API that accepts bearer tokens only in the
+  <code>Authorization</code> header and never authenticates by cookie. It is unsafe as a blanket
+  copy-and-paste rule.
+</p>
+
+<h2 id="jwt"><span class="num">10.</span> JWT access tokens</h2>
+<p class="lead">
+  A JWT is a token format, not an authentication protocol and not automatically a secure design.
+</p>
+
+<p>
+  A signed JWT has encoded header, claims, and signature parts. Encoding does not hide claims.
+  Anyone holding the token can usually read them. The resource server must verify the signature with
+  an explicitly allowed algorithm and trusted key, then validate claims required by the deployment.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Claim</th>
+        <th>Meaning</th>
+        <th>Required check or use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>iss</code></td>
+        <td>Issuer</td>
+        <td>Must equal the configured trusted issuer.</td>
+      </tr>
+      <tr>
+        <td><code>sub</code></td>
+        <td>Subject identifier</td>
+        <td>Use a stable identifier, not display text.</td>
+      </tr>
+      <tr>
+        <td><code>aud</code></td>
+        <td>Intended recipient</td>
+        <td>Reject a token not intended for this API.</td>
+      </tr>
+      <tr>
+        <td><code>exp</code></td>
+        <td>Expiration time</td>
+        <td>Reject expired tokens with small, controlled clock skew.</td>
+      </tr>
+      <tr>
+        <td><code>nbf</code></td>
+        <td>Not valid before</td>
+        <td>Reject premature use.</td>
+      </tr>
+      <tr>
+        <td><code>iat</code></td>
+        <td>Issued at</td>
+        <td>Can enforce maximum age and aid investigation.</td>
+      </tr>
+      <tr>
+        <td><code>jti</code></td>
+        <td>Unique token identifier</td>
+        <td>Useful for tracing or a targeted denylist.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Boot resource-server configuration</b></figcaption>
+  <pre><code>spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://identity.example.com
+          audiences:
+            - https://orders.example.com</code></pre>
+</figure>
+
+<p>
+  With issuer discovery, Spring Security obtains key metadata, validates signature and timestamps,
+  validates the issuer, and maps scopes to authorities prefixed with <code>SCOPE_</code> by default.
+  Configure audience validation as well. Plan key rotation with overlapping old and new verification
+  keys, stable <code>kid</code> values, bounded caches, alerting, and an emergency revocation path.
+</p>
+
+<div class="warning">
+  <strong>JWT failure modes</strong>
+  <p>
+    Never accept <code>alg=none</code>, derive the accepted algorithm from an untrusted token, trust
+    an arbitrary key URL from a header, put secrets or excessive personal data in claims, use an ID
+    token as an API access token, or accept access tokens for the wrong audience. Short token
+    lifetime limits damage but does not prevent theft.
+  </p>
+</div>
+
+<h2 id="refresh-tokens"><span class="num">11.</span> Access and refresh tokens</h2>
+<p class="lead">
+  Access tokens call resource servers. Refresh tokens obtain new access tokens from the
+  authorization server and usually deserve stronger protection.
+</p>
+
+<p>
+  Keep access tokens short-lived and narrowly scoped. Store refresh tokens only where the client
+  type can protect them. For public clients, current OAuth security best practice requires refresh
+  tokens to be sender-constrained or use refresh-token rotation. With rotation, every successful
+  refresh invalidates the old token and returns a new one. Reuse of an older member signals theft;
+  revoke the active token family and require authentication again.
+</p>
+
+<ul>
+  <li>Store an opaque refresh token as a strong hash when lookup design permits.</li>
+  <li>
+    Bind it to the client, user, grant, device context where appropriate, and authorized scopes.
+  </li>
+  <li>Apply idle and absolute expiry, revoke on logout or compromise, and keep an audit trail.</li>
+  <li>Perform rotation atomically to prevent two refresh requests both succeeding.</li>
+  <li>
+    Never send bearer tokens in URLs because logs, history, referrers, and monitoring can leak them.
+  </li>
+  <li>
+    Avoid persistent browser storage for high-value bearer tokens when a backend-for-frontend can
+    hold tokens and issue a hardened session cookie instead.
+  </li>
+</ul>
+
+<p>
+  Self-contained JWT access tokens are hard to revoke instantly. Options include very short
+  lifetimes, token-version checks, a denylist keyed by <code>jti</code>, opaque-token introspection,
+  or gateway enforcement. Every option trades availability, latency, storage, and revocation speed.
+</p>
+
+<h2 id="oauth"><span class="num">12.</span> OAuth 2.0 fundamentals</h2>
+<p class="lead">
+  OAuth 2.0 delegates authorization: a client receives limited access to a protected resource
+  without receiving the user's password.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Role</th>
+        <th>Responsibility</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Resource owner</td>
+        <td>Entity able to grant access, commonly the end user.</td>
+      </tr>
+      <tr>
+        <td>Client</td>
+        <td>Application requesting delegated access.</td>
+      </tr>
+      <tr>
+        <td>Authorization server</td>
+        <td>Authenticates as needed, obtains authorization, and issues tokens.</td>
+      </tr>
+      <tr>
+        <td>Resource server</td>
+        <td>API that validates access tokens and enforces scope plus business policy.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Prefer authorization code flow with PKCE for user-facing clients. The client creates a random
+  <code>code_verifier</code>, sends its SHA-256-derived <code>code_challenge</code> in the
+  authorization request, then proves possession by sending the verifier to the token endpoint. PKCE
+  prevents a stolen authorization code from being redeemed without its verifier. Use exact
+  redirect-URI matching, <code>state</code> to bind the browser response to the initiating flow, and
+  TLS everywhere.
+</p>
+
+<p>
+  Client credentials is for a confidential machine acting as itself, not for impersonating an end
+  user. Do not use the resource-owner password grant or the implicit grant in new systems. Restrict
+  tokens by audience and least-privilege scopes. Consent is a user experience and governance
+  control, not a substitute for resource-server authorization.
+</p>
+
+<h2 id="oidc"><span class="num">13.</span> OpenID Connect and login flows</h2>
+<p class="lead">OpenID Connect adds an interoperable identity layer to OAuth 2.0.</p>
+
+<p>
+  An OIDC authentication request includes the <code>openid</code> scope. The client receives an ID
+  token whose claims describe the authentication and subject. An access token is for an API. An ID
+  token is evidence intended for the client. Validate ID-token signature, issuer, audience, time
+  claims, authorized party where applicable, and <code>nonce</code> when used. Never send an ID
+  token to an unrelated API as an access token.
+</p>
+
+<ol>
+  <li>
+    The application starts authorization code flow and records protected <code>state</code>,
+    <code>nonce</code>, and PKCE verifier values.
+  </li>
+  <li>The browser authenticates at the OpenID Provider and grants requested access.</li>
+  <li>The provider redirects with a short-lived authorization code and the original state.</li>
+  <li>
+    The client verifies state and exchanges the code plus PKCE verifier at the token endpoint.
+  </li>
+  <li>
+    The client validates the ID token, establishes its local identity or session, and stores tokens
+    according to the client threat model.
+  </li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Boot OIDC client registration</b></figcaption>
+  <pre><code>spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          corporate:
+            provider: corporate-idp
+            client-id: ${OIDC_CLIENT_ID}
+            client-secret: ${OIDC_CLIENT_SECRET}
+            authorization-grant-type: authorization_code
+            scope: openid,profile,email
+        provider:
+          corporate-idp:
+            issuer-uri: https://identity.example.com</code></pre>
+</figure>
+
+<p>
+  Keep the client secret in a secret manager, not source control. Provider discovery reduces copied
+  endpoint configuration but makes issuer trust especially important. Decide how external subjects
+  map to local accounts, handle renamed email safely, and key identity by issuer plus subject rather
+  than email alone.
+</p>
+
+<h2 id="resource-server"><span class="num">14.</span> Resource servers and claim mapping</h2>
+<p class="lead">
+  A resource server authenticates the token, then independently authorizes the requested operation.
+</p>
+
+<p>
+  Spring Security supports JWT validation and opaque-token introspection. JWT validation is local
+  after keys are available, which improves latency and authorization-server independence.
+  Introspection asks an authorization server about token activity, enabling centralized revocation
+  but adding network latency and availability coupling. Cache only within the risk tolerance of
+  delayed revocation.
+</p>
+
+<figure class="code">
+  <figcaption><b>Map a custom permissions claim</b></figcaption>
+  <pre><code>@Bean
+JwtAuthenticationConverter jwtAuthenticationConverter() {
+    JwtGrantedAuthoritiesConverter permissions =
+            new JwtGrantedAuthoritiesConverter();
+    permissions.setAuthoritiesClaimName("permissions");
+    permissions.setAuthorityPrefix("");
+
+    JwtAuthenticationConverter converter =
+            new JwtAuthenticationConverter();
+    converter.setJwtGrantedAuthoritiesConverter(permissions);
+    converter.setPrincipalClaimName("sub");
+    return converter;
+}
+
+// In HttpSecurity:
+// .oauth2ResourceServer(oauth -&gt; oauth.jwt(jwt -&gt;
+//     jwt.jwtAuthenticationConverter(jwtAuthenticationConverter())))</code></pre>
+</figure>
+
+<p>
+  Treat claims as authorization input issued by a particular trusted authority. Keep token size
+  bounded because every request carries it. Avoid embedding rapidly changing permissions unless the
+  lifetime is correspondingly short. Multi-issuer systems must select a trusted decoder by request
+  context without letting an attacker introduce arbitrary issuers.
+</p>
+
+<h2 id="csrf"><span class="num">15.</span> CSRF</h2>
+<p class="lead">
+  Cross-Site Request Forgery makes a victim's browser send an unwanted state-changing request using
+  credentials the browser attaches automatically.
+</p>
+
+<p>
+  Spring Security enables CSRF protection by default for unsafe methods. The server creates an
+  unpredictable token bound to the user's context, and the legitimate page sends that value in a
+  form field or request header. An attacking site can cause a request but normally cannot read the
+  token because of browser origin controls.
+</p>
+
+<figure class="code">
+  <figcaption><b>SPA token repository when a cookie-readable token is required</b></figcaption>
+  <pre><code>http.csrf(csrf -&gt; csrf
+    .csrfTokenRepository(
+        CookieCsrfTokenRepository.withHttpOnlyFalse()));</code></pre>
+</figure>
+
+<p>
+  Making the CSRF token cookie readable is intentional only when JavaScript must copy it into a
+  header. The authentication cookie should remain <code>HttpOnly</code>. Account for Spring
+  Security's deferred token and BREACH-protection behavior when building an SPA. Login and logout
+  also need CSRF protection. Use POST logout with a valid token, not a state-changing GET.
+</p>
+
+<div class="warning">
+  <strong>When disabling CSRF is wrong</strong>
+  <p>
+    JSON does not prevent CSRF. If the browser authenticates with a session cookie, Basic
+    credentials, a client certificate, or any automatically attached credential, evaluate CSRF.
+    Disable it only for a chain whose authentication mechanism and clients make the attack
+    inapplicable.
+  </p>
+</div>
+
+<h2 id="cors"><span class="num">16.</span> CORS</h2>
+<p class="lead">
+  CORS tells browsers which origins may read or send selected cross-origin requests. It is not
+  authentication and does not protect non-browser clients.
+</p>
+
+<p>
+  Preflight requests normally have no session cookie, so CORS must run before authentication.
+  Provide a <code>UrlBasedCorsConfigurationSource</code> and enable <code>http.cors()</code>. Allow
+  exact trusted origins, methods, and headers. If credentials are allowed, never use a wildcard
+  origin. Keep production origins out of client-controlled input.
+</p>
+
+<figure class="code">
+  <figcaption><b>Explicit CORS policy</b></figcaption>
+  <pre><code>@Bean
+UrlBasedCorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration cors = new CorsConfiguration();
+    cors.setAllowedOrigins(List.of("https://app.example.com"));
+    cors.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE"));
+    cors.setAllowedHeaders(List.of("Authorization", "Content-Type", "X-CSRF-TOKEN"));
+    cors.setAllowCredentials(true);
+    cors.setMaxAge(Duration.ofHours(1));
+
+    UrlBasedCorsConfigurationSource source =
+            new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/api/**", cors);
+    return source;
+}</code></pre>
+</figure>
+
+<h2 id="headers"><span class="num">17.</span> Security response headers and transport</h2>
+<p class="lead">
+  Spring Security writes useful browser-security headers by default, but each deployment still needs
+  an explicit HTTPS and content policy.
+</p>
+
+<ul>
+  <li>
+    <code>Strict-Transport-Security</code> tells browsers to use HTTPS for future requests and is
+    written only on secure requests.
+  </li>
+  <li><code>X-Content-Type-Options: nosniff</code> reduces content-type confusion.</li>
+  <li>
+    <code>X-Frame-Options</code> or CSP <code>frame-ancestors</code> controls framing and
+    clickjacking risk.
+  </li>
+  <li>Cache-control defaults prevent sensitive authenticated responses from being stored.</li>
+  <li>
+    A carefully deployed Content Security Policy reduces XSS impact and controls resource origins.
+  </li>
+  <li>
+    <code>Referrer-Policy</code> and <code>Permissions-Policy</code> limit information and browser
+    capabilities where suitable.
+  </li>
+</ul>
+
+<p>
+  Terminate TLS only at trusted infrastructure. Configure forwarded-header handling only for trusted
+  proxies so redirects and secure-cookie decisions see the original scheme without trusting forged
+  client headers. Test HSTS, cookie flags, CSP, and redirects in the real proxy path. Do not disable
+  all default headers to fix one embedding or caching issue; customize the specific policy.
+</p>
+
+<h2 id="errors"><span class="num">18.</span> Security exception handling</h2>
+<p class="lead">Authentication failure and insufficient authorization are different outcomes.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Situation</th>
+        <th>HTTP result</th>
+        <th>Spring hook</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>No valid authentication for a protected API</td>
+        <td><code>401 Unauthorized</code>, often with <code>WWW-Authenticate</code></td>
+        <td><code>AuthenticationEntryPoint</code></td>
+      </tr>
+      <tr>
+        <td>Authenticated caller lacks permission</td>
+        <td><code>403 Forbidden</code></td>
+        <td><code>AccessDeniedHandler</code></td>
+      </tr>
+      <tr>
+        <td>Browser needs interactive login</td>
+        <td>Redirect to login or authorization endpoint</td>
+        <td>Login entry point</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Return a stable, sanitized JSON error shape for APIs and a correlation ID that operators can use.
+  Do not reveal token claims, expected signatures, account existence, policy internals, or stack
+  traces. Log enough structured context to investigate, but redact credentials and personal data. A
+  missing resource may deliberately return 404 rather than reveal its existence to an unauthorized
+  caller, provided the policy is consistent.
+</p>
+
+<h2 id="logout"><span class="num">19.</span> Logout and revocation</h2>
+<p class="lead">
+  Logout must clear every relevant local credential, while federated logout may also involve the
+  identity provider.
+</p>
+
+<p>
+  Spring Security's default servlet logout invalidates the HTTP session, clears the security context
+  and repository, removes remember-me state, clears saved CSRF state, and publishes a logout event.
+  With CSRF enabled, POST to <code>/logout</code> with the token. Consider the
+  <code>Clear-Site-Data</code> header for cookies, storage, or cache where its broad browser effect
+  is desired.
+</p>
+
+<p>
+  Deleting a JWT in one browser does not revoke copies. Revoke refresh tokens and decide whether
+  access-token denylisting or short expiry meets the risk. OIDC local logout does not necessarily
+  end the provider session, and provider logout does not automatically clear every relying-party
+  session. Implement supported RP-initiated or back-channel logout when the product requires true
+  single logout.
+</p>
+
+<h2 id="vulnerabilities"><span class="num">20.</span> Common vulnerabilities and mistakes</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Safer approach</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Only hiding buttons in the UI</td>
+        <td>Attackers call the endpoint directly.</td>
+        <td>Authorize on the server at request and service boundaries.</td>
+      </tr>
+      <tr>
+        <td>Checking only that a user is logged in</td>
+        <td>Any user can access another user's object.</td>
+        <td>Check permission, tenant, ownership, and object state.</td>
+      </tr>
+      <tr>
+        <td>Broad matcher before specific rules</td>
+        <td>First-match behavior can expose or block later paths.</td>
+        <td>Order specific matchers first and test negative cases.</td>
+      </tr>
+      <tr>
+        <td>Disabling CSRF because the API uses JSON</td>
+        <td>Browsers still attach cookies automatically.</td>
+        <td>Base the decision on credential transport, not media type.</td>
+      </tr>
+      <tr>
+        <td>Wildcard credentialed CORS</td>
+        <td>Untrusted sites may act with browser credentials.</td>
+        <td>Allow a small exact origin list.</td>
+      </tr>
+      <tr>
+        <td>Long-lived bearer tokens in logs or browser storage</td>
+        <td>Any holder can replay a stolen token.</td>
+        <td>Short lifetime, safe storage, redaction, rotation, sender constraint.</td>
+      </tr>
+      <tr>
+        <td>Trusting JWT signature alone</td>
+        <td>A valid token may have the wrong issuer, audience, or time window.</td>
+        <td>Validate algorithm, key, issuer, audience, time, and required claims.</td>
+      </tr>
+      <tr>
+        <td>Self-invoking a secured method</td>
+        <td>The call can bypass the AOP proxy.</td>
+        <td>Call a separate secured Spring bean through its proxy.</td>
+      </tr>
+      <tr>
+        <td>Writing a custom authentication filter unnecessarily</td>
+        <td>Ordering, persistence, failure, and context cleanup are easy to get wrong.</td>
+        <td>Compose built-in authentication mechanisms and providers.</td>
+      </tr>
+      <tr>
+        <td>Returning detailed login errors</td>
+        <td>Enables account discovery and targeted attacks.</td>
+        <td>Use generic client errors and safe internal diagnostics.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Spring Security does not replace output encoding, parameterized SQL, file validation, secure
+  deserialization, dependency patching, SSRF controls, business fraud checks, secret management, or
+  infrastructure hardening. Use the OWASP threat categories to review the whole system, not merely
+  the security configuration class.
+</p>
+
+<h2 id="testing"><span class="num">21.</span> Testing security</h2>
+<p class="lead">Security tests must prove denial as carefully as success.</p>
+
+<p>
+  Add <code>spring-security-test</code> in test scope. With MockMvc, apply the Spring Security
+  configurer when setup is manual. Use <code>@WithMockUser</code> for simple method tests,
+  <code>user()</code> for request principals, <code>jwt()</code> for resource-server claims, and
+  <code>csrf()</code> for state-changing browser requests. Keep tests that exercise the real decoder
+  and identity provider contract at a separate integration level.
+</p>
+
+<figure class="code">
+  <figcaption><b>Positive and negative MockMvc tests</b></figcaption>
+  <pre><code>@Test
+void adminEndpointRejectsAnonymousUser() throws Exception {
+    mvc.perform(get("/api/admin/report"))
+        .andExpect(status().isUnauthorized());
+}
+
+@Test
+void adminEndpointRejectsTokenWithoutScope() throws Exception {
+    mvc.perform(get("/api/admin/report")
+            .with(jwt().authorities(new SimpleGrantedAuthority("SCOPE_read"))))
+        .andExpect(status().isForbidden());
+}
+
+@Test
+void updateRequiresCsrfForSessionUser() throws Exception {
+    mvc.perform(put("/profile")
+            .with(user("sam"))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"displayName\":\"Sam\"}"))
+        .andExpect(status().isForbidden());
+
+    mvc.perform(put("/profile")
+            .with(user("sam"))
+            .with(csrf())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"displayName\":\"Sam\"}"))
+        .andExpect(status().isOk());
+}</code></pre>
+</figure>
+
+<ul>
+  <li>
+    Test anonymous, authenticated-but-forbidden, and allowed users for every sensitive policy.
+  </li>
+  <li>
+    Test role-prefix, scope, claim, tenant, and ownership mapping with realistic principal types.
+  </li>
+  <li>Test expired, wrong-issuer, wrong-audience, malformed, and incorrectly signed tokens.</li>
+  <li>
+    Test CORS preflight, CSRF missing and valid tokens, logout, session fixation, and headers.
+  </li>
+  <li>
+    Test matcher boundaries such as trailing slashes, alternate HTTP methods, encoded paths, error
+    dispatches, and management endpoints.
+  </li>
+  <li>Test custom failure JSON without asserting secrets or unstable internal messages.</li>
+</ul>
+
+<p>
+  Mock authentication skips credential verification, so it cannot prove that a production decoder or
+  password flow is configured correctly. Maintain a smaller number of full integration tests using
+  generated signing keys, a controlled authorization server, or the real provider's supported test
+  environment.
+</p>
+
+<h2 id="performance"><span class="num">22.</span> Performance and reliability</h2>
+<p class="lead">
+  Security work consumes CPU, network, storage, and latency budgets, and attackers intentionally
+  target those costs.
+</p>
+
+<ul>
+  <li>
+    Password hashing is CPU or memory intensive. Tune it, rate-limit it, and capacity-plan peak
+    login and reset traffic.
+  </li>
+  <li>
+    JWT verification is local but key discovery and rotation need bounded, observable caching.
+  </li>
+  <li>
+    Opaque introspection adds a remote call. Configure short timeouts, connection pools, failure
+    behavior, and cautious caching.
+  </li>
+  <li>
+    Method security that queries a database can create repeated authorization queries. Batch, cache
+    only safe facts, or combine access predicates with the data query.
+  </li>
+  <li>Large JWTs increase request bandwidth and can exceed proxy or header limits.</li>
+  <li>
+    Session stores become critical dependencies. Monitor saturation, eviction, replication, and
+    outage behavior.
+  </li>
+</ul>
+
+<p>
+  Do not fail open because an authorization dependency is slow. Decide which public endpoints can
+  continue independently and deny protected operations when identity or policy cannot be validated.
+  Separate availability alerts from security alerts so operators understand whether a spike is
+  attack traffic, a provider outage, or a deployment defect.
+</p>
+
+<h2 id="production"><span class="num">23.</span> Production security checklist</h2>
+<ol>
+  <li>
+    Write a threat model listing assets, actors, trust boundaries, entry points, and abuse cases.
+  </li>
+  <li>
+    Use supported Spring Boot and Spring Security releases and patch dependencies continuously.
+  </li>
+  <li>
+    Require TLS, validate proxy trust, secure cookies, and deploy intentional security headers.
+  </li>
+  <li>Deny by default, use least privilege, and enforce tenant and object-level access.</li>
+  <li>
+    Keep client secrets, signing keys, passwords, and tokens in managed secret systems with rotation
+    and access auditing.
+  </li>
+  <li>
+    Validate OAuth issuer, audience, redirect URI, state, nonce, PKCE, scope, and token lifetime.
+  </li>
+  <li>Use MFA for privileged identities and isolate administrative endpoints and credentials.</li>
+  <li>
+    Rate-limit login, reset, token, and high-risk business actions without creating easy denial of
+    service against one victim.
+  </li>
+  <li>
+    Record authentication, authorization denial, privilege change, token reuse, and administrative
+    events with redaction and useful correlation.
+  </li>
+  <li>
+    Alert on unusual failures, impossible travel where appropriate, privilege escalation, key
+    errors, refresh reuse, and configuration drift.
+  </li>
+  <li>
+    Prepare key compromise, credential stuffing, session theft, and provider outage runbooks.
+    Exercise revocation and recovery before an incident.
+  </li>
+  <li>
+    Run code review, dependency scanning, secret scanning, SAST, DAST, penetration testing, and
+    policy regression tests in proportion to risk.
+  </li>
+</ol>
+
+<div class="key">
+  <strong>Audit logs are not debug logs</strong>
+  <p>
+    An audit record should answer who attempted what, on which protected resource, when, from which
+    relevant context, and with what outcome. It should never contain passwords, bearer tokens,
+    session IDs, authorization codes, or unnecessary personal data.
+  </p>
+</div>
+
+<h2 id="exercises"><span class="num">24.</span> Practice exercises</h2>
+<ol>
+  <li>
+    Build a session-based notes application. Require CSRF for writes, rotate the session ID at
+    login, secure cookies, and test logout plus anonymous denial.
+  </li>
+  <li>
+    Protect an orders API as a JWT resource server. Validate issuer and audience, map
+    <code>orders.read</code> and <code>orders.write</code>, and reject wrong claims.
+  </li>
+  <li>
+    Add tenant-aware method security. Ensure a support role can read only assigned tenants and an
+    ordinary user can read only owned orders.
+  </li>
+  <li>
+    Model refresh-token families with atomic rotation. Simulate reuse of an old token and revoke the
+    family.
+  </li>
+  <li>
+    Configure OIDC login with authorization code and PKCE. Explain state, nonce, redirect URI, ID
+    token, and access token validation to a reviewer.
+  </li>
+  <li>
+    Write a security test matrix for every endpoint: anonymous, insufficient permission, wrong
+    tenant, correct permission, invalid CSRF, wrong HTTP method, and malformed token.
+  </li>
+  <li>
+    Inspect a deployed response through its real proxy. Verify HTTPS redirects, HSTS, CSP,
+    clickjacking policy, cache headers, cookie flags, and redaction.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">25.</span> Interview questions and answers</h2>
+
+<h3>What is the difference between authentication and authorization?</h3>
+<p>
+  Authentication establishes an identity from credentials. Authorization decides whether that
+  established identity may perform a specific action on a specific resource. Authorization follows
+  authentication but may also allow anonymous operations.
+</p>
+
+<h3>How does Spring Security protect a servlet request?</h3>
+<p>
+  The servlet container invokes <code>DelegatingFilterProxy</code>, which delegates to Spring's
+  <code>FilterChainProxy</code>. It selects the first matching <code>SecurityFilterChain</code>.
+  Ordered filters load context, apply exploit protections, authenticate, translate security errors,
+  authorize the request, and clear context after processing.
+</p>
+
+<h3>What is inside Authentication?</h3>
+<p>
+  It normally contains the principal, credentials, granted authorities, request details, and an
+  authenticated flag. Before verification it represents an authentication request. After a trusted
+  provider succeeds, it represents the established identity. Credentials should then be erased when
+  possible.
+</p>
+
+<h3>Why is PasswordEncoder one-way?</h3>
+<p>
+  The server needs to compare a submitted password, not recover stored passwords. Adaptive salted
+  hashes reduce the value of a stolen database and slow offline guessing. Reversible encryption
+  exposes every password if the decryption key is stolen.
+</p>
+
+<h3>What is the difference between hasRole and hasAuthority?</h3>
+<p>
+  <code>hasAuthority("x")</code> checks the exact authority. <code>hasRole("ADMIN")</code> normally
+  checks <code>ROLE_ADMIN</code>. Teams should use a consistent convention to prevent prefix bugs.
+</p>
+
+<h3>Why can method security be bypassed by self-invocation?</h3>
+<p>
+  Default method security is proxy based. A call through <code>this</code> stays inside the target
+  and never enters the proxy interceptor. Move the protected operation to another Spring bean or
+  otherwise ensure calls pass through the proxy.
+</p>
+
+<h3>When should CSRF be disabled?</h3>
+<p>
+  Only when the chain cannot authenticate through credentials a browser attaches automatically, such
+  as a bearer-only API receiving the token in an authorization header. Session-cookie browser
+  applications should normally retain CSRF protection, regardless of whether their body is JSON.
+</p>
+
+<h3>What is the difference between CORS and CSRF?</h3>
+<p>
+  CORS controls whether a browser lets one origin interact with another origin. CSRF prevents an
+  attacker from causing a victim's browser to perform an unwanted authenticated action. CORS is not
+  an authorization mechanism, and a CORS policy does not by itself stop CSRF.
+</p>
+
+<h3>Session or JWT: which is better?</h3>
+<p>
+  Neither is universally better. Sessions provide small opaque cookies and immediate server-side
+  invalidation, but need shared state when scaled. JWT access tokens enable local validation across
+  services, but increase token exposure and make immediate revocation harder. Choose from trust
+  boundaries, clients, revocation needs, latency, and operational capacity.
+</p>
+
+<h3>What must a resource server validate in a JWT?</h3>
+<p>
+  It must use a trusted key and allowed algorithm, then validate issuer, intended audience,
+  expiration, not-before time, and every application-required claim. It must also safely map scopes
+  or permissions and still enforce resource-level business policy.
+</p>
+
+<h3>What is the difference between an access token and an ID token?</h3>
+<p>
+  An access token is presented to a resource server to authorize API access. An OIDC ID token gives
+  the client information about an authentication event and subject. The client validates it. APIs
+  should not accept an ID token in place of an access token.
+</p>
+
+<h3>Why use PKCE?</h3>
+<p>
+  PKCE binds an authorization request to the later token exchange. A client sends a challenge
+  derived from a secret verifier and must present that verifier to redeem the code. A stolen
+  authorization code alone is therefore insufficient.
+</p>
+
+<h3>How should refresh tokens be protected?</h3>
+<p>
+  Give them limited scope and lifetime, store them securely, bind them to the client, revoke them on
+  risk events, and detect replay. Public clients must use sender-constrained refresh tokens or
+  rotation under current OAuth best practice. Atomic rotation and family revocation are important.
+</p>
+
+<h3>Why does CORS run before Spring Security authentication?</h3>
+<p>
+  A browser preflight request normally contains no session cookie. If authentication sees it first,
+  it can reject the request before CORS headers are produced. Spring integrates a CORS configuration
+  early in the chain.
+</p>
+
+<h3>What is the correct difference between 401 and 403?</h3>
+<p>
+  A protected API returns 401 when valid authentication is absent and may include a
+  <code>WWW-Authenticate</code> challenge. It returns 403 when the caller is authenticated but lacks
+  required authorization. Browser flows may redirect an unauthenticated user to login instead.
+</p>
+
+<h3>How do you test Spring Security well?</h3>
+<p>
+  Test the policy matrix, especially anonymous and authenticated-but-forbidden cases. Use Spring
+  Security's test request processors for focused tests, then integration-test real token validation,
+  identity mapping, CSRF, CORS, sessions, logout, headers, proxy behavior, and negative edge cases.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">26.</span> Concise cheat sheet</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Preferred starting point</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Servlet policy</td>
+        <td><code>SecurityFilterChain</code> plus ordered, explicit request matchers</td>
+      </tr>
+      <tr>
+        <td>Service authorization</td>
+        <td><code>@EnableMethodSecurity</code> and <code>@PreAuthorize</code></td>
+      </tr>
+      <tr>
+        <td>Password storage</td>
+        <td><code>DelegatingPasswordEncoder</code> with tuned adaptive hash</td>
+      </tr>
+      <tr>
+        <td>Browser login</td>
+        <td>Hardened session cookie, CSRF, session fixation protection</td>
+      </tr>
+      <tr>
+        <td>Bearer-only API</td>
+        <td>OAuth 2.0 resource server, stateless chain, issuer plus audience checks</td>
+      </tr>
+      <tr>
+        <td>Delegated login</td>
+        <td>OIDC authorization code flow with PKCE, state, and nonce</td>
+      </tr>
+      <tr>
+        <td>Permissions</td>
+        <td>Least-privilege authorities plus tenant and object-level checks</td>
+      </tr>
+      <tr>
+        <td>Authentication failure</td>
+        <td>401 or login entry point</td>
+      </tr>
+      <tr>
+        <td>Authorization failure</td>
+        <td>403 through an <code>AccessDeniedHandler</code></td>
+      </tr>
+      <tr>
+        <td>Security testing</td>
+        <td><code>spring-security-test</code>, negative matrix, full decoder integration</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<ul>
+  <li>Deny by default and permit narrowly.</li>
+  <li>Authenticate first, authorize every sensitive operation, and verify object ownership.</li>
+  <li>Never log passwords, cookies, authorization codes, client secrets, or bearer tokens.</li>
+  <li>
+    Do not disable CSRF, CORS support, or headers without a mechanism-specific threat analysis.
+  </li>
+  <li>JWT: verify algorithm, signature, issuer, audience, time, and required claims.</li>
+  <li>
+    OAuth: use authorization code with PKCE, exact redirects, TLS, least scopes, and safe token
+    storage.
+  </li>
+  <li>
+    Plan rotation, revocation, incident response, observability, and negative tests before launch.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">27.</span> Official references</h2>
+<ul>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/architecture.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security servlet architecture</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/features/authentication/password-storage.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security password storage</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security method security</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/authentication/session-management.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security session management</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security CSRF protection</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security CORS integration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/exploits/headers.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security response headers</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/index.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security OAuth 2.0 resource server</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/security/oauth2.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot OAuth 2.0 support</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/test/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security servlet testing</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://datatracker.ietf.org/doc/html/rfc6750"
+      target="_blank"
+      rel="noopener noreferrer"
+      >RFC 6750: OAuth 2.0 bearer token usage</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://datatracker.ietf.org/doc/html/rfc7519"
+      target="_blank"
+      rel="noopener noreferrer"
+      >RFC 7519: JSON Web Token</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://datatracker.ietf.org/doc/html/rfc7636"
+      target="_blank"
+      rel="noopener noreferrer"
+      >RFC 7636: Proof Key for Code Exchange</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://datatracker.ietf.org/doc/html/rfc9700"
+      target="_blank"
+      rel="noopener noreferrer"
+      >RFC 9700: OAuth 2.0 security best current practice</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://openid.net/specs/openid-connect-core-1_0.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >OpenID Connect Core 1.0</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
