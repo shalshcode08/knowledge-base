@@ -85,6 +85,14 @@
           "path": "spring/spring-jdbc-database-access"
         },
         {
+          "title": "Spring Security",
+          "path": "spring/spring-security"
+        },
+        {
+          "title": "Observability and Production Operations",
+          "path": "spring/observability-production-operations"
+        },
+        {
           "title": "Testing Spring Applications",
           "path": "spring/testing-spring-applications"
         }
