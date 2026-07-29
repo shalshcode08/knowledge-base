@@ -85,6 +85,14 @@
           "path": "spring/spring-jdbc-database-access"
         },
         {
+          "title": "Spring Security",
+          "path": "spring/spring-security"
+        },
+        {
+          "title": "Observability and Production Operations",
+          "path": "spring/observability-production-operations"
+        },
+        {
           "title": "Caching, Scheduling, Async Processing, and Events",
           "path": "spring/caching-scheduling-async-events"
         }

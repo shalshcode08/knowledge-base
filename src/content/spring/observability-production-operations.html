@@ -1,0 +1,1468 @@
+<h1>Spring Boot Observability and Production Operations - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to Actuator, health probes, Micrometer metrics, structured
+  logs, correlation, distributed tracing, secure configuration, graceful shutdown, JVM diagnostics,
+  containers, deployment safety, and evidence-based incident troubleshooting.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The production mental model</h2>
+<p class="lead">
+  Production operations is the discipline of making a running system understandable, safe to change,
+  and recoverable when reality differs from expectations.
+</p>
+
+<p>
+  A program can be logically correct and still fail as a service. It can run out of database
+  connections, wait forever on a downstream dependency, exhaust heap, produce too much logging,
+  reject traffic during a rollout, or return successful HTTP responses while silently losing
+  business work. Production readiness therefore includes runtime signals and operating procedures,
+  not only application code.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a service as an aircraft. Logs are the event record, metrics are the instrument panel,
+    and traces show the route of one journey through multiple systems. Health probes communicate
+    whether the aircraft should receive passengers or be restarted. None of these signals alone
+    explains every failure.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Primary evidence</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>What happened to one request?</td>
+        <td>Trace plus correlated logs</td>
+        <td>Follow a failure across services and dependencies.</td>
+      </tr>
+      <tr>
+        <td>Is the whole service getting worse?</td>
+        <td>Metrics</td>
+        <td>Detect rate, error, latency, and saturation changes.</td>
+      </tr>
+      <tr>
+        <td>Why did code choose this path?</td>
+        <td>Structured logs</td>
+        <td>Inspect contextual events without attaching a debugger.</td>
+      </tr>
+      <tr>
+        <td>Should this instance receive traffic?</td>
+        <td>Readiness</td>
+        <td>Remove an instance from routing without necessarily restarting it.</td>
+      </tr>
+      <tr>
+        <td>Is this process unable to recover?</td>
+        <td>Liveness</td>
+        <td>Ask the platform to restart a stuck instance.</td>
+      </tr>
+      <tr>
+        <td>What is the JVM doing now?</td>
+        <td>Thread dump, heap evidence, JFR</td>
+        <td>Diagnose deadlock, CPU, allocation, pause, or memory problems.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Observe outcomes, not implementation trivia</strong>
+  <p>
+    Start with user-visible latency, errors, throughput, and resource saturation. Add lower-level
+    signals only when they help explain or predict those outcomes. A dashboard containing hundreds
+    of unowned graphs is not observability.
+  </p>
+</div>
+
+<h2 id="actuator"><span class="num">01.</span> Spring Boot Actuator</h2>
+<p class="lead">
+  Actuator adds production-oriented endpoints and auto-configuration that expose selected runtime
+  information through HTTP or JMX.
+</p>
+
+<figure class="code">
+  <figcaption><b>Maven dependencies for HTTP management and Prometheus metrics</b></figcaption>
+  <pre><code>&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+  &lt;artifactId&gt;micrometer-registry-prometheus&lt;/artifactId&gt;
+  &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+</figure>
+
+<p>
+  An endpoint must be both enabled and exposed. Most endpoints are enabled for in-process use, but
+  only health is exposed over HTTP by default. Exposure is an attack-surface decision. Endpoints
+  such as environment, configuration properties, heap dump, loggers, mappings, scheduled tasks, and
+  thread dump can reveal secrets, application structure, customer data, or operational controls.
+</p>
+
+<figure class="code">
+  <figcaption><b>A conservative management configuration</b></figcaption>
+  <pre><code>management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      roles: OPS
+  info:
+    env:
+      enabled: false</code></pre>
+</figure>
+
+<p>
+  Prefer an explicit allowlist over <code>*</code>. Protect management traffic with Spring Security,
+  network policy, a private listener, or several layers together. A separate management port can
+  reduce exposure, but a probe on that port can succeed while the application connector is broken.
+  For traffic decisions, expose a minimal health group on the main server port.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Endpoint</th>
+        <th>Purpose</th>
+        <th>Production caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>health</code></td>
+        <td>Aggregate component and availability state.</td>
+        <td>Do not expose internal details anonymously.</td>
+      </tr>
+      <tr>
+        <td><code>prometheus</code></td>
+        <td>Prometheus-formatted meter scrape.</td>
+        <td>Restrict access and control label cardinality.</td>
+      </tr>
+      <tr>
+        <td><code>metrics</code></td>
+        <td>Diagnostic meter names and measurements.</td>
+        <td>It is a diagnostic view, not usually the monitoring backend.</td>
+      </tr>
+      <tr>
+        <td><code>loggers</code></td>
+        <td>Inspect and change runtime log levels.</td>
+        <td>Write access can create data leakage and severe volume.</td>
+      </tr>
+      <tr>
+        <td><code>threaddump</code>, <code>heapdump</code></td>
+        <td>JVM diagnostic evidence.</td>
+        <td>Heap dumps may contain credentials and personal data.</td>
+      </tr>
+      <tr>
+        <td><code>env</code>, <code>configprops</code></td>
+        <td>Configuration diagnosis.</td>
+        <td>Sanitization helps but is not a reason to publish these openly.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="actuator-security">Securing Actuator with an explicit filter chain</h3>
+<figure class="code">
+  <figcaption><b>Allow probes while requiring an operations role elsewhere</b></figcaption>
+  <pre><code>@Bean
+@Order(1)
+SecurityFilterChain actuatorSecurity(HttpSecurity http) throws Exception {
+    http.securityMatcher(EndpointRequest.toAnyEndpoint())
+        .authorizeHttpRequests(authorize -&gt; authorize
+            .requestMatchers(EndpointRequest.to(HealthEndpoint.class)).permitAll()
+            .anyRequest().hasRole("OPS"))
+        .httpBasic(Customizer.withDefaults());
+    return http.build();
+}</code></pre>
+</figure>
+
+<p>
+  Defining a custom <code>SecurityFilterChain</code> makes Spring Boot back off from its Actuator
+  security auto-configuration, so the application must cover every intended management rule. Network
+  restrictions remain useful because application authentication can itself be misconfigured.
+</p>
+
+<h2 id="health"><span class="num">02.</span> Health indicators and health groups</h2>
+<p class="lead">
+  Health is a small operational contract, not a detailed status page and not a replacement for
+  metrics.
+</p>
+
+<p>
+  Spring Boot assembles <code>HealthContributor</code> beans into a tree. A
+  <code>HealthIndicator</code> returns a status such as <code>UP</code>, <code>DOWN</code>,
+  <code>OUT_OF_SERVICE</code>, or <code>UNKNOWN</code>, optionally with details. A
+  <code>CompositeHealthContributor</code> groups contributors. A status aggregator chooses the
+  overall status, and an HTTP status mapper turns it into a response code.
+</p>
+
+<figure class="code">
+  <figcaption><b>A bounded custom readiness dependency check</b></figcaption>
+  <pre><code>@Component
+final class CatalogHealthIndicator implements HealthIndicator {
+    private final CatalogClient catalog;
+
+    CatalogHealthIndicator(CatalogClient catalog) {
+        this.catalog = catalog;
+    }
+
+    @Override
+    public Health health() {
+        try {
+            CatalogStatus status = catalog.status(Duration.ofMillis(300));
+            return status.acceptingOrders()
+                    ? Health.up().withDetail("mode", "accepting-orders").build()
+                    : Health.outOfService().withDetail("mode", status.mode()).build();
+        } catch (Exception failure) {
+            return Health.down(failure).build();
+        }
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Keep checks fast, bounded, and cheap. Never perform a full table scan, mutate state, or wait on an
+  unbounded remote call. If health collection becomes slow, monitoring can amplify an outage by
+  creating more load. A component that can be observed through metrics but does not control routing
+  often should not be in readiness.
+</p>
+
+<div class="note">
+  <strong>A dependency outage is not automatically a liveness failure</strong>
+  <p>
+    Restarting every instance does not repair PostgreSQL, Redis, DNS, or a payment provider. If a
+    process is responsive but a dependency is unavailable, keep liveness healthy and use readiness,
+    errors, alerts, circuit breakers, and recovery procedures for the dependency.
+  </p>
+</div>
+
+<h2 id="probes"><span class="num">03.</span> Liveness, readiness, and startup probes</h2>
+<p class="lead">
+  Each probe must answer one narrow question because the platform takes a different action for each
+  answer.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Probe</th>
+        <th>Question</th>
+        <th>Failure action</th>
+        <th>What usually belongs</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Startup</td>
+        <td>Has initialization completed?</td>
+        <td>Delay liveness and readiness evaluation, then restart after its failure budget.</td>
+        <td>Boot completion for legitimately slow applications.</td>
+      </tr>
+      <tr>
+        <td>Liveness</td>
+        <td>Is this process stuck beyond self-recovery?</td>
+        <td>Restart the container.</td>
+        <td>Internal availability state, not shared external systems.</td>
+      </tr>
+      <tr>
+        <td>Readiness</td>
+        <td>Should new traffic be routed here now?</td>
+        <td>Remove the instance from service endpoints.</td>
+        <td>Warmup, draining state, and carefully selected critical capabilities.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Actuator probes and main-port paths</b></figcaption>
+  <pre><code>management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        liveness:
+          additional-path: "server:/livez"
+        readiness:
+          additional-path: "server:/readyz"</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Kubernetes probe configuration</b></figcaption>
+  <pre><code>startupProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 30
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2</code></pre>
+</figure>
+
+<p>
+  Tune thresholds from real startup and response distributions. A startup probe is clearer than a
+  huge liveness initial delay because it protects slow initialization without weakening later
+  detection. Avoid probe periods so aggressive that temporary CPU pressure triggers a restart loop.
+  Test failure actions in a staging environment, including rolling deployment and termination.
+</p>
+
+<h2 id="metrics"><span class="num">04.</span> Metrics and Micrometer</h2>
+<p class="lead">
+  Metrics summarize behavior as numeric time series and are best for trends, alerts, capacity, and
+  service-level objectives.
+</p>
+
+<p>
+  Micrometer is an instrumentation facade. Application and library code use a common meter model,
+  while a registry publishes to Prometheus, OTLP, Datadog, or another backend. Spring Boot
+  auto-configures a <code>MeterRegistry</code>, built-in JVM and system binders, web request
+  metrics, and integration metrics when the matching technology is present.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Meter</th>
+        <th>Use</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Counter</td>
+        <td>Monotonically increasing event count.</td>
+        <td>Orders rejected by stable reason code.</td>
+      </tr>
+      <tr>
+        <td>Timer</td>
+        <td>Count plus latency distribution.</td>
+        <td>Payment authorization duration.</td>
+      </tr>
+      <tr>
+        <td>Distribution summary</td>
+        <td>Distribution of non-time values.</td>
+        <td>Payload size or batch size.</td>
+      </tr>
+      <tr>
+        <td>Gauge</td>
+        <td>Current sampled value.</td>
+        <td>In-flight work or queue depth.</td>
+      </tr>
+      <tr>
+        <td>Long task timer</td>
+        <td>Duration and count of still-running work.</td>
+        <td>Imports or reconciliation jobs.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Business metrics with stable dimensions</b></figcaption>
+  <pre><code>@Component
+final class CheckoutMetrics {
+    private final MeterRegistry registry;
+
+    CheckoutMetrics(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    void recordRejected(String reason) {
+        registry.counter(
+                "checkout.rejected",
+                "reason", normalizeReason(reason))
+            .increment();
+    }
+
+    &lt;T&gt; T timeAuthorization(Supplier&lt;T&gt; action) {
+        return registry.timer("checkout.authorization")
+                .record(action);
+    }
+
+    private String normalizeReason(String reason) {
+        return switch (reason) {
+            case "OUT_OF_STOCK", "PAYMENT_DECLINED" -&gt; reason;
+            default -&gt; "OTHER";
+        };
+    }
+}</code></pre>
+</figure>
+
+<h3 id="cardinality">Cardinality is a production constraint</h3>
+<p>
+  Every unique combination of meter name and tag values creates a time series. Tags such as customer
+  ID, order ID, URL with identifiers, exception message, email address, or raw SQL can create
+  millions of series. That increases memory, ingestion cost, query time, and incident risk. Use
+  bounded dimensions such as route template, status class, operation, region, or enumerated outcome.
+  Put request-specific values in traces and logs.
+</p>
+
+<div class="key">
+  <strong>Start with the four golden signals</strong>
+  <ul>
+    <li>Traffic: request, job, or message rate.</li>
+    <li>Errors: failed outcomes, ideally separated by stable reason.</li>
+    <li>Latency: distributions and percentiles, not average alone.</li>
+    <li>Saturation: pool usage, queue depth, CPU, memory pressure, and thread availability.</li>
+  </ul>
+</div>
+
+<p>
+  Configure histograms and percentiles deliberately. Client-side percentiles are difficult to
+  aggregate across instances. Histogram buckets support aggregate percentile estimation but add
+  series. Choose buckets around user-facing latency objectives, and verify backend semantics for
+  counters, steps, resets, and exemplars.
+</p>
+
+<h2 id="logs"><span class="num">05.</span> Logs, structured logging, and correlation</h2>
+<p class="lead">
+  A useful log is a bounded, structured event that explains something an operator may need to know.
+</p>
+
+<p>
+  Spring Boot uses Commons Logging internally and normally provides Logback through its starters.
+  Containerized applications usually write to standard output and let the platform collect, rotate,
+  retain, and ship logs. Avoid application-managed files unless the environment specifically
+  requires them.
+</p>
+
+<figure class="code">
+  <figcaption><b>Enable built-in structured JSON output</b></figcaption>
+  <pre><code>spring:
+  application:
+    name: orders
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    root: INFO
+    com.example.orders: INFO</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Parameterize data and keep stable event meaning</b></figcaption>
+  <pre><code>log.atInfo()
+    .addKeyValue("order.id", orderId)
+    .addKeyValue("outcome", "accepted")
+    .log("Order accepted");
+
+log.atWarn()
+    .addKeyValue("payment.provider", provider)
+    .addKeyValue("attempt", attempt)
+    .setCause(failure)
+    .log("Payment authorization failed");</code></pre>
+</figure>
+
+<p>
+  Define event names and field meanings as an internal contract. Include service, environment,
+  version, trace and span IDs, operation, stable outcome, and safe business identifiers only when
+  policy permits. Never log passwords, access or refresh tokens, session cookies, API keys, secret
+  configuration, full payment data, or unnecessary personal information. Masking after ingestion is
+  weaker than never emitting the value.
+</p>
+
+<p>
+  Correlation IDs join events for one logical operation. Distributed tracing usually supplies trace
+  and span IDs and propagates trace context over supported clients. If accepting a client-provided
+  request ID, validate its length and character set before logging it. Do not assume MDC values move
+  to worker threads automatically. Thread changes require explicit context propagation, and every
+  manually installed MDC value must be cleared in a <code>finally</code> block.
+</p>
+
+<div class="warning">
+  <strong>Logging can cause an outage</strong>
+  <p>
+    Debug logging on a hot path can consume CPU, disk, network, and backend quota. Repeated stack
+    traces can multiply one failure into thousands of events. Use sampling, aggregation, bounded
+    messages, retention policy, and time-limited runtime level changes.
+  </p>
+</div>
+
+<h2 id="tracing"><span class="num">06.</span> Observations and distributed tracing</h2>
+<p class="lead">
+  A trace follows one operation through nested spans, while Micrometer Observation can drive both
+  metrics and tracing from one instrumentation lifecycle.
+</p>
+
+<p>
+  An observation has a name, a context, lifecycle events, and key values. Low-cardinality values can
+  become metric tags and trace attributes. High-cardinality values belong only in traces. Registered
+  handlers turn the lifecycle into timers, spans, context propagation, or other behavior.
+</p>
+
+<figure class="code">
+  <figcaption><b>A custom business observation</b></figcaption>
+  <pre><code>@Component
+final class InventoryReservation {
+    private final ObservationRegistry observations;
+
+    InventoryReservation(ObservationRegistry observations) {
+        this.observations = observations;
+    }
+
+    Reservation reserve(String warehouse, UUID orderId) {
+        return Observation.createNotStarted("inventory.reserve", observations)
+            .lowCardinalityKeyValue("warehouse.region", regionOf(warehouse))
+            .highCardinalityKeyValue("order.id", orderId.toString())
+            .observe(() -&gt; performReservation(warehouse, orderId));
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Auto-instrumented HTTP clients are important because they inject trace headers. Constructing a
+  client outside the auto-configured builders can lose propagation. Context can also disappear at
+  <code>@Async</code>, executor, scheduler, callback, or reactive boundaries. Use Spring Boot
+  context propagation support or a <code>ContextPropagatingTaskDecorator</code> for a custom
+  executor, then test that child work retains the expected trace.
+</p>
+
+<p>
+  Sampling controls volume and cost. Head sampling decides near the start and can miss rare
+  failures. Tail sampling decides after more of the trace is known but requires capable collector
+  infrastructure. A production strategy may keep all errors and slow operations while sampling a
+  smaller share of ordinary successes. Trace data is not a durable audit record.
+</p>
+
+<h2 id="configuration"><span class="num">07.</span> Configuration and secret management</h2>
+<p class="lead">
+  Build one artifact and supply environment-specific configuration at deployment time.
+</p>
+
+<p>
+  Spring Boot can read properties, YAML, environment variables, command-line arguments, imported
+  files, and configuration trees. Bind related settings into validated
+  <code>@ConfigurationProperties</code> objects. Fail startup for missing or invalid required values
+  rather than discovering them under traffic.
+</p>
+
+<figure class="code">
+  <figcaption><b>Validated operational configuration</b></figcaption>
+  <pre><code>@ConfigurationProperties("payments")
+@Validated
+public record PaymentProperties(
+        @NotNull URI baseUrl,
+        @NotNull Duration connectTimeout,
+        @NotNull Duration readTimeout,
+        @Min(1) int maxAttempts) {}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Import a mounted secret configuration tree</b></figcaption>
+  <pre><code>spring:
+  config:
+    import: "optional:configtree:/run/secrets/"</code></pre>
+</figure>
+
+<p>
+  Store secrets in a dedicated secret manager or platform secret facility, grant access by workload
+  identity, encrypt in transit and at rest, rotate them, and audit reads. Environment variables are
+  convenient but may be visible through process inspection, diagnostics, deployment metadata, or
+  accidental logging. Mounted files also need strict permissions and rotation behavior. Never bake
+  secrets into source, images, default configuration, test fixtures, or command history.
+</p>
+
+<div class="note">
+  <strong>Dynamic configuration needs a consistency model</strong>
+  <p>
+    Decide which values can change without restart, how changes are validated, whether all instances
+    must agree, how rollback works, and how a change is audited. Restart-based configuration is
+    often simpler and safer than silently changing critical behavior in place.
+  </p>
+</div>
+
+<h2 id="shutdown"><span class="num">08.</span> Graceful shutdown and draining</h2>
+<p class="lead">
+  Graceful shutdown stops new work, gives accepted work a bounded chance to finish, and then
+  releases resources.
+</p>
+
+<p>
+  Current Spring Boot versions enable graceful shutdown for supported embedded servers. Closing the
+  application context begins server shutdown early in the <code>SmartLifecycle</code> stop phases.
+  Existing requests receive a grace period while new requests are rejected according to server
+  behavior.
+</p>
+
+<figure class="code">
+  <figcaption><b>Bound the Spring lifecycle shutdown phase</b></figcaption>
+  <pre><code>spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 25s</code></pre>
+</figure>
+
+<p>
+  The platform termination grace period must be longer than application draining, with time for
+  network propagation and final process termination. For example, if Spring has 25 seconds, a
+  Kubernetes pod might need 35 or 40 seconds. On <code>SIGTERM</code>, readiness should turn false
+  before or while the server stops accepting traffic. Load balancer state does not update
+  instantaneously, so allow a measured drain interval where needed.
+</p>
+
+<p>
+  HTTP is only one kind of work. Stop message consumption, scheduler claims, polling loops, and new
+  async submissions. Let in-flight work finish or persist a safe retry state. A request that exceeds
+  the grace period needs idempotency because the client may retry without knowing whether the first
+  attempt committed. Do not rely only on JVM shutdown hooks for critical durable work.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Resource</th>
+        <th>Shutdown responsibility</th>
+        <th>Failure if ignored</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>HTTP server</td>
+        <td>Stop admission, drain bounded in-flight requests.</td>
+        <td>Connection resets and partial client outcomes.</td>
+      </tr>
+      <tr>
+        <td>Message listener</td>
+        <td>Stop polling, finish or abandon safely, acknowledge only after durable success.</td>
+        <td>Duplicate or lost processing.</td>
+      </tr>
+      <tr>
+        <td>Executor</td>
+        <td>Reject new work and await a bounded termination.</td>
+        <td>Accepted tasks disappear at process exit.</td>
+      </tr>
+      <tr>
+        <td>Database pool</td>
+        <td>Close after application work is drained.</td>
+        <td>In-flight transactions fail unexpectedly.</td>
+      </tr>
+      <tr>
+        <td>Telemetry exporter</td>
+        <td>Flush within a short final budget.</td>
+        <td>Last logs, metrics, or spans may be missing.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="connection-pool"><span class="num">09.</span> Database connection pool monitoring</h2>
+<p class="lead">
+  A connection pool is a concurrency gate around a scarce database resource, not a speed setting to
+  maximize.
+</p>
+
+<p>
+  Spring Boot commonly uses HikariCP with JDBC and JPA starters. Monitor active, idle, total,
+  pending, acquisition time, usage time, timeout count, maximum size, and database-side connections.
+  The important incident pattern is sustained pending demand plus acquisition latency and timeouts,
+  especially when active connections stay near the configured maximum.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal combination</th>
+        <th>Likely explanation</th>
+        <th>Next evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Active near max, pending rising, slow SQL</td>
+        <td>Queries or lock waits hold connections too long.</td>
+        <td>Database activity, lock graph, slow query plans, transaction duration.</td>
+      </tr>
+      <tr>
+        <td>Active near max, CPU low, downstream slow</td>
+        <td>A transaction performs network I/O while holding a connection.</td>
+        <td>Traces and thread stacks around service boundaries.</td>
+      </tr>
+      <tr>
+        <td>Frequent acquisition timeout after load increase</td>
+        <td>Demand exceeds bounded database concurrency.</td>
+        <td>Arrival rate, query latency, queueing, database capacity.</td>
+      </tr>
+      <tr>
+        <td>Many idle connections across replicas</td>
+        <td>Pool size multiplied by instance count exceeds the useful budget.</td>
+        <td>Deployment replicas, database connection limit, proxy or pooler policy.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Increasing the pool can move contention into PostgreSQL and make every query slower. Size the
+  total across all instances, workers, administrative tools, and failover headroom. Keep
+  transactions short, set bounded acquisition and statement timeouts, diagnose leaks, and apply
+  backpressure before requests pile up without limit.
+</p>
+
+<h2 id="diagnostics"><span class="num">10.</span> Thread dumps, heap diagnostics, and JFR</h2>
+<p class="lead">
+  Runtime diagnostics are snapshots and recordings that test a hypothesis about CPU, blocking,
+  deadlock, allocation, garbage collection, or memory retention.
+</p>
+
+<h3 id="thread-dumps">Thread dumps</h3>
+<p>
+  A thread dump records thread names, states, stack traces, and owned or awaited monitors. Capture
+  several dumps a few seconds apart. One snapshot can show a normal moment; repeated identical
+  stacks reveal stuck work, while moving stacks reveal progress.
+</p>
+
+<figure class="code">
+  <figcaption><b>Useful JDK diagnostic commands</b></figcaption>
+  <pre><code>jcmd &lt;pid&gt; Thread.print -l
+jcmd &lt;pid&gt; GC.class_histogram
+jcmd &lt;pid&gt; GC.heap_dump filename=/secure/diagnostics/app.hprof
+jcmd &lt;pid&gt; JFR.start name=incident settings=profile duration=5m \
+  filename=/secure/diagnostics/incident.jfr</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Interpretation</th>
+        <th>Follow-up</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Many request threads waiting for a pool connection</td>
+        <td>Database concurrency is saturated or connections are held too long.</td>
+        <td>Pool metrics, transaction spans, database sessions and locks.</td>
+      </tr>
+      <tr>
+        <td>Many threads blocked on the same monitor</td>
+        <td>Lock contention or a deadlock candidate.</td>
+        <td>Owner stack, synchronized region, repeated dumps.</td>
+      </tr>
+      <tr>
+        <td>RUNNABLE thread with the same CPU-heavy stack</td>
+        <td>Hot loop, expensive parsing, serialization, compression, or algorithm.</td>
+        <td>CPU profile or JFR method samples.</td>
+      </tr>
+      <tr>
+        <td>Workers waiting in a bounded queue</td>
+        <td>May be normal when idle.</td>
+        <td>Compare queue depth, active count, throughput, and latency.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="heap">Heap evidence</h3>
+<p>
+  Heap usage rising after full garbage collections suggests retained live objects, but a single
+  sawtooth is normal. Start with memory pool, allocation rate, pause, and post-GC trend metrics. A
+  class histogram is smaller and faster than a full heap dump. A heap dump can pause the process,
+  consume disk roughly comparable to live heap, and contain secrets or personal data. Store it in a
+  restricted location, transfer it securely, set retention, and delete it according to policy.
+</p>
+
+<p>
+  In analysis, distinguish shallow size from retained size. Find dominator paths and GC roots that
+  keep unexpected objects alive. Common causes include unbounded caches, static collections,
+  thread-local values, listeners that were never removed, buffered requests, oversized sessions,
+  class-loader retention, and queues whose consumers cannot keep up.
+</p>
+
+<h3 id="jfr">Java Flight Recorder</h3>
+<p>
+  JFR records time-based evidence such as CPU samples, allocation, locks, garbage collection, file
+  and socket activity with production-oriented overhead. It is often more useful than a heap dump
+  for a broad latency or CPU incident. Use a bounded recording, preserve the exact deployment
+  version, and correlate its time window with service metrics and traces.
+</p>
+
+<h2 id="error-reporting"><span class="num">11.</span> Error reporting and failure taxonomy</h2>
+<p class="lead">
+  Error reporting must group useful failures without leaking data or turning expected outcomes into
+  noise.
+</p>
+
+<p>
+  Separate programmer defects, transient infrastructure failures, invalid client input, expected
+  business rejection, and security events. They have different severity, ownership, retry policy,
+  and alert behavior. A declined card is not an application exception; a
+  <code>NullPointerException</code> in every checkout is.
+</p>
+
+<ul>
+  <li>
+    Capture the application version, environment, operation, safe request context, and trace ID.
+  </li>
+  <li>
+    Preserve exception type, message after redaction, stack, cause, and suppressed exceptions.
+  </li>
+  <li>Group by stable fingerprint, not raw message containing identifiers.</li>
+  <li>Rate-limit duplicate reports while retaining occurrence counts.</li>
+  <li>Attach release and deployment markers to spot regressions.</li>
+  <li>Link alerts to a dashboard, runbook, owner, and rollback procedure.</li>
+</ul>
+
+<p>
+  Report an exception once at the boundary that can add operational context or choose recovery.
+  Logging and rethrowing at every layer creates duplicates. If a lower layer handles and recovers
+  from a failure, log at an appropriate level only when the event is still operationally meaningful.
+</p>
+
+<h2 id="containers"><span class="num">12.</span> Containerization and deployment concerns</h2>
+<p class="lead">
+  A container image is a versioned runtime artifact; orchestration supplies identity, configuration,
+  resources, rollout, and recovery.
+</p>
+
+<figure class="code">
+  <figcaption><b>A small non-root runtime image</b></figcaption>
+  <pre><code>FROM eclipse-temurin:21-jre
+RUN addgroup --system spring &amp;&amp; adduser --system --ingroup spring spring
+WORKDIR /app
+COPY --chown=spring:spring target/orders.jar app.jar
+USER spring
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]</code></pre>
+</figure>
+
+<p>
+  Use a trusted minimal base, run as a non-root user, scan application and operating-system
+  dependencies, rebuild for security updates, and pin an auditable image digest in deployment.
+  Multi-stage builds can keep compilers and source out of the runtime image. Never put secrets in
+  image layers or build arguments that become metadata.
+</p>
+
+<h3 id="resources">Resource limits and JVM ergonomics</h3>
+<p>
+  Container memory includes Java heap, metaspace, code cache, direct buffers, thread stacks, native
+  libraries, memory-mapped regions, and monitoring overhead. Setting maximum heap equal to the
+  container limit invites an operating-system kill. Leave measured native headroom. CPU limits can
+  affect parallelism, garbage collection, timeouts, and startup. Load-test with the same limits used
+  in production.
+</p>
+
+<h3 id="rollouts">Safe rollouts</h3>
+<ul>
+  <li>Use immutable versions and expose the version in telemetry.</li>
+  <li>Require readiness before routing and set a realistic progress deadline.</li>
+  <li>Keep enough healthy capacity during rolling replacement.</li>
+  <li>Use backward-compatible database migrations across old and new application versions.</li>
+  <li>Watch error, latency, saturation, and business outcomes during canary or staged rollout.</li>
+  <li>
+    Define an automated or quick manual rollback, but remember data migrations may not roll back.
+  </li>
+  <li>Test termination, node loss, dependency outage, and telemetry backend failure.</li>
+</ul>
+
+<h2 id="slos"><span class="num">13.</span> SLOs, dashboards, and actionable alerts</h2>
+<p class="lead">
+  Monitoring becomes operationally useful when it measures a promise, identifies risk, and routes a
+  concrete action to an owner.
+</p>
+
+<p>
+  A service-level indicator is a measured ratio or distribution, such as successful eligible
+  requests divided by total eligible requests, or the share of requests below a latency threshold. A
+  service-level objective is the target over a window. The error budget is the allowed
+  unreliability. Define eligibility and success from the user view, including which status codes,
+  cancellations, maintenance, and client errors count.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Dashboard layer</th>
+        <th>Purpose</th>
+        <th>Example panels</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Service overview</td>
+        <td>Detect user impact.</td>
+        <td>Traffic, errors, latency distribution, availability SLI.</td>
+      </tr>
+      <tr>
+        <td>Saturation</td>
+        <td>Find constrained resources.</td>
+        <td>CPU, heap after GC, pool pending, executor queue, downstream limits.</td>
+      </tr>
+      <tr>
+        <td>Dependencies</td>
+        <td>Locate propagated failure.</td>
+        <td>Dependency latency, errors, retries, circuit state, database waits.</td>
+      </tr>
+      <tr>
+        <td>Deployment</td>
+        <td>Connect change to behavior.</td>
+        <td>Version, replica readiness, restart rate, rollout markers.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Page on sustained user impact or imminent exhaustion that requires timely human action. Ticket
+  slower trends such as disk growth or certificate expiry. Avoid alerts for every exception, CPU
+  spike, or single failed probe. Use multi-window burn-rate alerts for SLOs so severe fast burns and
+  slower persistent burns are both detected without constant noise.
+</p>
+
+<h2 id="troubleshooting"><span class="num">14.</span> A practical incident workflow</h2>
+<p class="lead">
+  Troubleshooting should narrow uncertainty with time-correlated evidence, not begin with random
+  restarts or configuration changes.
+</p>
+
+<ol>
+  <li>
+    <strong>Protect users.</strong> Roll back, disable a risky feature, shed optional work, fail
+    over, or scale only when the action is safe and understood.
+  </li>
+  <li>
+    <strong>State the symptom precisely.</strong> Name the operation, affected population, start
+    time, severity, and evidence of recovery or continued impact.
+  </li>
+  <li>
+    <strong>Check recent changes.</strong> Compare deployment, configuration, traffic, dependency,
+    certificate, and infrastructure events to the symptom time.
+  </li>
+  <li>
+    <strong>Follow the golden signals.</strong> Determine whether the problem is errors, latency,
+    traffic shape, saturation, or several together.
+  </li>
+  <li>
+    <strong>Localize.</strong> Compare versions, zones, instances, routes, tenants, and
+    dependencies. Use traces to find where time or failure appears.
+  </li>
+  <li>
+    <strong>Form one falsifiable hypothesis.</strong> Say what evidence would confirm or reject it,
+    then run the smallest safe check.
+  </li>
+  <li>
+    <strong>Mitigate and verify.</strong> Watch the original user signal, not only the component
+    that was changed.
+  </li>
+  <li>
+    <strong>Preserve evidence and learn.</strong> Record the timeline, contributing conditions,
+    detection gap, safe corrective actions, owners, and deadlines.
+  </li>
+</ol>
+
+<h3 id="playbooks">Symptom-driven playbooks</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>First checks</th>
+        <th>Common deeper causes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Latency rises, CPU rises</td>
+        <td>Route latency, CPU profile, GC, allocation, recent traffic and release.</td>
+        <td>Hot algorithm, serialization, retry storm, excessive logging, allocation churn.</td>
+      </tr>
+      <tr>
+        <td>Latency rises, CPU stays low</td>
+        <td>Thread states, pool pending, dependency spans, database locks.</td>
+        <td>I/O wait, lock contention, exhausted pool, downstream timeout.</td>
+      </tr>
+      <tr>
+        <td>Restarts and <code>OOMKilled</code></td>
+        <td>Container limit, last termination reason, heap and native memory trend.</td>
+        <td>Leak, burst allocation, direct buffer, too many threads, heap too close to limit.</td>
+      </tr>
+      <tr>
+        <td>Readiness flaps during traffic</td>
+        <td>Probe latency, dependency check, CPU throttling, GC pauses.</td>
+        <td>Overloaded probe path, external dependency in readiness, thresholds too strict.</td>
+      </tr>
+      <tr>
+        <td>Errors begin after rollout</td>
+        <td>Version split, configuration diff, schema compatibility, error fingerprint.</td>
+        <td>Bad release, mixed-version contract, missing secret, migration ordering.</td>
+      </tr>
+      <tr>
+        <td>Database acquisition timeouts</td>
+        <td>Active and pending pool metrics, transaction duration, DB sessions and locks.</td>
+        <td>
+          Slow query, long transaction, network call inside transaction, pool multiplied by
+          replicas.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="testing"><span class="num">15.</span> Testing production behavior</h2>
+<p class="lead">
+  Production controls deserve automated tests and failure drills because their mistakes often appear
+  only during deployment or outage.
+</p>
+
+<ul>
+  <li>
+    Test endpoint exposure and authorization, including anonymous denial of sensitive endpoints.
+  </li>
+  <li>
+    Test custom health indicators for timeout, exception, degraded state, and redacted details.
+  </li>
+  <li>Test readiness transitions during startup and graceful shutdown.</li>
+  <li>Use a test registry to assert meter name, bounded tags, count, and timing behavior.</li>
+  <li>Capture logs to verify event level, required fields, correlation, and secret redaction.</li>
+  <li>
+    Verify trace propagation through HTTP clients, executors, async work, and message boundaries.
+  </li>
+  <li>
+    Run the application with container limits and exercise startup, load, termination, and restart.
+  </li>
+  <li>Simulate slow, unavailable, and partially failing dependencies with bounded timeouts.</li>
+  <li>Validate dashboards and alert queries against synthetic incidents or replayed data.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Testing a custom metric with SimpleMeterRegistry</b></figcaption>
+  <pre><code>@Test
+void recordsABoundedRejectionReason() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    CheckoutMetrics metrics = new CheckoutMetrics(registry);
+
+    metrics.recordRejected("unexpected-provider-text-123");
+
+    Counter counter = registry.get("checkout.rejected")
+        .tag("reason", "OTHER")
+        .counter();
+    assertThat(counter.count()).isEqualTo(1.0);
+}</code></pre>
+</figure>
+
+<h2 id="security-performance">
+  <span class="num">16.</span> Security and performance implications
+</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Risk</th>
+        <th>Production practice</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Actuator</td>
+        <td>Information disclosure or operational mutation.</td>
+        <td>Explicit allowlist, least privilege, private network, audit access.</td>
+      </tr>
+      <tr>
+        <td>Logs and errors</td>
+        <td>Secret or personal-data leakage and ingestion overload.</td>
+        <td>Data classification, redaction, sampling, quotas, retention.</td>
+      </tr>
+      <tr>
+        <td>Metrics</td>
+        <td>Unbounded cardinality and expensive aggregation.</td>
+        <td>Bounded tag values, meter filters, series budgets.</td>
+      </tr>
+      <tr>
+        <td>Traces</td>
+        <td>Cost, propagation gaps, sensitive attributes.</td>
+        <td>Sampling, attribute policy, exporter limits, context tests.</td>
+      </tr>
+      <tr>
+        <td>Health checks</td>
+        <td>Probe storm or restart cascade.</td>
+        <td>Cheap bounded checks and correct failure semantics.</td>
+      </tr>
+      <tr>
+        <td>Diagnostics</td>
+        <td>Pause, disk exhaustion, sensitive heap contents.</td>
+        <td>Incident approval, capacity check, access control, deletion policy.</td>
+      </tr>
+      <tr>
+        <td>Secrets</td>
+        <td>Long-lived credential theft.</td>
+        <td>Workload identity, short lifetime, rotation, audited access.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="mistakes"><span class="num">17.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Expose every Actuator endpoint publicly.</td>
+        <td>Diagnostics reveal internals and some endpoints change state.</td>
+        <td>Expose the minimum and authorize explicitly.</td>
+      </tr>
+      <tr>
+        <td>Put PostgreSQL in liveness.</td>
+        <td>A shared outage restarts every healthy process and increases load.</td>
+        <td>Keep liveness internal; model dependency impact separately.</td>
+      </tr>
+      <tr>
+        <td>Use average latency only.</td>
+        <td>A small slow population disappears inside the mean.</td>
+        <td>Use distributions, percentiles, thresholds, and counts.</td>
+      </tr>
+      <tr>
+        <td>Tag metrics with request or customer IDs.</td>
+        <td>Each value creates new time series.</td>
+        <td>Use bounded metric tags and place IDs in traces or safe logs.</td>
+      </tr>
+      <tr>
+        <td>Log every exception in every layer.</td>
+        <td>One failure becomes duplicate noise and higher cost.</td>
+        <td>Report once at the useful boundary with stable context.</td>
+      </tr>
+      <tr>
+        <td>Increase the database pool when it saturates.</td>
+        <td>More concurrency can overload the database and worsen latency.</td>
+        <td>Find hold time, query, lock, and capacity causes first.</td>
+      </tr>
+      <tr>
+        <td>Set heap equal to container memory.</td>
+        <td>Native memory has no headroom and the process is killed.</td>
+        <td>Measure all memory categories and reserve native headroom.</td>
+      </tr>
+      <tr>
+        <td>Call a restart the root-cause fix.</td>
+        <td>It removes evidence and the condition may return.</td>
+        <td>Use restart only as mitigation, then preserve and analyze evidence.</td>
+      </tr>
+      <tr>
+        <td>Assume graceful HTTP shutdown handles background work.</td>
+        <td>Consumers, jobs, and executors have separate admission paths.</td>
+        <td>Drain each source and make interrupted work retry-safe.</td>
+      </tr>
+      <tr>
+        <td>Create alerts without owners or runbooks.</td>
+        <td>Humans receive noise with no safe next action.</td>
+        <td>Attach impact, owner, evidence, urgency, and response procedure.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="practice"><span class="num">18.</span> Practice exercises</h2>
+<ol>
+  <li>
+    Design Actuator exposure for a public API. State which endpoints are public, which are private,
+    which are disabled, and how each layer is protected.
+  </li>
+  <li>
+    A Redis outage makes liveness fail and Kubernetes restarts 100 pods. Explain the feedback loop
+    and redesign liveness, readiness, and dependency alerting.
+  </li>
+  <li>
+    Define availability and latency SLIs for checkout. Specify eligible events, success, latency
+    boundary, labels, and how retries count.
+  </li>
+  <li>
+    Create Micrometer meters for a file import. Include completion outcome, item count, duration,
+    and active imports without unbounded tags.
+  </li>
+  <li>
+    Trace an HTTP request that enters Spring MVC, calls an <code>@Async</code> method, and invokes a
+    payment service. Identify every context propagation boundary.
+  </li>
+  <li>
+    Write a termination timeline for an API plus Kafka consumer. Fit readiness, listener stop,
+    in-flight work, telemetry flush, and forced termination into one budget.
+  </li>
+  <li>
+    Diagnose rising latency with low CPU, a full Hikari pool, and many threads waiting for
+    connections. List evidence that separates slow SQL, lock waits, and remote calls in
+    transactions.
+  </li>
+  <li>
+    Plan collection of a heap dump from a production container. Include disk capacity, security,
+    expected pause, transfer, analysis, retention, and deletion.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">19.</span> Interview questions and answers</h2>
+
+<h3>What is the difference between monitoring and observability?</h3>
+<p>
+  Monitoring checks known conditions through predefined signals and alerts. Observability is the
+  ability to infer internal state from outputs, including investigating failures that were not
+  predicted. Good systems need both: clear known alerts and enough correlated telemetry for new
+  questions.
+</p>
+
+<h3>What does Spring Boot Actuator provide?</h3>
+<p>
+  It provides production endpoints, health contributor infrastructure, Micrometer integration,
+  application availability state, auditing and management support, and auto-configuration around
+  runtime features. Endpoint enablement, exposure, and authorization remain explicit operational
+  decisions.
+</p>
+
+<h3>How do liveness and readiness differ?</h3>
+<p>
+  Liveness means the process cannot recover and should be restarted. Readiness means the instance
+  should or should not receive new traffic. A dependency outage normally affects capability or
+  readiness, not liveness, because restarting the process does not repair the dependency.
+</p>
+
+<h3>Why should liveness exclude external dependencies?</h3>
+<p>
+  A shared dependency failure would cause every application instance to restart simultaneously. That
+  removes otherwise responsive capacity, increases startup and dependency load, and can create a
+  restart loop. Liveness should detect internal unrecoverable process states.
+</p>
+
+<h3>What is Micrometer?</h3>
+<p>
+  Micrometer is a facade for application metrics and an observation API used by Spring Boot for
+  metrics and tracing integration. Code uses common meter types and a registry publishes them to a
+  chosen backend.
+</p>
+
+<h3>Why is metric tag cardinality important?</h3>
+<p>
+  A unique tag-value combination creates a distinct time series. Unbounded values such as request
+  IDs or customer IDs can exhaust memory, increase monitoring cost, and make queries unusable.
+  Metrics need stable bounded dimensions.
+</p>
+
+<h3>How are logs, metrics, and traces used together?</h3>
+<p>
+  Metrics detect that a population is unhealthy. Traces localize latency and errors for sampled
+  operations across components. Correlated structured logs explain detailed decisions and events.
+  Time, service version, trace IDs, and stable operation names connect them.
+</p>
+
+<h3>What is an Observation in Micrometer?</h3>
+<p>
+  It is a named lifecycle around an operation with context and key values. Observation handlers can
+  produce metrics, spans, context propagation, and other effects. Low-cardinality values may feed
+  metrics and traces; high-cardinality values should remain trace-only.
+</p>
+
+<h3>How do you investigate a Spring application with high latency and low CPU?</h3>
+<p>
+  Check latency by route and dependency, thread dumps, database pool pending and acquisition time,
+  executor queues, database locks and sessions, downstream spans, timeouts, and connection state.
+  Low CPU suggests waiting or contention more than computation.
+</p>
+
+<h3>Why can a full connection pool be a symptom rather than a root cause?</h3>
+<p>
+  Connections stay active because transactions or queries take too long. The cause may be slow SQL,
+  lock waits, network calls inside a transaction, database saturation, or leaked resources.
+  Increasing pool size can only increase database concurrency and worsen the condition.
+</p>
+
+<h3>What does graceful shutdown require besides enabling a property?</h3>
+<p>
+  It requires traffic draining, aligned platform and application timeouts, stopping every work
+  admission source, bounded completion, retry-safe interrupted work, correct resource close order,
+  and deployment tests using real termination signals.
+</p>
+
+<h3>When would you take a thread dump, heap dump, or JFR recording?</h3>
+<p>
+  Use repeated thread dumps for blocking, deadlock, and current stack evidence. Use heap histograms
+  and dumps for retained-object or leak analysis. Use JFR for time-based CPU, allocation, GC, lock,
+  and I/O evidence. Heap dumps have the greatest storage and data-sensitivity risk.
+</p>
+
+<h3>How should secrets reach a Spring Boot application?</h3>
+<p>
+  Prefer a secret manager or platform-mounted secret with workload identity, least privilege,
+  encryption, rotation, and audited access. Import or bind it at runtime, prevent it from entering
+  images and logs, and define how rotation reaches live instances.
+</p>
+
+<h3>What makes an alert actionable?</h3>
+<p>
+  It identifies real or imminent user impact, has an owner and urgency, contains evidence and useful
+  scope, links to a dashboard and runbook, and offers a safe first action. If no timely human action
+  is required, it is usually a ticket or dashboard signal rather than a page.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">20.</span> Concise cheat sheet</h2>
+<div class="cheat">
+  <ul>
+    <li>
+      Actuator endpoint enabled does not mean exposed; exposed does not mean safely authorized.
+    </li>
+    <li>Expose only required management endpoints and keep sensitive details private.</li>
+    <li>Liveness asks restart; readiness asks route traffic; startup protects initialization.</li>
+    <li>Keep health checks cheap, bounded, non-mutating, and operationally meaningful.</li>
+    <li>Begin metrics with traffic, errors, latency distributions, and saturation.</li>
+    <li>Never use request, customer, order, message, or raw URL values as metric tags.</li>
+    <li>Use structured events and trace IDs; never emit secrets or unnecessary personal data.</li>
+    <li>
+      Propagate observation context across executors, async work, reactive code, and network calls.
+    </li>
+    <li>Sample traces by a deliberate cost and diagnostic policy.</li>
+    <li>Bind validated configuration and fail startup for missing required values.</li>
+    <li>Keep secrets out of source, images, logs, diagnostics, and command history.</li>
+    <li>Fit application drain time inside the platform termination grace period.</li>
+    <li>Stop every source of work, not only HTTP admission.</li>
+    <li>Pool saturation requires hold-time diagnosis before a size increase.</li>
+    <li>Capture repeated thread dumps; treat heap dumps as sensitive production data.</li>
+    <li>Leave native memory headroom below a container limit.</li>
+    <li>Correlate symptoms with releases, configuration, traffic, and dependencies.</li>
+    <li>Alert on actionable user impact or imminent exhaustion, with an owner and runbook.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">21.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/actuator/index.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot production-ready features</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/actuator/endpoints.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot Actuator endpoints and health</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/actuator/metrics.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot metrics</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/actuator/observability.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot observability and context propagation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/actuator/tracing.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot tracing</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/logging.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot logging and structured logging</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/external-config.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot externalized configuration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/web/graceful-shutdown.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot graceful shutdown</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.micrometer.io/micrometer/reference/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Micrometer reference documentation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.micrometer.io/tracing/reference/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Micrometer Tracing reference</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Kubernetes liveness, readiness, and startup probes</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.docker.com/build/building/best-practices/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Docker build best practices</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/en/java/javase/24/troubleshoot/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Java troubleshooting guide</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
