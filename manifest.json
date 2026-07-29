@@ -91,6 +91,10 @@
         {
           "title": "Observability and Production Operations",
           "path": "spring/observability-production-operations"
+        },
+        {
+          "title": "Testing Spring Applications",
+          "path": "spring/testing-spring-applications"
         }
       ]
     }
