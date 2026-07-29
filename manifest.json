@@ -83,6 +83,10 @@
         {
           "title": "Spring JDBC and Database Access",
           "path": "spring/spring-jdbc-database-access"
+        },
+        {
+          "title": "Caching, Scheduling, Async Processing, and Events",
+          "path": "spring/caching-scheduling-async-events"
         }
       ]
     }
