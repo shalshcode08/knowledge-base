@@ -83,6 +83,10 @@
         {
           "title": "Spring JDBC and Database Access",
           "path": "spring/spring-jdbc-database-access"
+        },
+        {
+          "title": "Observability and Production Operations",
+          "path": "spring/observability-production-operations"
         }
       ]
     }
