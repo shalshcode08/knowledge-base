@@ -1,0 +1,1555 @@
+<h1>Testing Spring Applications - Complete Notes</h1>
+<p class="subtitle">
+  A practical and interview-focused guide to test strategy, JUnit, Mockito, Spring test slices, full
+  application tests, web and data testing, PostgreSQL Testcontainers, security, contracts,
+  isolation, performance, and reliable production test suites.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The testing mental model</h2>
+<p class="lead">
+  A valuable test gives fast, trustworthy evidence about one important behavior at the lowest cost
+  that can prove that behavior.
+</p>
+
+<p>
+  A test is not valuable merely because it executes code. It must detect a meaningful regression,
+  explain what broke, run repeatably, and cost less to maintain than the risk it controls. Spring
+  applications have several boundaries: plain Java decisions, bean wiring, proxy advice, HTTP
+  mapping, serialization, security filters, persistence mappings, SQL behavior, and communication
+  with external systems. No single test style proves all of them efficiently.
+</p>
+
+<div class="analogy">
+  <p>
+    Testing a Spring application is like inspecting a building. A material sample can be checked
+    quickly in a laboratory, a room can be inspected with its wiring and plumbing, and the complete
+    building can be tested through its entrances. Inspecting only individual bricks misses assembly
+    failures. Rebuilding and inspecting the whole building for every brick is too slow.
+  </p>
+</div>
+
+<p>
+  Start by naming the risk. If the risk is a discount formula, use a plain unit test. If it is JSON
+  validation or authorization on an endpoint, use a web slice. If it is a PostgreSQL query, test
+  against PostgreSQL. If it is complete bootstrapping and network behavior, use a full context and a
+  real server. The smallest useful context is the smallest environment that contains the behavior
+  under test and the infrastructure needed to observe it.
+</p>
+
+<div class="key">
+  <strong>The central rule</strong>
+  <p>
+    Do not ask, "Which annotation should I use?" first. Ask, "Which failure must this test detect?"
+    The answer determines whether Spring, a database, a server, or a real external protocol belongs
+    in the test.
+  </p>
+</div>
+
+<h2 id="pyramid"><span class="num">01.</span> Testing pyramid and risk coverage</h2>
+<p class="lead">
+  Keep many focused tests near the code, fewer boundary tests around framework integration, and a
+  small number of broad end-to-end tests.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>What it proves</th>
+        <th>Typical tools</th>
+        <th>Main cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Unit</td>
+        <td>One class or cohesive domain unit behaves correctly.</td>
+        <td>JUnit, assertions, Mockito when a boundary must be replaced.</td>
+        <td>Cannot prove Spring wiring or infrastructure behavior.</td>
+      </tr>
+      <tr>
+        <td>Component or slice</td>
+        <td>One application boundary works with focused framework infrastructure.</td>
+        <td><code>@WebMvcTest</code>, <code>@DataJpaTest</code>, MockMvc.</td>
+        <td>Excluded beans and auto-configuration can differ from the full app.</td>
+      </tr>
+      <tr>
+        <td>Integration</td>
+        <td>Several real components collaborate through actual infrastructure.</td>
+        <td><code>@SpringBootTest</code>, Testcontainers, real clients.</td>
+        <td>More startup time, resources, failure causes, and cleanup.</td>
+      </tr>
+      <tr>
+        <td>Contract</td>
+        <td>A producer and consumer agree on an HTTP or message boundary.</td>
+        <td>Spring Cloud Contract, schema validation, published stubs.</td>
+        <td>Contract ownership and version discipline.</td>
+      </tr>
+      <tr>
+        <td>End-to-end</td>
+        <td>A critical user journey crosses deployed system boundaries.</td>
+        <td>Real server, browser or HTTP client, production-like services.</td>
+        <td>Slow, expensive, and harder to diagnose.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The pyramid is a portfolio shape, not a quota. A persistence-heavy service may need many
+  PostgreSQL integration tests. A mathematical library may need almost none. The useful idea is to
+  avoid proving every small rule through the largest environment. Broad tests should cover a few
+  important seams and journeys, while focused tests explain most failures quickly.
+</p>
+
+<h3 id="test-quadrants">Useful categories of risk</h3>
+<ul class="clean">
+  <li>
+    <strong>Business logic:</strong> calculations, state transitions, invariants, and policies.
+  </li>
+  <li>
+    <strong>Framework integration:</strong> scanning, binding, validation, proxies, and advice.
+  </li>
+  <li>
+    <strong>Data integration:</strong> mappings, queries, constraints, isolation, and migrations.
+  </li>
+  <li>
+    <strong>Protocol integration:</strong> HTTP status, JSON, headers, authentication, and schemas.
+  </li>
+  <li>
+    <strong>Operational behavior:</strong> startup, health, retries, timeouts, and observability.
+  </li>
+</ul>
+
+<h2 id="junit"><span class="num">02.</span> JUnit Jupiter fundamentals</h2>
+<p class="lead">
+  JUnit supplies test discovery and lifecycle; Spring integrates with it only when a test needs a
+  Spring-managed environment.
+</p>
+
+<figure class="code">
+  <figcaption><b>A plain unit test with no Spring context</b></figcaption>
+  <pre><code>class PriceCalculatorTest {
+
+    private final PriceCalculator calculator = new PriceCalculator();
+
+    @Test
+    void appliesMemberDiscountAfterQuantityDiscount() {
+        Money result = calculator.price(
+                new OrderLine(money("100.00"), 10),
+                CustomerTier.MEMBER);
+
+        assertEquals(money("855.00"), result);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "STANDARD, 100.00",
+        "MEMBER,    95.00",
+        "PREMIUM,   90.00"
+    })
+    void appliesTierRate(CustomerTier tier, String expected) {
+        assertEquals(money(expected), calculator.priceOne(money("100.00"), tier));
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Use names that describe behavior and outcome. Arrange the relevant state, act once, then assert
+  observable results. This is a thinking aid, not a requirement to add comments. Prefer one
+  behavioral reason for failure per test. Multiple assertions are appropriate when they describe one
+  outcome, especially with <code>assertAll</code>.
+</p>
+
+<h3 id="junit-lifecycle">Lifecycle and state</h3>
+<p>
+  JUnit creates a new test instance for each test method by default. <code>@BeforeEach</code> and
+  <code>@AfterEach</code> surround every test. <code>@BeforeAll</code> and
+  <code>@AfterAll</code> normally use static methods. <code>@TestInstance(PER_CLASS)</code> changes
+  that lifecycle, but shared mutable fields can then leak state between methods. Test order should
+  not be a hidden dependency.
+</p>
+
+<ul class="clean">
+  <li>
+    Use <code>assertThrows</code> and inspect the exception when the message or fields matter.
+  </li>
+  <li>Use parameterized tests for the same rule over representative inputs and boundaries.</li>
+  <li>Use <code>@Nested</code> to group scenarios, not to create a complicated class hierarchy.</li>
+  <li>Use <code>@TempDir</code> instead of fixed machine-specific filesystem paths.</li>
+  <li>Use deterministic clocks, IDs, and random seeds through injected collaborators.</li>
+  <li>
+    A timeout guards hangs, but an unrealistically tight timeout creates machine-dependent tests.
+  </li>
+</ul>
+
+<div class="warning">
+  <strong>Do not load Spring by habit</strong>
+  <p>
+    <code>@SpringBootTest</code> does not make a unit test better. If the class can be constructed
+    with <code>new</code>, use plain JUnit. This keeps the feedback fast and also proves that the
+    design is not unnecessarily coupled to the container.
+  </p>
+</div>
+
+<h2 id="mockito"><span class="num">03.</span> Mockito and interaction boundaries</h2>
+<p class="lead">
+  A mock is a programmable substitute used to control or observe a collaborator, not a copy of its
+  implementation.
+</p>
+
+<figure class="code">
+  <figcaption><b>A service unit test with one mocked boundary</b></figcaption>
+  <pre><code>@ExtendWith(MockitoExtension.class)
+class RegistrationServiceTest {
+
+    @Mock UserRepository users;
+    @Mock DomainEventPublisher events;
+    @Captor ArgumentCaptor&lt;UserRegistered&gt; event;
+
+    @InjectMocks RegistrationService service;
+
+    @Test
+    void savesUserAndPublishesRegistration() {
+        given(users.existsByEmail("ana@example.com")).willReturn(false);
+
+        UserId id = service.register("ana@example.com");
+
+        then(users).should().save(argThat(user -&gt;
+                user.id().equals(id) &amp;&amp; user.email().equals("ana@example.com")));
+        then(events).should().publish(event.capture());
+        assertEquals(id, event.getValue().userId());
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Stub only behavior the test reaches. Modern strict Mockito sessions report unused or mismatched
+  stubbing, which often reveals a test that no longer describes the implementation path. Verify an
+  interaction only when the interaction is part of the contract, such as publishing an event,
+  charging a gateway, or never invoking a repository after validation fails.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Test double</th>
+        <th>Purpose</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Stub</td>
+        <td>Returns controlled answers.</td>
+        <td>A gateway returns a declined payment.</td>
+      </tr>
+      <tr>
+        <td>Mock</td>
+        <td>Records calls for verification.</td>
+        <td>Verify an audit event was published once.</td>
+      </tr>
+      <tr>
+        <td>Fake</td>
+        <td>Has a lightweight working implementation.</td>
+        <td>An in-memory repository implementing the port.</td>
+      </tr>
+      <tr>
+        <td>Spy</td>
+        <td>Wraps a real object while observing or replacing selected calls.</td>
+        <td>Rarely observe one method on a legacy collaborator.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="mocking-guidelines">Mocking guidelines</h3>
+<ul class="clean">
+  <li>Mock owned application ports and slow or nondeterministic boundaries.</li>
+  <li>Do not mock value objects, collections, DTOs, entities, or the class under test.</li>
+  <li>Do not mock JDBC, JPA, or Spring internals to claim that a query or mapping works.</li>
+  <li>Avoid deep stubs because they encode an implementation call chain.</li>
+  <li>Prefer state assertions when the externally visible result is sufficient.</li>
+  <li>Use a real object when it is simple, deterministic, and cheap.</li>
+  <li>Resetting a mock usually signals that one test is trying to cover several scenarios.</li>
+</ul>
+
+<p>
+  In a Spring test context, current Spring test support can replace a bean with
+  <code>@MockitoBean</code> and wrap one with <code>@MockitoSpyBean</code>. Older Spring Boot
+  versions commonly use <code>@MockBean</code> and <code>@SpyBean</code>. Use the API supported by
+  the project version, and remember that each distinct override contributes to context configuration
+  and can reduce context-cache reuse.
+</p>
+
+<h2 id="spring-test-context"><span class="num">04.</span> Spring TestContext internals</h2>
+<p class="lead">
+  The TestContext framework connects JUnit lifecycle events to Spring context loading, dependency
+  injection, transactions, SQL scripts, security setup, and cleanup listeners.
+</p>
+
+<p>
+  With JUnit Jupiter, <code>SpringExtension</code> integrates Spring with the extension model.
+  Composed annotations such as <code>@SpringJUnitConfig</code>, <code>@SpringBootTest</code>, and
+  Boot test slices include the required integration. The framework bootstraps a
+  <code>TestContextManager</code>, selects a bootstrapper, builds a merged context configuration,
+  asks a context loader to create or find an <code>ApplicationContext</code>, and invokes registered
+  <code>TestExecutionListener</code> callbacks around the test.
+</p>
+
+<ol class="clean">
+  <li>JUnit discovers the test class and its extensions.</li>
+  <li>
+    Spring determines configuration classes, locations, profiles, properties, and customizers.
+  </li>
+  <li>The context cache is checked using the resulting configuration key.</li>
+  <li>On a miss, Spring creates and refreshes the application context.</li>
+  <li>Listeners inject the test instance and prepare transactions or security context.</li>
+  <li>JUnit lifecycle and test methods execute.</li>
+  <li>Listeners perform rollback, cleanup, and after-test work.</li>
+  <li>The context usually stays cached for another compatible test class.</li>
+</ol>
+
+<p>
+  Test instances are not Spring beans by default, but dependency injection listeners can inject
+  fields, constructors, or methods from the test context. Constructor injection is clear, but a test
+  constructor fully autowired by Spring interacts with JUnit lifecycle choices, especially when
+  <code>@DirtiesContext</code> closes a context between methods. Keep the arrangement simple.
+</p>
+
+<h2 id="context-caching"><span class="num">05.</span> Context caching and suite speed</h2>
+<p class="lead">
+  A Spring context is cached by its effective configuration, not only by the test annotation name.
+</p>
+
+<p>
+  The cache key includes configuration locations and classes, initializers, loader, parent context,
+  active profiles, test property sources, resource base path, and context customizers. Dynamic
+  properties and bean overrides are customizers, so changing them can create a different key. Two
+  test classes reuse one context only when their keys match.
+</p>
+
+<div class="note">
+  <strong>Important cache facts</strong>
+  <p>
+    The cache is static and therefore belongs to one JVM process. Forking a new process discards it.
+    The default maximum is 32 contexts and least recently used entries are evicted when full. Set
+    <code>org.springframework.test.context.cache</code> logging to <code>DEBUG</code> to inspect
+    hit, miss, and size statistics.
+  </p>
+</div>
+
+<ul class="clean">
+  <li>Standardize a small number of test configurations and profiles.</li>
+  <li>Avoid unique inline properties for every test class.</li>
+  <li>Group tests that need the same bean overrides.</li>
+  <li>Do not fork one JVM per test class when context reuse matters.</li>
+  <li>Use <code>@DirtiesContext</code> only when a test truly corrupts context state.</li>
+  <li>Reset mutable application data instead of rebuilding the entire context.</li>
+  <li>Measure cache statistics before increasing the cache maximum.</li>
+</ul>
+
+<p>
+  <code>@DirtiesContext</code> removes a context before or after the selected class or method. It is
+  correct when a test mutates bean definitions, closes the context, or irreversibly changes a
+  singleton. It is an expensive cleanup shortcut for ordinary database rows, mocks, or caches.
+</p>
+
+<h2 id="smallest-context"><span class="num">06.</span> Choosing the smallest useful context</h2>
+<p class="lead">Add infrastructure only when the assertion would be invalid without it.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Smallest likely test</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Does this domain rule handle boundaries?</td>
+        <td>Plain JUnit with real domain objects.</td>
+      </tr>
+      <tr>
+        <td>Does this service coordinate its ports?</td>
+        <td>Plain JUnit with small mocks or fakes.</td>
+      </tr>
+      <tr>
+        <td>Does Spring construct this custom bean graph?</td>
+        <td><code>@SpringJUnitConfig</code> with explicit configuration.</td>
+      </tr>
+      <tr>
+        <td>Does the MVC contract bind, validate, secure, and serialize?</td>
+        <td><code>@WebMvcTest</code> with MockMvc.</td>
+      </tr>
+      <tr>
+        <td>Does a JPA mapping or repository query work?</td>
+        <td><code>@DataJpaTest</code> with PostgreSQL.</td>
+      </tr>
+      <tr>
+        <td>Does auto-configuration and the complete bean graph start?</td>
+        <td><code>@SpringBootTest(webEnvironment = NONE)</code>.</td>
+      </tr>
+      <tr>
+        <td>Does real HTTP transport behavior work?</td>
+        <td><code>@SpringBootTest(RANDOM_PORT)</code> and a real client.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A slice should not be expanded one missing bean at a time until it silently becomes a full
+  context. If the assertion genuinely spans the whole application, say so with
+  <code>@SpringBootTest</code>. If only one adapter is relevant, import that adapter and its focused
+  configuration into the slice.
+</p>
+
+<h2 id="slice-tests"><span class="num">07.</span> Spring Boot slice tests</h2>
+<p class="lead">
+  A slice uses type filters and selected auto-configuration to test one technical layer.
+</p>
+
+<p>
+  Common slices include <code>@WebMvcTest</code>, <code>@WebFluxTest</code>,
+  <code>@DataJpaTest</code>, <code>@JdbcTest</code>, <code>@DataJdbcTest</code>,
+  <code>@JsonTest</code>, <code>@RestClientTest</code>, and <code>@GraphQlTest</code>. Exact modules
+  and package names depend on the Spring Boot generation, so follow the dependency management and
+  reference guide for the project version.
+</p>
+
+<ul class="clean">
+  <li>A slice excludes ordinary application components outside its focus.</li>
+  <li>Use <code>@Import</code> for a small required user configuration or component.</li>
+  <li>Use a test bean override for a collaborator intentionally outside the slice.</li>
+  <li>Do not assume <code>@ConfigurationProperties</code> classes are scanned by every slice.</li>
+  <li>Main-application component scan customization can interfere with slice filters.</li>
+  <li>Test the full context separately so slices are not the only wiring evidence.</li>
+</ul>
+
+<div class="warning">
+  <strong>A slice is real framework integration, not production completeness</strong>
+  <p>
+    A web slice can prove mapping, conversion, validation, exception handling, filters, and
+    security. It does not prove that the mocked service has a real bean, that the database is
+    reachable, or that the whole application starts.
+  </p>
+</div>
+
+<h2 id="spring-boot-test"><span class="num">08.</span> Full contexts with @SpringBootTest</h2>
+<p class="lead">
+  Use <code>@SpringBootTest</code> when the test needs Spring Boot startup, auto-configuration, and
+  the complete application bean graph.
+</p>
+
+<p>
+  Unlike a basic <code>@ContextConfiguration</code>, it creates the context through
+  <code>SpringApplication</code>, so Boot external properties, environment preparation, and other
+  Boot behavior participate. It searches upward from the test package for the primary
+  <code>@SpringBootConfiguration</code> unless explicit sources are supplied.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Web environment</th>
+        <th>Behavior</th>
+        <th>Use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>MOCK</code></td>
+        <td>Default mock web environment; no embedded server.</td>
+        <td>Full context with MockMvc or mock WebTestClient support.</td>
+      </tr>
+      <tr>
+        <td><code>RANDOM_PORT</code></td>
+        <td>Starts a real server on an allocated port.</td>
+        <td>Real HTTP stack without fixed-port collisions.</td>
+      </tr>
+      <tr>
+        <td><code>DEFINED_PORT</code></td>
+        <td>Starts a server on the configured port.</td>
+        <td>Rare external-system test that requires a known port.</td>
+      </tr>
+      <tr>
+        <td><code>NONE</code></td>
+        <td>Loads a non-web Boot application context.</td>
+        <td>Batch, messaging, startup, or service integration.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>A real-server integration test</b></figcaption>
+  <pre><code>@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+class OrderApiIntegrationTest {
+
+    @Autowired WebTestClient client;
+
+    @Test
+    void createsAndReadsOrder() {
+        String location = client.post()
+                .uri("/orders")
+                .bodyValue(new CreateOrderRequest("SKU-42", 2))
+                .exchange()
+                .expectStatus().isCreated()
+                .expectHeader().valueMatches("Location", "/orders/.+")
+                .returnResult(Void.class)
+                .getResponseHeaders()
+                .getLocation()
+                .toString();
+
+        client.get().uri(location)
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody()
+                .jsonPath("$.sku").isEqualTo("SKU-42")
+                .jsonPath("$.quantity").isEqualTo(2);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Do not use <code>DEFINED_PORT</code> for normal parallel tests. With a real server, the test
+  client and request handler run on separate threads. A transaction started around the test method
+  does not wrap the server transaction, so automatic test rollback does not clean server writes. Use
+  explicit cleanup, isolated schemas, or API-level deletion.
+</p>
+
+<h2 id="mockmvc"><span class="num">09.</span> Testing Spring MVC with MockMvc</h2>
+<p class="lead">
+  MockMvc sends mock Servlet requests through the <code>DispatcherServlet</code> without opening a
+  network socket.
+</p>
+
+<p>
+  It can test request mappings, argument resolution, data binding, validation, message conversion,
+  controller advice, filters, interceptors, and response serialization. It does not prove servlet
+  container configuration, TLS, compression, real network timeouts, or client-server thread
+  behavior.
+</p>
+
+<figure class="code">
+  <figcaption><b>A focused MVC contract test</b></figcaption>
+  <pre><code>@WebMvcTest(OrderController.class)
+class OrderControllerTest {
+
+    @Autowired MockMvc mvc;
+    @MockitoBean OrderService service;
+
+    @Test
+    void rejectsInvalidQuantityAsProblemDetail() throws Exception {
+        mvc.perform(post("/orders")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"sku":"SKU-42","quantity":0}
+                    """))
+            .andExpect(status().isBadRequest())
+            .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+            .andExpect(jsonPath("$.title").value("Validation failed"))
+            .andExpect(jsonPath("$.errors.quantity").exists());
+
+        then(service).shouldHaveNoInteractions();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Prefer assertions on public HTTP behavior: status, media type, headers, JSON shape, validation,
+  and security. Avoid asserting a private controller method, an exact internal exception type, or
+  the entire JSON document when only two fields are contractual. Add negative cases for missing
+  content type, malformed JSON, unknown IDs, invalid enum values, oversized input, and unsupported
+  methods.
+</p>
+
+<h3 id="mockmvc-setup">Context setup versus standalone setup</h3>
+<p>
+  <code>webAppContextSetup</code> uses the Spring MVC configuration in a
+  <code>WebApplicationContext</code>. <code>standaloneSetup</code> registers selected controllers
+  and supporting objects programmatically. Standalone setup is focused but can drift from actual
+  conversion, advice, security, and configuration. A Boot <code>@WebMvcTest</code> usually provides
+  a useful middle ground.
+</p>
+
+<h2 id="webtestclient"><span class="num">10.</span> WebTestClient and reactive web tests</h2>
+<p class="lead">
+  WebTestClient offers a fluent non-blocking client API that can bind to mock handlers or a live
+  server.
+</p>
+
+<p>
+  For WebFlux it can bind to a controller, router function, application context, or server. It can
+  also test Spring MVC through MockMvc adapters. The same assertion style can therefore begin with
+  mock handling and later connect over HTTP. It is particularly useful for streaming responses,
+  asynchronous behavior, and reactive backpressure scenarios.
+</p>
+
+<figure class="code">
+  <figcaption><b>A WebFlux slice test</b></figcaption>
+  <pre><code>@WebFluxTest(InventoryController.class)
+class InventoryControllerTest {
+
+    @Autowired WebTestClient client;
+    @MockitoBean InventoryQuery query;
+
+    @Test
+    void streamsAvailableItems() {
+        given(query.available()).willReturn(
+                Flux.just(new ItemView("A"), new ItemView("B")));
+
+        client.get().uri("/inventory/stream")
+                .exchange()
+                .expectStatus().isOk()
+                .returnResult(ItemView.class)
+                .getResponseBody()
+                .as(StepVerifier::create)
+                .expectNextMatches(item -&gt; item.sku().equals("A"))
+                .expectNextMatches(item -&gt; item.sku().equals("B"))
+                .verifyComplete();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Avoid blocking a reactive pipeline in production code merely to simplify a test. Use
+  <code>StepVerifier</code> for publisher signals, errors, cancellation, and virtual-time scenarios.
+  A mock binding still does not prove the behavior of the actual network server.
+</p>
+
+<h2 id="repository-tests"><span class="num">11.</span> Repository and persistence tests</h2>
+<p class="lead">
+  A repository test should prove mappings, generated SQL behavior, queries, constraints, and
+  database-specific semantics.
+</p>
+
+<p>
+  <code>@DataJpaTest</code> scans entities and Spring Data JPA repositories, supplies focused JPA
+  auto-configuration, and normally runs each test in a rollback-only transaction. It may replace the
+  configured database with an embedded one when available. Use
+  <code>@AutoConfigureTestDatabase(replace = Replace.NONE)</code> when the real configured
+  PostgreSQL data source must remain.
+</p>
+
+<figure class="code">
+  <figcaption><b>A mapping and query test with explicit flush</b></figcaption>
+  <pre><code>@DataJpaTest
+@AutoConfigureTestDatabase(replace = Replace.NONE)
+class OrderRepositoryTest {
+
+    @Autowired OrderRepository orders;
+    @Autowired TestEntityManager entities;
+
+    @Test
+    void findsPendingOrdersOldestFirst() {
+        entities.persist(order(PENDING, instant("2026-07-29T10:00:00Z")));
+        entities.persist(order(PAID, instant("2026-07-29T09:00:00Z")));
+        entities.persist(order(PENDING, instant("2026-07-29T08:00:00Z")));
+        entities.flush();
+        entities.clear();
+
+        List&lt;Order&gt; result = orders.findTop100ByStatusOrderByCreatedAt(PENDING);
+
+        assertAll(
+                () -&gt; assertEquals(2, result.size()),
+                () -&gt; assertEquals(
+                        instant("2026-07-29T08:00:00Z"),
+                        result.getFirst().createdAt()));
+    }
+}</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>Flush before expecting database constraints or SQL errors.</li>
+  <li>Clear the persistence context to prove data is read from the database.</li>
+  <li>Test owning sides, cascades, orphan removal, converters, and optimistic versions.</li>
+  <li>Assert ordering explicitly when the query contract promises ordering.</li>
+  <li>Test empty, null, boundary, duplicate, and large-page cases.</li>
+  <li>Inspect query counts for known N+1 risks, not every harmless implementation detail.</li>
+  <li>
+    Run migration scripts in integration tests rather than relying only on ORM schema creation.
+  </li>
+</ul>
+
+<h2 id="test-transactions"><span class="num">12.</span> Transaction behavior in tests</h2>
+<p class="lead">
+  A test-managed transaction is started by the Spring TestContext framework around the test; it is
+  related to, but distinct from, application-managed transaction boundaries.
+</p>
+
+<p>
+  A test annotated with Spring <code>@Transactional</code> normally starts a transaction before the
+  test and rolls it back afterward. Application methods using <code>REQUIRED</code> usually join it.
+  This is convenient isolation, but it changes what the test can observe. Lazy loading may succeed
+  because a persistence context remains open, and SQL deferred until flush or commit may never be
+  exercised.
+</p>
+
+<figure class="code">
+  <figcaption><b>Exercising a real commit with TestTransaction</b></figcaption>
+  <pre><code>@SpringBootTest
+@Transactional
+class OutboxCommitTest {
+
+    @Autowired CheckoutService checkout;
+    @Autowired JdbcTemplate jdbc;
+
+    @Test
+    void orderAndOutboxBecomeVisibleTogether() {
+        UUID orderId = checkout.place(command());
+
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+
+        assertEquals(1, count("orders", orderId));
+        assertEquals(1, count("outbox", orderId));
+
+        TestTransaction.start();
+    }
+}</code></pre>
+</figure>
+
+<div class="warning">
+  <strong>Cases that escape the test transaction</strong>
+  <p>
+    A real HTTP server handles requests on another thread. Work using
+    <code>REQUIRES_NEW</code> commits independently. Asynchronous work uses another execution
+    context. Preemptive timeout mechanisms may also run code on another thread. Rollback of the test
+    transaction cannot undo those writes.
+  </p>
+</div>
+
+<p>
+  Use <code>@Commit</code> or <code>@Rollback(false)</code> only when commit is the behavior under
+  test and provide deterministic cleanup. Use <code>@BeforeTransaction</code> and
+  <code>@AfterTransaction</code> for assertions outside the transaction. Never mistake automatic
+  rollback for proof that production cleanup or transaction boundaries are correct.
+</p>
+
+<h2 id="testcontainers"><span class="num">13.</span> Testcontainers with PostgreSQL</h2>
+<p class="lead">
+  Use the same database engine as production when SQL dialect, types, constraints, locking,
+  migrations, or query plans matter.
+</p>
+
+<p>
+  H2 is useful for tests designed around H2. It is not PostgreSQL. Differences include data types,
+  JSON operators, arrays, collations, generated identifiers, case behavior, SQL grammar, constraint
+  timing, locking, transaction isolation, and extensions. Compatibility modes reduce some syntax
+  differences but do not turn one engine into another.
+</p>
+
+<figure class="code">
+  <figcaption><b>A shared PostgreSQL container with dynamic properties</b></figcaption>
+  <pre><code>@Testcontainers
+@SpringBootTest
+class CheckoutIntegrationTest {
+
+    @Container
+    static final PostgreSQLContainer&lt;?&gt; postgres =
+            new PostgreSQLContainer&lt;&gt;("postgres:18-alpine")
+                    .withDatabaseName("orders")
+                    .withUsername("test")
+                    .withPassword("test");
+
+    @DynamicPropertySource
+    static void databaseProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The JUnit extension starts a static <code>@Container</code> once for the test class and an
+  instance container for each test method. Per-method containers maximize environmental isolation
+  but are much slower. Static containers plus database cleanup are usually a better balance. Pin an
+  explicit compatible image tag so an upstream image change does not silently alter CI.
+</p>
+
+<h3 id="service-connections">Service connections and dynamic properties</h3>
+<p>
+  Supported Spring Boot versions can use <code>@ServiceConnection</code> so container connection
+  details override normal properties automatically. <code>@DynamicPropertySource</code> remains a
+  flexible option and registers lazy suppliers in the test <code>Environment</code>. A dynamic
+  property method is static and its values help determine the test context configuration.
+</p>
+
+<figure class="code">
+  <figcaption><b>A service connection alternative</b></figcaption>
+  <pre><code>@TestConfiguration(proxyBeanMethods = false)
+class Containers {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer&lt;?&gt; postgres() {
+        return new PostgreSQLContainer&lt;&gt;("postgres:18-alpine");
+    }
+}
+
+@SpringBootTest
+@Import(Containers.class)
+class OrderApplicationTest {
+    // The container connection details configure the DataSource.
+}</code></pre>
+</figure>
+
+<p>
+  When an application context must live as long as a container, align their lifecycles. A base-class
+  singleton container that is stopped after one subclass while a cached context still points to it
+  causes confusing connection failures. Boot-managed container beans or imported container
+  declarations can make that ownership clearer.
+</p>
+
+<h3 id="container-production-practices">Container production practices</h3>
+<ul class="clean">
+  <li>Run the real migration tool against the fresh container.</li>
+  <li>Wait for readiness through supported container mechanisms, not fixed sleeps.</li>
+  <li>Keep container logs on failure but avoid printing passwords.</li>
+  <li>Do not enable experimental reusable containers in CI as an isolation strategy.</li>
+  <li>Cache downloaded images in CI infrastructure where policy allows.</li>
+  <li>Be deliberate with parallel execution because shared database state can collide.</li>
+  <li>Use unique database names or schemas when workers genuinely run concurrently.</li>
+</ul>
+
+<h2 id="fixtures"><span class="num">14.</span> Fixture design and data builders</h2>
+<p class="lead">
+  A fixture should make the important differences obvious and hide only irrelevant construction
+  noise.
+</p>
+
+<figure class="code">
+  <figcaption><b>A valid-by-default test data builder</b></figcaption>
+  <pre><code>final class OrderBuilder {
+    private CustomerId customerId = new CustomerId("customer-1");
+    private List&lt;OrderLine&gt; lines = List.of(line("SKU-1", 1));
+    private Instant createdAt = Instant.parse("2026-07-29T10:00:00Z");
+
+    OrderBuilder withoutLines() {
+        this.lines = List.of();
+        return this;
+    }
+
+    OrderBuilder createdAt(Instant value) {
+        this.createdAt = value;
+        return this;
+    }
+
+    Order build() {
+        return Order.restore(new OrderId("order-1"), customerId, lines, createdAt);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Builders should return valid objects by default. Each test changes only fields relevant to its
+  scenario. Avoid a universal fixture that creates dozens of unrelated rows. Hidden fixture graphs
+  make failures mysterious and slow cleanup. Prefer small domain factories, builders, SQL scripts
+  for precise relational state, or API setup when the setup behavior itself matters.
+</p>
+
+<ul class="clean">
+  <li>Use fixed instants through an injected <code>Clock</code>.</li>
+  <li>Generate unique values intentionally when a unique constraint requires them.</li>
+  <li>Do not depend on auto-generated IDs having a particular sequence value.</li>
+  <li>Keep expected values independent from the production algorithm.</li>
+  <li>Store large JSON examples as readable test resources when inline text becomes noisy.</li>
+  <li>Use factories per bounded context rather than one global test utility.</li>
+</ul>
+
+<h2 id="isolation"><span class="num">15.</span> Test isolation and deterministic cleanup</h2>
+<p class="lead">
+  Every test must produce the same result alone, after another test, in a different order, and on
+  another machine.
+</p>
+
+<p>
+  Isolation means controlling database rows, singleton state, caches, message queues, files, ports,
+  locale, time zone, environment variables, and background work. Rollback is one technique, not a
+  universal solution.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>Strength</th>
+        <th>Risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Rollback per test</td>
+        <td>Fast database reset in one thread and transaction.</td>
+        <td>Hides commit behavior and misses writes on other threads.</td>
+      </tr>
+      <tr>
+        <td>Targeted delete or truncate</td>
+        <td>Works after real commits.</td>
+        <td>Foreign keys, sequence state, and parallel workers need care.</td>
+      </tr>
+      <tr>
+        <td>Fresh schema or database</td>
+        <td>Strong database isolation.</td>
+        <td>Migration and creation cost.</td>
+      </tr>
+      <tr>
+        <td>Unique tenant or correlation key</td>
+        <td>Allows concurrent data in one service.</td>
+        <td>Queries and cleanup must always preserve the boundary.</td>
+      </tr>
+      <tr>
+        <td>Fresh container</td>
+        <td>Strong process and service isolation.</td>
+        <td>Highest startup and resource cost.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Parallel tests are safe only after shared resources are identified. JUnit resource locks can
+  serialize known global state. Separate schemas, ports, object keys, and broker destinations permit
+  real parallelism. Never fix a race by adding arbitrary sleeps. Await an observable condition with
+  a bounded timeout and useful failure diagnostics.
+</p>
+
+<h2 id="security-tests"><span class="num">16.</span> Spring Security tests</h2>
+<p class="lead">
+  Security tests must cover both allowed and denied paths through the actual security boundary.
+</p>
+
+<p>
+  Spring Security test support can populate the <code>SecurityContext</code>, apply users to MockMvc
+  requests, create JWT authentication, and add CSRF tokens. With MockMvc, ensure the Spring Security
+  filter chain is applied. A direct controller unit test cannot prove URL authorization, CSRF
+  behavior, filter ordering, authentication entry points, or access-denied handling.
+</p>
+
+<figure class="code">
+  <figcaption><b>Testing authentication, authority, and CSRF</b></figcaption>
+  <pre><code>@WebMvcTest(AdminOrderController.class)
+class AdminOrderControllerSecurityTest {
+
+    @Autowired MockMvc mvc;
+    @MockitoBean OrderAdminService service;
+
+    @Test
+    void anonymousUserIsRejected() throws Exception {
+        mvc.perform(delete("/admin/orders/{id}", "order-1")
+                .with(csrf()))
+            .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @WithMockUser(authorities = "order:delete")
+    void authorizedUserCanDelete() throws Exception {
+        mvc.perform(delete("/admin/orders/{id}", "order-1")
+                .with(csrf()))
+            .andExpect(status().isNoContent());
+
+        then(service).should().delete(new OrderId("order-1"));
+    }
+
+    @Test
+    @WithMockUser(authorities = "order:delete")
+    void stateChangingRequestWithoutCsrfIsRejected() throws Exception {
+        mvc.perform(delete("/admin/orders/{id}", "order-1"))
+            .andExpect(status().isForbidden());
+    }
+}</code></pre>
+</figure>
+
+<ul class="clean">
+  <li>
+    Distinguish unauthenticated <code>401</code> from authenticated-but-forbidden <code>403</code>.
+  </li>
+  <li>Test exact authorities, not only broad administrator roles.</li>
+  <li>Test object ownership and method security separately from URL rules.</li>
+  <li>Use <code>@WithUserDetails</code> when code expects a custom principal.</li>
+  <li>
+    For resource servers, test valid, missing, expired, malformed, and insufficient-scope tokens.
+  </li>
+  <li>Test CORS and CSRF according to the actual browser or API architecture.</li>
+  <li>Never weaken the production filter chain merely to make a test convenient.</li>
+</ul>
+
+<h2 id="external-systems"><span class="num">17.</span> External clients and failure simulation</h2>
+<p class="lead">
+  Test client code against a protocol boundary that can reproduce success, error, delay, and
+  malformed-response behavior.
+</p>
+
+<p>
+  A mocked Java interface proves service decisions but not URL construction, headers, serialization,
+  connection behavior, or status mapping. A mock HTTP server such as WireMock or OkHttp
+  MockWebServer exercises the configured production client over HTTP. Spring also provides focused
+  support for clients, including <code>MockRestServiceServer</code> for selected synchronous clients
+  and Boot client test slices.
+</p>
+
+<ul class="clean">
+  <li>Verify method, path, query encoding, headers, body, and content type.</li>
+  <li>Simulate <code>4xx</code>, <code>5xx</code>, timeout, disconnect, and malformed JSON.</li>
+  <li>Prove which failures retry and which fail immediately.</li>
+  <li>Use a stable idempotency key across retries.</li>
+  <li>Do not assert an exact retry delay in wall-clock milliseconds.</li>
+  <li>Use virtual time where the retry library supports it.</li>
+  <li>Keep a few sandbox-provider tests when a third-party contract is especially risky.</li>
+</ul>
+
+<h2 id="contract-tests"><span class="num">18.</span> Contract tests</h2>
+<p class="lead">
+  A contract test verifies the shared assumptions at a service boundary without requiring every
+  service to be deployed together.
+</p>
+
+<p>
+  A producer contract states which requests the provider accepts and which responses or messages it
+  produces. A consumer test uses a verified stub to prove its client expectations. The provider
+  verifies the same contract against its implementation. Spring Cloud Contract supports
+  consumer-driven and producer-driven HTTP and messaging contracts, generated tests, and published
+  stubs.
+</p>
+
+<div class="key">
+  <strong>Contracts complement integration tests</strong>
+  <p>
+    A schema alone may say that a field is a string but not that a missing order returns
+    <code>404</code>. A provider test alone may cover responses no consumer uses. A contract records
+    meaningful examples and matching rules at the shared boundary.
+  </p>
+</div>
+
+<ul class="clean">
+  <li>Keep business algorithms out of contracts; capture boundary examples and rules.</li>
+  <li>Version contracts with provider and consumer ownership clearly defined.</li>
+  <li>Use flexible matchers for IDs and timestamps, with concrete generated examples.</li>
+  <li>Cover backward-compatible optional additions and breaking removals intentionally.</li>
+  <li>Publish verified stubs only after provider verification succeeds.</li>
+  <li>
+    Do not call a mocked collaborator inside a provider test and claim the full service works.
+  </li>
+  <li>
+    Retain a small number of end-to-end tests for deployment, routing, and infrastructure risks.
+  </li>
+</ul>
+
+<h2 id="brittleness"><span class="num">19.</span> Avoiding brittle tests</h2>
+<p class="lead">
+  A brittle test fails after a harmless refactor or passes while an important public behavior is
+  broken.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Brittle pattern</th>
+        <th>Better focus</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Verify every internal method call in order.</td>
+        <td>Assert the observable state or essential boundary interaction.</td>
+      </tr>
+      <tr>
+        <td>Snapshot a huge response for one field rule.</td>
+        <td>Assert contractual fields and maintain a separate schema or contract.</td>
+      </tr>
+      <tr>
+        <td>Use production code to calculate the expected answer.</td>
+        <td>Write a simple independent expected value.</td>
+      </tr>
+      <tr>
+        <td>Sleep until asynchronous work "should" finish.</td>
+        <td>Await an observable condition with a bounded deadline.</td>
+      </tr>
+      <tr>
+        <td>Depend on current time, locale, or random values.</td>
+        <td>Inject controlled inputs and set explicit locale or zone.</td>
+      </tr>
+      <tr>
+        <td>Share mutable fixtures between test methods.</td>
+        <td>Create or restore state for each test.</td>
+      </tr>
+      <tr>
+        <td>Use a full context for a pure calculation.</td>
+        <td>Construct the object directly.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Do not expose private methods only for tests. Test them through the public behavior, or extract a
+  cohesive rule into its own type if it deserves direct tests. A failing test should name the
+  violated behavior and show relevant expected and actual values. Diagnostic quality is part of
+  suite design.
+</p>
+
+<h2 id="performance"><span class="num">20.</span> Test suite performance</h2>
+<p class="lead">
+  A fast suite comes from deliberate boundaries, context reuse, and controlled infrastructure, not
+  from deleting valuable assertions.
+</p>
+
+<ol class="clean">
+  <li>Measure test duration, context cache hits, and slow classes in CI.</li>
+  <li>Move pure rules out of Spring contexts.</li>
+  <li>Replace repeated full contexts with appropriate slices.</li>
+  <li>Unify equivalent profiles, properties, and bean overrides to reuse cache keys.</li>
+  <li>Share expensive containers at a safe lifecycle and clean their data.</li>
+  <li>Parallelize only tests whose resources are isolated.</li>
+  <li>Avoid fixed sleeps, repeated migrations per method, and unnecessary context dirtiness.</li>
+  <li>
+    Separate very slow environmental checks while keeping them mandatory at the right CI stage.
+  </li>
+</ol>
+
+<p>
+  Watch tail latency, not only average duration. One intermittent 90-second timeout damages feedback
+  more than many stable two-second tests. Record retry counts and quarantine only as a short, owned
+  remediation step. Automatically rerunning failures without investigation hides nondeterminism.
+</p>
+
+<h3 id="parallel-tests">Parallel execution</h3>
+<p>
+  JUnit can run tests concurrently, but Spring singleton beans, static variables, database tables,
+  ports, and container lifecycles may be shared. Mark unsafe resources or isolate them before
+  enabling parallelism. The Testcontainers JUnit extension documents its lifecycle support around
+  sequential execution, so validate any concurrent container strategy instead of assuming it is
+  safe.
+</p>
+
+<h2 id="production-strategy"><span class="num">21.</span> Production-quality test strategy</h2>
+<p class="lead">
+  Treat the test suite as production code with owners, architecture, observability, and a failure
+  budget.
+</p>
+
+<ul class="clean">
+  <li>Define which risks each test layer owns and avoid accidental gaps.</li>
+  <li>Require all tests to run from a clean checkout with documented prerequisites.</li>
+  <li>Pin Java, database images, locale, and time zone where reproducibility matters.</li>
+  <li>Run migrations against supported PostgreSQL versions before release.</li>
+  <li>Test rollback, timeout, retry, duplicate delivery, and partial failure paths.</li>
+  <li>Keep secrets out of fixtures, logs, snapshots, and container configuration.</li>
+  <li>Collect useful diagnostics on failure: request, response, SQL state, and container logs.</li>
+  <li>Fail clearly when Docker or required infrastructure is unavailable.</li>
+  <li>Review slow and flaky tests as defects, not normal background noise.</li>
+  <li>Delete duplicated tests only after confirming the same risk is covered elsewhere.</li>
+</ul>
+
+<h3 id="ci-pipeline">A practical CI sequence</h3>
+<ol class="clean">
+  <li>Compile and run static checks.</li>
+  <li>Run plain unit tests and focused slices.</li>
+  <li>Run PostgreSQL and external-protocol integration tests.</li>
+  <li>Verify producer and consumer contracts.</li>
+  <li>Build the deployable artifact and start it in a production-like configuration.</li>
+  <li>Run a small set of critical end-to-end and operational smoke tests.</li>
+</ol>
+
+<p>
+  Ordering gives early, precise feedback without making later integration evidence optional.
+  Developers should be able to run the important layers locally. CI-specific tests should be rare
+  and justified by infrastructure that cannot safely exist on a workstation.
+</p>
+
+<h2 id="mistakes"><span class="num">22.</span> Common mistakes</h2>
+<ol class="clean">
+  <li>
+    <strong>Full context everywhere:</strong> slow tests hide whether the design is unit-testable.
+  </li>
+  <li>
+    <strong>Mocks everywhere:</strong> tests repeat implementation calls but prove no integration.
+  </li>
+  <li><strong>H2 as PostgreSQL:</strong> database-specific failures reach production.</li>
+  <li><strong>No flush in JPA tests:</strong> deferred SQL and constraints remain untested.</li>
+  <li>
+    <strong>Rollback assumption:</strong> real-server and asynchronous writes leak between tests.
+  </li>
+  <li><strong>DirtiesContext cleanup:</strong> the suite repeatedly pays full startup cost.</li>
+  <li><strong>Random sleeps:</strong> tests are both slow and nondeterministic.</li>
+  <li>
+    <strong>Happy path only:</strong> validation, authorization, conflict, and timeout behavior
+    drift.
+  </li>
+  <li>
+    <strong>Disabled security filters:</strong> controller tests prove an impossible production
+    path.
+  </li>
+  <li><strong>Shared mutable fixture:</strong> ordering changes the result.</li>
+  <li><strong>Over-asserted JSON:</strong> harmless response additions break unrelated tests.</li>
+  <li>
+    <strong>Test-only production branches:</strong> production code behaves differently under test.
+  </li>
+  <li>
+    <strong>Mocking framework internals:</strong> a simulated mapping or transaction proves nothing.
+  </li>
+  <li>
+    <strong>Ignored flakiness:</strong> genuine regressions become indistinguishable from noise.
+  </li>
+</ol>
+
+<h2 id="worked-strategy"><span class="num">23.</span> Worked test strategy for an order API</h2>
+<p class="lead">
+  Consider an endpoint that validates an order, reserves PostgreSQL stock, writes an outbox event,
+  and requires a scoped JWT.
+</p>
+
+<ol class="clean">
+  <li>Unit-test quantity, price, and order state-transition rules with plain JUnit.</li>
+  <li>
+    Unit-test the application service with repository and event-store ports replaced by fakes.
+  </li>
+  <li>
+    Use <code>@WebMvcTest</code> for JSON binding, validation <code>ProblemDetail</code>, status,
+    location header, authentication, authority, and malformed requests.
+  </li>
+  <li>
+    Use <code>@DataJpaTest</code> with PostgreSQL Testcontainers for repository queries, mappings,
+    uniqueness, optimistic locking, and generated SQL behavior.
+  </li>
+  <li>
+    Use a full-context test against PostgreSQL to prove transactional order, stock, and outbox
+    behavior. Force a flush and verify rollback on failure.
+  </li>
+  <li>
+    Use <code>RANDOM_PORT</code> for a few real HTTP journeys and clean committed data explicitly.
+  </li>
+  <li>Publish an HTTP contract for consumers and an event contract for the outbox payload.</li>
+  <li>Test duplicate request IDs, concurrent stock reservation, timeout, and retry safety.</li>
+  <li>Start the packaged artifact in CI and verify health plus one authenticated smoke request.</li>
+</ol>
+
+<p>
+  This portfolio gives rapid feedback for domain rules, precise boundary failures for web and data
+  problems, and a small amount of full-stack confidence. It avoids trying to prove every permutation
+  through a running server.
+</p>
+
+<h2 id="practice"><span class="num">24.</span> Practice exercises</h2>
+<ol class="clean">
+  <li>Classify twenty existing tests by the risk they prove and remove unnecessary contexts.</li>
+  <li>Write a parameterized JUnit test for validation boundaries without loading Spring.</li>
+  <li>Replace an over-mocked unit test with real value objects and one boundary mock.</li>
+  <li>
+    Build a <code>@WebMvcTest</code> covering valid JSON, malformed JSON, and validation errors.
+  </li>
+  <li>Add anonymous, wrong-authority, correct-authority, and missing-CSRF security cases.</li>
+  <li>Write a <code>@DataJpaTest</code> that flushes and proves a PostgreSQL unique constraint.</li>
+  <li>Compare H2 and PostgreSQL behavior for one JSONB or case-sensitive query.</li>
+  <li>Use <code>TestTransaction</code> to prove a commit-time database constraint.</li>
+  <li>Measure Spring context cache hits, then consolidate unnecessary unique configurations.</li>
+  <li>Replace a fixed sleep in an asynchronous test with condition-based waiting.</li>
+  <li>Design cleanup for real-server tests that commit on another thread.</li>
+  <li>Define and verify one consumer-provider contract for an error response.</li>
+  <li>Run two inventory reservations concurrently and assert the durable invariant.</li>
+  <li>Create a CI test matrix and state which risk each stage controls.</li>
+</ol>
+
+<h2 id="interview"><span class="num">25.</span> Interview questions and answers</h2>
+
+<h3>What is the testing pyramid?</h3>
+<p>
+  It is a portfolio model with many fast focused tests, fewer integration tests, and a small number
+  of broad end-to-end tests. Its purpose is fast diagnosis plus enough boundary confidence, not a
+  fixed numerical ratio.
+</p>
+
+<h3>What is the difference between a unit test and a Spring integration test?</h3>
+<p>
+  A unit test constructs the subject directly and tests a small behavioral unit without the Spring
+  container. A Spring integration test loads an application context to verify container-managed
+  behavior such as configuration, injection, proxies, or framework adapters.
+</p>
+
+<h3>Why should you choose the smallest useful Spring context?</h3>
+<p>
+  Smaller contexts start faster, fail for fewer unrelated reasons, and communicate the boundary
+  under test. The context must still include every infrastructure behavior required for the
+  assertion to be valid.
+</p>
+
+<h3>How does Spring context caching work?</h3>
+<p>
+  The TestContext framework creates a key from configuration classes and locations, profiles,
+  properties, initializers, loader, parent, resource path, and customizers such as dynamic
+  properties and bean overrides. Compatible tests in one JVM reuse the cached context.
+</p>
+
+<h3>Why can @DirtiesContext make a suite slow?</h3>
+<p>
+  It removes a context from the cache, so a later compatible test must rebuild and refresh it. Use
+  it only for irreversible context mutation, not as ordinary data cleanup.
+</p>
+
+<h3>What does @SpringBootTest add?</h3>
+<p>
+  It creates the application context through <code>SpringApplication</code>, including Boot startup
+  and auto-configuration behavior. It can use a mock web environment, a real server, or no web
+  environment.
+</p>
+
+<h3>What is a Spring Boot test slice?</h3>
+<p>
+  It is a focused context that includes selected component types and auto-configuration for one
+  technical layer. Examples are MVC, JPA, JDBC, JSON, and REST client slices.
+</p>
+
+<h3>What does MockMvc test?</h3>
+<p>
+  It sends mock Servlet requests through Spring MVC request handling without a real server. It can
+  prove mapping, binding, conversion, validation, advice, filters, security, and serialization, but
+  not real network or servlet-container behavior.
+</p>
+
+<h3>When would you prefer WebTestClient?</h3>
+<p>
+  It is natural for WebFlux, streaming, and reactive assertions. It can bind to mock handlers or a
+  live server and can also use a MockMvc adapter for Spring MVC.
+</p>
+
+<h3>Why should repository tests use PostgreSQL when production uses PostgreSQL?</h3>
+<p>
+  Queries, types, operators, constraints, transaction behavior, locking, and extensions differ
+  between engines. An embedded substitute cannot prove PostgreSQL-specific behavior.
+</p>
+
+<h3>Why do JPA tests call flush and clear?</h3>
+<p>
+  Flush forces pending SQL so database errors become observable. Clear removes managed entities so a
+  subsequent read proves mapping and query behavior rather than returning the same in-memory object.
+</p>
+
+<h3>How are test-managed and application transactions different?</h3>
+<p>
+  The Spring TestContext framework owns the transaction around the test method. Application proxies
+  own service transactions. They may participate in the same physical transaction, but propagation,
+  threads, and real server requests can make them separate.
+</p>
+
+<h3>Why does @Transactional not clean up a RANDOM_PORT test?</h3>
+<p>
+  The test client and real server execute on different threads and therefore in different
+  transactions. Rolling back the test thread does not roll back a transaction already committed by
+  the server.
+</p>
+
+<h3>How does @DynamicPropertySource work with Testcontainers?</h3>
+<p>
+  A static method registers property suppliers in the test environment. It is useful for dynamic
+  JDBC URLs, usernames, passwords, ports, and other values known after container startup.
+</p>
+
+<h3>Should a Testcontainers database be started per method?</h3>
+<p>
+  Usually not. It gives strong isolation but high cost. A static per-class or suite-aligned
+  container with reliable database cleanup is commonly faster. Choose based on actual isolation
+  risk.
+</p>
+
+<h3>What should be mocked?</h3>
+<p>
+  Mock an owned boundary when the test needs controlled answers or essential interaction
+  verification. Use real simple objects. Do not mock framework internals to claim that integration
+  behavior works.
+</p>
+
+<h3>How do you test Spring Security?</h3>
+<p>
+  Apply the real security configuration at the relevant boundary, supply test authentication with
+  Spring Security test support, and cover anonymous, forbidden, allowed, CSRF, token, and
+  object-ownership cases.
+</p>
+
+<h3>What is contract testing?</h3>
+<p>
+  It verifies shared producer-consumer expectations for requests, responses, or messages. Providers
+  verify contracts against implementations, and consumers use verified stubs without deploying the
+  complete distributed system.
+</p>
+
+<h3>What makes a test brittle?</h3>
+<p>
+  It depends on incidental implementation details, timing, ordering, global state, or oversized
+  snapshots rather than stable public behavior. It fails on harmless refactoring or misses real
+  regressions.
+</p>
+
+<h3>How do you speed up a Spring test suite safely?</h3>
+<p>
+  Measure first, move pure logic to unit tests, choose slices, standardize context configurations,
+  reuse containers safely, avoid context dirtiness and sleeps, and parallelize only isolated
+  resources.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">26.</span> Concise cheat sheet</h2>
+<div class="key">
+  <ul class="clean">
+    <li>Name the risk before choosing a test annotation.</li>
+    <li>Use plain JUnit for pure Java behavior.</li>
+    <li>Mock boundaries, not simple values or framework internals.</li>
+    <li>Use slices for focused framework adapters.</li>
+    <li>Use <code>@SpringBootTest</code> for full Boot startup and bean-graph behavior.</li>
+    <li>MockMvc exercises Spring MVC without a network server.</li>
+    <li>WebTestClient works with WebFlux, mock binding, and real servers.</li>
+    <li>Context reuse requires the same effective configuration key in one JVM.</li>
+    <li>Dynamic properties and bean overrides can create distinct context keys.</li>
+    <li>Use <code>@DirtiesContext</code> only for real context corruption.</li>
+    <li>Flush and clear when testing JPA mappings and constraints.</li>
+    <li>Automatic rollback can hide commit and cross-thread behavior.</li>
+    <li>Real-server writes need explicit cleanup.</li>
+    <li>Use PostgreSQL to test PostgreSQL semantics.</li>
+    <li>Align container and cached-context lifecycles.</li>
+    <li>Security tests need denied and allowed paths through real security rules.</li>
+    <li>Contracts verify shared protocol assumptions, not complete user journeys.</li>
+    <li>Control time, randomness, locale, ports, files, and shared state.</li>
+    <li>Replace sleeps with bounded condition-based waiting.</li>
+    <li>Measure slow and flaky tests and treat both as engineering defects.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">27.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework testing reference</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing/testcontext-framework.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring TestContext Framework</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing/testcontext-framework/ctx-management/caching.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring test context caching</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing/testcontext-framework/tx.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring test-managed transactions</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing/mockmvc.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring MockMvc</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/testing/webtestclient.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring WebTestClient</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/testing/spring-boot-applications.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Testing Spring Boot applications</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/testing/testcontainers.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot Testcontainers support</a
+    >
+  </li>
+  <li>
+    <a href="https://docs.junit.org/current/user-guide/" target="_blank" rel="noopener noreferrer"
+      >JUnit user guide</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Mockito API documentation</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://java.testcontainers.org/test_framework_integration/junit_5/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Testcontainers JUnit Jupiter integration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://java.testcontainers.org/modules/databases/postgres/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Testcontainers PostgreSQL module</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/test/mockmvc/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Security MockMvc integration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-security/reference/servlet/test/method.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Testing Spring method security</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-cloud-contract/reference/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Cloud Contract reference</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/mvcc.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL concurrency control</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
