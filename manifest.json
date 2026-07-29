@@ -95,6 +95,10 @@
         {
           "title": "Testing Spring Applications",
           "path": "spring/testing-spring-applications"
+        },
+        {
+          "title": "Caching, Scheduling, Async Processing, and Events",
+          "path": "spring/caching-scheduling-async-events"
         }
       ]
     }

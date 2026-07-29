@@ -1,0 +1,2262 @@
+<h1>Spring Caching, Scheduling, Async Processing, and Events - Complete Notes</h1>
+<p class="subtitle">
+  An in-depth and interview-focused guide to Spring Cache, Redis, cache consistency, scheduled work,
+  asynchronous execution, thread pools, application and transactional events, retries, idempotency,
+  and the point where durable messaging becomes necessary.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> One mental model for four tools</h2>
+<p class="lead">
+  Caching changes where a result comes from. Scheduling changes when work starts. Async processing
+  changes which thread waits. Events change how components learn that something happened.
+</p>
+
+<p>
+  These features are often discussed together because they move work away from the simplest
+  request-to-database path. They solve different problems and provide different guarantees. A cache
+  is a disposable copy of authoritative data. A scheduler is a clock that asks code to run. An
+  executor is a bounded place where tasks wait for threads. An application event is an in-process
+  notification. None of them is automatically durable, exactly once, distributed, or safe across a
+  process crash.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a restaurant. The cache is a tray of popular prepared items. The scheduler is the wall
+    clock that starts recurring kitchen jobs. The async executor is a limited set of cooks plus a
+    waiting counter. An event is the bell telling nearby staff that an order changed state. A
+    durable broker is a numbered order system whose tickets survive even if the restaurant closes
+    temporarily.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Useful Spring tool</th>
+        <th>What it does not promise</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Avoid repeating an expensive read</td>
+        <td>Spring Cache with Caffeine or Redis</td>
+        <td>Immediate consistency or permanent storage</td>
+      </tr>
+      <tr>
+        <td>Start maintenance at a time or interval</td>
+        <td><code>@Scheduled</code> and <code>TaskScheduler</code></td>
+        <td>One execution across a cluster or missed-run recovery</td>
+      </tr>
+      <tr>
+        <td>Return to a caller before independent work finishes</td>
+        <td><code>@Async</code> and a configured <code>TaskExecutor</code></td>
+        <td>Durability, unlimited capacity, or transaction propagation</td>
+      </tr>
+      <tr>
+        <td>Decouple beans inside one application</td>
+        <td><code>ApplicationEventPublisher</code> and event listeners</td>
+        <td>Cross-service delivery or persistence</td>
+      </tr>
+      <tr>
+        <td>Survive restarts and deliver across services</td>
+        <td>Durable broker plus outbox or another reliable publication pattern</td>
+        <td>Exactly-once business effects without idempotent consumers</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Start from the required guarantee</strong>
+  <p>
+    Ask whether work may be lost, duplicated, delayed, reordered, or observed before a database
+    commit. Then choose a mechanism. An annotation is convenient configuration, not a new
+    reliability guarantee.
+  </p>
+</div>
+
+<aside class="toc" aria-label="Contents">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#mental-model">One mental model for four tools</a></li>
+    <li><a href="#cache-abstraction">Spring Cache abstraction</a></li>
+    <li><a href="#cache-keys">Keys, conditions, and annotations</a></li>
+    <li><a href="#cache-consistency">Invalidation, TTL, and consistency</a></li>
+    <li><a href="#redis-cache">Redis cache integration</a></li>
+    <li><a href="#stampede">Stampedes and advanced cache patterns</a></li>
+    <li><a href="#scheduling">Scheduling fundamentals</a></li>
+    <li><a href="#scheduler-production">Production scheduling</a></li>
+    <li><a href="#async">Async execution and thread pools</a></li>
+    <li><a href="#async-failures">Async failures and context</a></li>
+    <li><a href="#events">Application events</a></li>
+    <li><a href="#transactional-events">Transactional and domain events</a></li>
+    <li><a href="#retry">Retry patterns</a></li>
+    <li><a href="#idempotency">Idempotency and duplicate work</a></li>
+    <li><a href="#durable-broker">When to use a durable broker</a></li>
+    <li><a href="#architecture">Putting the tools together</a></li>
+    <li><a href="#testing">Testing strategies</a></li>
+    <li><a href="#operations">Security, performance, and operations</a></li>
+    <li><a href="#mistakes">Common mistakes</a></li>
+    <li><a href="#practice">Practice exercises</a></li>
+    <li><a href="#interview">Interview questions and answers</a></li>
+    <li><a href="#cheat-sheet">Cheat sheet</a></li>
+    <li><a href="#references">Official references</a></li>
+  </ol>
+</aside>
+
+<h2 id="cache-abstraction"><span class="num">01.</span> Spring Cache abstraction</h2>
+<p class="lead">
+  Spring Cache applies reusable caching rules around method calls while a cache provider stores the
+  actual entries.
+</p>
+
+<p>
+  The core interfaces are <code>Cache</code> and <code>CacheManager</code>. A <code>Cache</code> is
+  a named region containing key-value entries. A <code>CacheManager</code> finds caches by name.
+  Spring's interceptors connect method annotations to these interfaces. The provider may be a local
+  concurrent map, Caffeine, Redis, JCache implementation, or another supported store.
+</p>
+
+<p>
+  The common read pattern is cache-aside. On a hit, return the cached value and skip the method. On
+  a miss, invoke the method, usually reading the source of truth, then put the result into the
+  cache. Spring coordinates this method-level flow. The provider controls storage, expiration,
+  eviction, serialization, and distributed behavior.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Responsibility</th>
+        <th>Example decision</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Application method</td>
+        <td>Defines the authoritative operation and result</td>
+        <td><code>findProduct(id)</code> reads PostgreSQL</td>
+      </tr>
+      <tr>
+        <td>Spring Cache advice</td>
+        <td>Computes keys and decides get, put, or evict</td>
+        <td>Use cache <code>productById</code> and key <code>id</code></td>
+      </tr>
+      <tr>
+        <td>Provider</td>
+        <td>Stores entries and implements provider features</td>
+        <td>Redis entry TTL is 10 minutes</td>
+      </tr>
+      <tr>
+        <td>Operations policy</td>
+        <td>Controls capacity, observability, failure mode, and access</td>
+        <td>Alert on latency, errors, evictions, and memory pressure</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Enable caching away from the main application class</b></figcaption>
+  <pre><code>@Configuration
+@EnableCaching
+class CacheConfiguration {
+}
+
+@Service
+class ProductQueryService {
+    private final ProductRepository products;
+
+    ProductQueryService(ProductRepository products) {
+        this.products = products;
+    }
+
+    @Cacheable(cacheNames = "productById", key = "#productId")
+    public ProductView findProduct(UUID productId) {
+        return products.findViewById(productId)
+                .orElseThrow(() -&gt; new ProductNotFoundException(productId));
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The first call for an identifier normally enters <code>findProduct</code>. A later call with the
+  same key may return without executing the method. This means logging, authorization checks,
+  metrics, or other side effects inside the cached method might not run on a hit. Keep a cacheable
+  method side-effect free and cache data only after access-control boundaries are understood.
+</p>
+
+<h3 id="local-vs-distributed-cache">Local and distributed caches</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Local cache</th>
+        <th>Distributed Redis cache</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Read latency</td>
+        <td>Very low, no network hop</td>
+        <td>Includes network and Redis latency</td>
+      </tr>
+      <tr>
+        <td>Data per application instance</td>
+        <td>Each instance has its own copy</td>
+        <td>Instances share a cache</td>
+      </tr>
+      <tr>
+        <td>Invalidation</td>
+        <td>Must reach every process</td>
+        <td>One shared entry can be removed</td>
+      </tr>
+      <tr>
+        <td>Failure effect</td>
+        <td>Consumes application heap</td>
+        <td>Depends on network and Redis service</td>
+      </tr>
+      <tr>
+        <td>Best fit</td>
+        <td>Small, hot, instance-tolerant data</td>
+        <td>Shared cache, larger working set, coordinated keys</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A two-level cache can combine both, but it creates two consistency boundaries. Evicting Redis does
+  not automatically evict each process-local copy. Add an invalidation channel, short local TTL, or
+  accept the larger stale window. Complexity is justified only when measurements show the extra
+  layer is valuable.
+</p>
+
+<h3 id="proxy-boundary-cache">The proxy boundary</h3>
+<p>
+  In the default proxy mode, caching annotations are applied only when a call enters through the
+  Spring proxy. A method calling another annotated method on <code>this</code> bypasses the proxy,
+  so the cache advice does not run. The same basic limitation appears with <code>@Async</code>,
+  <code>@Transactional</code>, and proxy-based retry. Move the annotated operation to a separate
+  bean, call it through its injected proxy, or use AspectJ only when its complexity is justified.
+</p>
+
+<h2 id="cache-keys"><span class="num">02.</span> Cache keys, conditions, and annotations</h2>
+<p class="lead">
+  A cache is correct only when equal keys always represent interchangeable results under the same
+  data and authorization rules.
+</p>
+
+<h3 id="default-key-generation">Default and explicit keys</h3>
+<p>
+  With no arguments, Spring uses <code>SimpleKey.EMPTY</code>. With one argument, the argument
+  itself is the key. With multiple arguments, Spring creates a <code>SimpleKey</code> containing
+  them. This is convenient, but an explicit key documents which inputs actually determine the
+  result.
+</p>
+
+<figure class="code">
+  <figcaption><b>Make business identity and result variation visible</b></figcaption>
+  <pre><code>@Cacheable(
+        cacheNames = "catalogSearch",
+        key = "T(String).format('%s:%s:%s', #tenantId, #query, #currency)")
+public SearchResult search(
+        UUID tenantId,
+        String query,
+        Currency currency,
+        RequestTrace trace) {
+    // trace does not affect the result, so it is not part of the key.
+    return gateway.search(tenantId, query, currency);
+}</code></pre>
+</figure>
+
+<p>
+  A stable key should include tenant, locale, currency, feature version, authorization dimension,
+  query filters, or any other input that can change the returned value. Do not use mutable objects
+  with unstable <code>equals</code> or <code>hashCode</code>. For Redis, prefer short, readable,
+  deterministic keys. Hash very large query objects only after defining a canonical form, because
+  field order and serialization changes can otherwise create different hashes for the same query.
+</p>
+
+<div class="warning">
+  <strong>Tenant and permission leaks are cache bugs</strong>
+  <p>
+    If two users have different allowed views but share a key, one user's cached response can be
+    served to another. Cache a permission-neutral object and filter it afterward, or include the
+    security dimension in the key. Never assume a controller authorization check makes shared cached
+    output safe.
+  </p>
+</div>
+
+<h3 id="cache-annotations">What each annotation means</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Annotation</th>
+        <th>Method execution</th>
+        <th>Cache effect</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@Cacheable</code></td>
+        <td>Skipped on a hit</td>
+        <td>Stores a miss result</td>
+        <td>Read-through method</td>
+      </tr>
+      <tr>
+        <td><code>@CachePut</code></td>
+        <td>Always runs</td>
+        <td>Stores the returned result</td>
+        <td>Refresh cache after update</td>
+      </tr>
+      <tr>
+        <td><code>@CacheEvict</code></td>
+        <td>Normally runs</td>
+        <td>Removes one key or all entries</td>
+        <td>Invalidate after mutation</td>
+      </tr>
+      <tr>
+        <td><code>@Caching</code></td>
+        <td>Depends on nested operations</td>
+        <td>Groups several cache operations</td>
+        <td>Evict detail and list caches together</td>
+      </tr>
+      <tr>
+        <td><code>@CacheConfig</code></td>
+        <td>No operation by itself</td>
+        <td>Shares class-level names or resolvers</td>
+        <td>Reduce repeated annotation metadata</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Condition, unless, put, and eviction</b></figcaption>
+  <pre><code>@Cacheable(
+        cacheNames = "productById",
+        key = "#id",
+        condition = "#useCache",
+        unless = "#result.discontinued()")
+public ProductView find(UUID id, boolean useCache) {
+    return load(id);
+}
+
+@CachePut(cacheNames = "productById", key = "#result.id()")
+@Transactional
+public ProductView rename(UUID id, String name) {
+    return mapper.toView(products.rename(id, name));
+}
+
+@CacheEvict(cacheNames = "productById", key = "#id")
+@Transactional
+public void delete(UUID id) {
+    products.deleteById(id);
+}</code></pre>
+</figure>
+
+<p>
+  <code>condition</code> is checked before method invocation and may prevent caching. An
+  <code>unless</code> expression is checked after invocation and can veto storing the result.
+  <code>#result</code> is therefore useful in <code>unless</code>, <code>@CachePut</code> key
+  expressions, and after-invocation eviction expressions, but not in a pre-invocation condition.
+</p>
+
+<p>
+  By default, <code>@CacheEvict</code> evicts only after successful completion. If the method
+  throws, the entry remains. With <code>beforeInvocation = true</code>, eviction happens first even
+  if the method later fails. Use before-invocation eviction only when stale cached data is more
+  dangerous than an unnecessary miss and the database failure cannot make the old cache value
+  preferable.
+</p>
+
+<h3 id="null-and-negative-cache">Null and negative caching</h3>
+<p>
+  Caching "not found" can protect a database from repeated requests for absent identifiers, but it
+  creates a stale absence when the record is later created. Use a short negative TTL and evict on
+  creation. Many providers can adapt null values, while some configurations disable them. An
+  explicit result such as <code>Optional</code> or a small lookup outcome makes the policy easier to
+  understand.
+</p>
+
+<h2 id="cache-consistency"><span class="num">03.</span> Invalidation, TTL, and consistency</h2>
+<p class="lead">
+  Cache consistency is a business policy about how long a copied value may disagree with the source
+  of truth.
+</p>
+
+<p>
+  A TTL is a safety bound and memory-management tool, not precise synchronization. A 10-minute TTL
+  means a stale entry may remain usable for roughly that duration after the source changes unless
+  explicit invalidation occurs. Expiration can happen before an application reads the entry, and
+  provider eviction can remove it even earlier under memory pressure.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>Write path</th>
+        <th>Strength</th>
+        <th>Main risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>TTL only</td>
+        <td>Do nothing to cache</td>
+        <td>Simple, eventual refresh</td>
+        <td>Known stale window</td>
+      </tr>
+      <tr>
+        <td>Cache-aside invalidation</td>
+        <td>Commit source, then remove key</td>
+        <td>Next read reloads authoritative data</td>
+        <td>Crash between commit and eviction</td>
+      </tr>
+      <tr>
+        <td>Write-through update</td>
+        <td>Update source and cache</td>
+        <td>Warm cache immediately</td>
+        <td>Two writes can fail or reorder</td>
+      </tr>
+      <tr>
+        <td>Versioned key</td>
+        <td>Change version used in new keys</td>
+        <td>No broad delete needed</td>
+        <td>Old keys consume memory until expiry</td>
+      </tr>
+      <tr>
+        <td>Event-driven invalidation</td>
+        <td>Publish committed change, consumers evict</td>
+        <td>Coordinates many processes or caches</td>
+        <td>Requires reliable delivery and idempotency</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="transaction-cache-order">Cache operations and database transactions</h3>
+<p>
+  Cache and database are separate resources. Putting or evicting before a database transaction
+  commits can expose a state that later rolls back. Putting only after commit is safer, but a
+  process can crash after commit and before the cache operation. For important cross-process
+  invalidation, store an outbox row in the same database transaction and publish it reliably. For a
+  noncritical cache, combine post-commit eviction with a bounded TTL and accept the small failure
+  window.
+</p>
+
+<div class="note">
+  <strong>Delete after database write is usually safer than update in place</strong>
+  <p>
+    A later reader repopulates from the committed source. Updating the cache can race with
+    concurrent readers and writers. It can also cache a representation that differs from the final
+    committed state because of triggers, defaults, or concurrent changes.
+  </p>
+</div>
+
+<h3 id="ttl-selection">Choosing a TTL</h3>
+<ul class="clean">
+  <li>Start from the maximum stale period the business can tolerate, not a round number.</li>
+  <li>Use shorter TTLs for volatile, sensitive, or frequently corrected data.</li>
+  <li>Use longer TTLs for immutable or versioned reference data.</li>
+  <li>Add randomized jitter so many entries do not expire at exactly the same second.</li>
+  <li>Measure hit rate, origin load, entry size, and change rate before tuning.</li>
+  <li>Do not cache account balances, authorization decisions, or one-time secrets casually.</li>
+  <li>Remember that provider capacity eviction can shorten the effective lifetime.</li>
+</ul>
+
+<p>
+  TTL is normally reset when an entry is created or updated. Time to idle, or TTI, resets expiration
+  on access. Spring Data Redis can emulate TTI with Redis <code>GETEX</code>, but every access path
+  must reset the TTL consistently and Redis 6.2 or later is required. Mixing cache reads with plain
+  <code>GET</code> operations breaks the TTI expectation.
+</p>
+
+<h3 id="cache-key-versioning">Versioning and schema changes</h3>
+<p>
+  Cached bytes outlive a deployment. A new class shape may fail to deserialize old entries or,
+  worse, deserialize with incorrect defaults. Add a format version to cache names or key prefixes,
+  deploy readers that tolerate a planned transition, or clear only the affected region. Avoid a
+  global Redis flush because Redis may hold unrelated application data.
+</p>
+
+<h2 id="redis-cache"><span class="num">04.</span> Redis cache integration</h2>
+<p class="lead">
+  Redis gives application instances a shared in-memory cache, but network, serialization, memory,
+  and security become part of the request path.
+</p>
+
+<p>
+  Spring Boot can auto-configure a <code>RedisCacheManager</code> when Redis is available and
+  caching is enabled. Cache names, a default TTL, null handling, and prefixes can be configured. For
+  different policies per region, build the manager with per-cache
+  <code>RedisCacheConfiguration</code> values.
+</p>
+
+<figure class="code">
+  <figcaption><b>Boot properties for a simple shared cache</b></figcaption>
+  <pre><code>spring:
+  cache:
+    type: redis
+    cache-names:
+      - productById
+      - exchangeRates
+    redis:
+      time-to-live: 10m
+      cache-null-values: false
+      use-key-prefix: true
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: true
+      connect-timeout: 2s
+      timeout: 1s</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Different expiration policies by cache</b></figcaption>
+  <pre><code>@Configuration
+@EnableCaching
+class RedisCachingConfiguration {
+
+    @Bean
+    RedisCacheManagerBuilderCustomizer cacheTtls() {
+        return builder -&gt; builder
+                .withCacheConfiguration(
+                        "productById",
+                        defaults(Duration.ofMinutes(10)))
+                .withCacheConfiguration(
+                        "exchangeRates",
+                        defaults(Duration.ofSeconds(45)));
+    }
+
+    private RedisCacheConfiguration defaults(Duration ttl) {
+        return RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(ttl)
+                .disableCachingNullValues()
+                .computePrefixWith(name -&gt; "kb:v2:" + name + "::");
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Keep a cache-name prefix. It prevents identical keys from different caches from colliding. Include
+  an application, environment, tenant model, and data-format version when Redis is shared. A key
+  such as <code>kb:prod:v2:productById::42</code> is easier to inspect than opaque Java-serialized
+  bytes.
+</p>
+
+<h3 id="redis-serialization">Serialization</h3>
+<p>
+  The serializer is a compatibility and security decision. JDK native serialization ties data to
+  Java types and has a history of unsafe deserialization when untrusted bytes are accepted. A
+  constrained JSON or another explicit format is easier to inspect, but polymorphic type metadata
+  also needs a strict allowlist. Cache immutable DTOs rather than managed JPA entities. Entities can
+  contain lazy proxies, bidirectional graphs, or fields whose meaning changes with a persistence
+  context.
+</p>
+
+<p>
+  Define the format contract, control type resolution, limit object size and nesting, and version
+  incompatible changes. Never deserialize bytes writable by an untrusted Redis client. Select the
+  current serializer API supported by the exact Spring Data Redis and Jackson generation in the
+  application rather than copying a deprecated serializer class from an older example.
+</p>
+
+<h3 id="redis-ttl-memory">Expiration and memory pressure</h3>
+<p>
+  Redis stores an absolute expiration timestamp for a key. <code>EXPIRE</code> and the expiration
+  options on <code>SET</code> create or update it. Expired keys are removed through access and
+  background expiration work. Separately, when memory exceeds <code>maxmemory</code>, Redis follows
+  <code>maxmemory-policy</code>. An all-keys LRU or LFU policy is common for a dedicated cache.
+  Volatile policies consider only expiring keys and behave like no-eviction if no eligible keys
+  exist.
+</p>
+
+<ul class="clean">
+  <li>
+    Set an explicit memory limit with headroom for clients, replication, persistence, and OS use.
+  </li>
+  <li>Choose an eviction policy based on measured access patterns.</li>
+  <li>
+    Keep durable data in a separate Redis deployment from disposable cache data when possible.
+  </li>
+  <li>
+    Monitor <code>used_memory</code>, evictions, expirations, hits, misses, latency, and errors.
+  </li>
+  <li>Remember that Redis LRU and LFU policies are approximations designed for efficiency.</li>
+</ul>
+
+<h3 id="redis-failure-mode">Fail-open or fail-closed</h3>
+<p>
+  A cache is normally an optimization, so a Redis failure may fall back to the database. This
+  fail-open approach can create a database traffic surge exactly when Redis is unavailable. Bound
+  timeouts, limit fallback concurrency, shed nonessential load, and protect the origin with a
+  circuit breaker or bulkhead. If cached data is itself required for correctness, it is no longer a
+  disposable cache and needs stronger storage and recovery design.
+</p>
+
+<h2 id="stampede"><span class="num">05.</span> Cache stampedes and advanced patterns</h2>
+<p class="lead">
+  A stampede occurs when many callers miss the same hot key and perform the expensive load
+  concurrently.
+</p>
+
+<p>
+  Stampedes commonly follow synchronized expiration, a cold deployment, mass invalidation, or a
+  cache outage. The origin receives traffic multiplied by the number of waiting callers. This can
+  turn one cache miss into a database incident.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>How it helps</th>
+        <th>Limit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@Cacheable(sync = true)</code></td>
+        <td>Provider may let one thread compute a missing key</td>
+        <td>Capability depends on provider and is often process-local</td>
+      </tr>
+      <tr>
+        <td>Per-key single-flight</td>
+        <td>Coalesces identical loads in one process</td>
+        <td>Every application instance may still load once</td>
+      </tr>
+      <tr>
+        <td>Distributed short lock</td>
+        <td>Coordinates loaders across instances</td>
+        <td>Lease expiry, fencing, crash, and unlock correctness matter</td>
+      </tr>
+      <tr>
+        <td>TTL jitter</td>
+        <td>Spreads expirations over time</td>
+        <td>Does not protect one extremely hot key</td>
+      </tr>
+      <tr>
+        <td>Refresh ahead</td>
+        <td>Refreshes before hard expiration</td>
+        <td>Background refresh can waste work or fail silently</td>
+      </tr>
+      <tr>
+        <td>Stale while revalidate</td>
+        <td>Serves bounded stale data while one caller refreshes</td>
+        <td>Requires explicit stale policy and metadata</td>
+      </tr>
+      <tr>
+        <td>Negative caching</td>
+        <td>Stops repeated loads for missing records</td>
+        <td>Can hide newly created data until eviction</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Spring's <code>sync = true</code> is a hint to the provider and restricts combinations with other
+  cache attributes. Confirm the provider's exact behavior. A local provider can synchronize only
+  inside one JVM. A Redis-backed cache may still let one loader per application instance reach the
+  database.
+</p>
+
+<h3 id="distributed-lock-warning">Distributed lock warning</h3>
+<p>
+  A Redis lock normally uses an atomic conditional set with an expiration and a unique owner token.
+  Unlock must delete only when the stored token still belongs to that owner, usually with an atomic
+  script. A lease can expire while slow work is still running, allowing a second loader. Fencing
+  tokens are needed when the protected resource must reject an older worker. Do not describe a
+  simple <code>SET NX</code> as a universal distributed-lock solution.
+</p>
+
+<h3 id="cache-observability">Cache metrics that answer useful questions</h3>
+<ul class="clean">
+  <li>Hit and miss count by bounded cache name, not by unbounded key.</li>
+  <li>Load duration, load failure count, and concurrent loader count.</li>
+  <li>Entry count, total bytes, large-value distribution, evictions, and expirations.</li>
+  <li>Redis command latency, connection-pool wait, timeouts, and reconnects.</li>
+  <li>Origin query rate and latency during normal service and cache failure.</li>
+  <li>Stale-value age when a stale-while-revalidate design is used.</li>
+</ul>
+
+<p>
+  A high hit rate is not automatically good. A cheap query might cost less than serialization and a
+  network call. A cache with a 99 percent hit rate can still serve dangerously stale authorization
+  data. Measure end-to-end latency, origin capacity, correctness, and operational cost.
+</p>
+
+<h2 id="scheduling"><span class="num">06.</span> Scheduling fundamentals</h2>
+<p class="lead">
+  A scheduler decides when to submit a task. The task still needs a thread, bounded work, error
+  handling, and concurrency rules.
+</p>
+
+<p>
+  Add <code>@EnableScheduling</code> to a configuration class to detect
+  <code>@Scheduled</code> methods. A scheduled method is normally a no-argument method. Fixed-delay,
+  fixed-rate, cron, and one-time initial-delay triggers express different timing models.
+</p>
+
+<figure class="code">
+  <figcaption><b>Three different schedules</b></figcaption>
+  <pre><code>@Component
+class MaintenanceJobs {
+
+    @Scheduled(
+            fixedDelayString = "${jobs.cleanup.delay:PT10M}",
+            initialDelayString = "${jobs.cleanup.initial-delay:PT1M}")
+    void cleanupExpiredSessions() {
+        // Next delay starts after this invocation finishes.
+    }
+
+    @Scheduled(fixedRate = 30, timeUnit = TimeUnit.SECONDS)
+    void captureQueueDepth() {
+        // Target start times are 30 seconds apart.
+    }
+
+    @Scheduled(
+            cron = "${jobs.invoice.cron:0 15 2 * * *}",
+            zone = "${jobs.invoice.zone:UTC}")
+    void createDailyInvoices() {
+        // Spring cron has six fields, including seconds.
+    }
+}</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Trigger</th>
+        <th>Meaning</th>
+        <th>Best use</th>
+        <th>Important edge case</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Fixed delay</td>
+        <td>Wait after the preceding execution completes</td>
+        <td>Polling or cleanup that must not chase a clock</td>
+        <td>Long task shifts every later start</td>
+      </tr>
+      <tr>
+        <td>Fixed rate</td>
+        <td>Target start times follow a regular period</td>
+        <td>Sampling and lightweight periodic work</td>
+        <td>Slow tasks can queue or overlap with pool capacity</td>
+      </tr>
+      <tr>
+        <td>Cron</td>
+        <td>Calendar-based schedule</td>
+        <td>Daily or weekday business jobs</td>
+        <td>Time zones and daylight-saving transitions</td>
+      </tr>
+      <tr>
+        <td>Initial delay only</td>
+        <td>One invocation after startup delay</td>
+        <td>Deferred startup task</td>
+        <td>Runs again after each restart</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A fixed rate does not make work complete at a fixed rate. If a single scheduler thread is busy,
+  another scheduled callback waits. With a pool, separate triggers can overlap. A repeatable
+  <code>@Scheduled</code> declaration creates independent triggers, so even the same method may
+  overlap.
+</p>
+
+<h3 id="cron-time">Cron and time</h3>
+<p>
+  Spring cron expressions use six fields: second, minute, hour, day of month, month, and day of
+  week. Always set an explicit <code>zone</code> for a business schedule. UTC avoids daylight-saving
+  ambiguity, but some business rules truly mean local time. During a daylight-saving transition, a
+  local time may not exist or may occur twice. Define the product rule, test the transition, and
+  make the job idempotent.
+</p>
+
+<p>
+  Inject <code>Clock</code> into business logic instead of repeatedly calling the system clock.
+  Tests can then use <code>Clock.fixed</code>. The scheduler should trigger a small coordinator that
+  passes an explicit time window to a service, such as
+  <code>[lastSuccessfulInstant, currentInstant)</code>, instead of hiding time calculations
+  throughout the job.
+</p>
+
+<h3 id="task-scheduler">TaskScheduler and configuration</h3>
+<p>
+  <code>TaskScheduler</code> is Spring's scheduling abstraction. A
+  <code>ThreadPoolTaskScheduler</code> delegates scheduling to a
+  <code>ScheduledExecutorService</code> and uses scheduler threads to execute tasks. Configure pool
+  size, thread names, shutdown behavior, and an error handler explicitly for important jobs. Spring
+  Boot exposes scheduling settings under <code>spring.task.scheduling</code>.
+</p>
+
+<figure class="code">
+  <figcaption><b>An explicit scheduler for observable behavior</b></figcaption>
+  <pre><code>@Configuration
+@EnableScheduling
+class SchedulingConfiguration implements SchedulingConfigurer {
+
+    @Bean
+    ThreadPoolTaskScheduler jobScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(4);
+        scheduler.setThreadNamePrefix("job-");
+        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        scheduler.setAwaitTerminationSeconds(30);
+        scheduler.setErrorHandler(error -&gt;
+                LoggerFactory.getLogger("scheduled-jobs")
+                        .error("Scheduled task failed", error));
+        return scheduler;
+    }
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar registrar) {
+        registrar.setTaskScheduler(jobScheduler());
+    }
+}</code></pre>
+</figure>
+
+<h2 id="scheduler-production"><span class="num">07.</span> Production scheduling</h2>
+<p class="lead">
+  Every application replica registers its own schedules, so a three-replica deployment normally runs
+  the same scheduled method three times.
+</p>
+
+<p>
+  This behavior is correct for per-instance work such as refreshing local state. It is dangerous for
+  global invoicing, emails, cleanup, or settlement. Decide whether the job is per-instance, one
+  active worker, partitioned, or intentionally redundant.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Approach</th>
+        <th>Useful when</th>
+        <th>Failure to design for</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Run on every replica</td>
+        <td>Work is local and independent</td>
+        <td>Unexpected shared side effects</td>
+      </tr>
+      <tr>
+        <td>Leader or external platform scheduler</td>
+        <td>One trigger is enough</td>
+        <td>Leader failover and duplicate trigger</td>
+      </tr>
+      <tr>
+        <td>Database or lease lock</td>
+        <td>Short global job with shared coordination store</td>
+        <td>Lease expires before task finishes</td>
+      </tr>
+      <tr>
+        <td>Quartz with persistent store</td>
+        <td>Persistent triggers, calendars, clustering, misfire policy</td>
+        <td>Operational schema and cluster configuration</td>
+      </tr>
+      <tr>
+        <td>Broker-driven work</td>
+        <td>Large work can be split into durable items</td>
+        <td>Duplicates, poison messages, backpressure</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="missed-and-overlapping-runs">Missed, slow, and overlapping runs</h3>
+<p>
+  The basic in-memory scheduler does not persist a fire while the application is down. On restart,
+  it resumes from current trigger state rather than replaying every missed business period. If every
+  period matters, store job checkpoints, scan for unfinished periods, or use a persistent scheduler
+  or broker.
+</p>
+
+<p>
+  Design the job around claimable units instead of one huge transaction. For example, claim 100
+  pending rows with a lease, process them, record results, and repeat. The lease identifies work
+  that another worker may reclaim after a crash. A unique business constraint prevents duplicate
+  output. Keep database transactions short and avoid holding locks during network calls.
+</p>
+
+<figure class="code">
+  <figcaption><b>A thin scheduled coordinator</b></figcaption>
+  <pre><code>@Component
+class ExpirationJob {
+    private final ExpirationService service;
+
+    ExpirationJob(ExpirationService service) {
+        this.service = service;
+    }
+
+    @Scheduled(fixedDelayString = "${jobs.expiration.delay:PT30S}")
+    void trigger() {
+        int processed;
+        do {
+            processed = service.processNextBatch(100);
+        } while (processed == 100);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Put transactional work in another Spring bean so its <code>@Transactional</code> proxy is used.
+  Bound the loop by a time budget as well as batch count in latency-sensitive services. Emit one
+  summary log and metrics instead of one high-cardinality log per row.
+</p>
+
+<h3 id="scheduler-operability">Job operability checklist</h3>
+<ul class="clean">
+  <li>Feature flag or property to disable the job safely.</li>
+  <li>Explicit time zone, batch size, timeout, and concurrency.</li>
+  <li>Last start, last success, last failure, duration, processed count, and backlog metrics.</li>
+  <li>Stable job-run identifier propagated to logs and downstream calls.</li>
+  <li>Manual recovery command that uses the same idempotent business service.</li>
+  <li>Alert on missing success as well as explicit failures.</li>
+  <li>Shutdown policy that stops accepting work and bounds drain time.</li>
+</ul>
+
+<h2 id="async"><span class="num">08.</span> Async execution and thread pools</h2>
+<p class="lead">
+  <code>@Async</code> submits a method invocation to an executor and returns control to the caller.
+  It does not make the work cheaper or durable.
+</p>
+
+<p>
+  Enable annotation support with <code>@EnableAsync</code>. In proxy mode, a call must cross the
+  proxy. The annotated method normally returns <code>void</code>, <code>Future</code>, or
+  <code>CompletableFuture</code>. The method may accept ordinary arguments. Use an explicit executor
+  name when workloads need different capacity or isolation.
+</p>
+
+<figure class="code">
+  <figcaption><b>A bounded executor and named async workload</b></figcaption>
+  <pre><code>@Configuration
+@EnableAsync
+class AsyncConfiguration implements AsyncConfigurer {
+
+    @Bean("notificationExecutor")
+    ThreadPoolTaskExecutor notificationExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(12);
+        executor.setQueueCapacity(200);
+        executor.setKeepAliveSeconds(30);
+        executor.setThreadNamePrefix("notify-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(30);
+        executor.setRejectedExecutionHandler(
+                new ThreadPoolExecutor.AbortPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+
+@Service
+class NotificationService {
+
+    @Async("notificationExecutor")
+    public CompletableFuture&lt;DeliveryResult&gt; send(Notification command) {
+        DeliveryResult result = gateway.deliver(command);
+        return CompletableFuture.completedFuture(result);
+    }
+}</code></pre>
+</figure>
+
+<h3 id="pool-anatomy">Pool anatomy and queueing</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Meaning</th>
+        <th>Design question</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Core pool size</td>
+        <td>Baseline worker count</td>
+        <td>How much steady concurrency can dependencies support?</td>
+      </tr>
+      <tr>
+        <td>Queue capacity</td>
+        <td>Tasks waiting before more threads or rejection</td>
+        <td>How much latency and memory may accumulate?</td>
+      </tr>
+      <tr>
+        <td>Maximum pool size</td>
+        <td>Upper worker count after a bounded queue fills</td>
+        <td>Can the database or remote service survive this burst?</td>
+      </tr>
+      <tr>
+        <td>Keep-alive</td>
+        <td>How long extra idle threads remain</td>
+        <td>Is burst capacity temporary?</td>
+      </tr>
+      <tr>
+        <td>Rejection policy</td>
+        <td>Behavior when both pool and queue are full</td>
+        <td>Fail, run on caller, drop, or custom persistence?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  With a <code>ThreadPoolExecutor</code>-style bounded queue, tasks generally fill core threads,
+  then the queue, then expand toward maximum threads, then reject. A huge queue can make
+  <code>maxPoolSize</code> irrelevant while requests wait for minutes and consume memory. An
+  unbounded executor can create threads until the process or downstream dependency collapses.
+  Capacity limits make overload visible.
+</p>
+
+<h3 id="pool-sizing">Reasoning about pool size</h3>
+<p>
+  CPU-heavy work rarely benefits from far more runnable platform threads than available CPU.
+  Blocking I/O can use more concurrency because threads spend time waiting, but the correct limit is
+  also bounded by database connections, downstream rate limits, file descriptors, memory, and
+  service-level objectives. Little's Law gives a useful starting relationship:
+  <code>concurrency = throughput × average time in system</code>. Measure real waiting and service
+  time before tuning.
+</p>
+
+<p>
+  Virtual threads can reduce the cost of blocking threads, but they do not create downstream
+  capacity. Keep semaphores, connection pools, concurrency limits, deadlines, and backpressure.
+  Avoid mixing CPU-heavy work and slow remote calls in one executor because one workload can starve
+  the other.
+</p>
+
+<h3 id="async-return-semantics">Return semantics</h3>
+<p>
+  A controller returning "accepted" after submitting an in-memory task must be honest: the process
+  may crash immediately and lose that work. If loss is acceptable, document it. If the caller needs
+  a result, return or compose the <code>CompletableFuture</code> and handle timeout and failure. If
+  business completion must survive restarts, persist a job or send a durable message before
+  acknowledging acceptance.
+</p>
+
+<h2 id="async-failures"><span class="num">09.</span> Async failures, transactions, and context</h2>
+<p class="lead">
+  Crossing a thread boundary also crosses exception, transaction, logging-context, and
+  request-context boundaries.
+</p>
+
+<h3 id="async-exceptions">Exception handling</h3>
+<p>
+  For a <code>Future</code> or <code>CompletableFuture</code>, the failure is captured and observed
+  when the caller waits or attaches a completion stage. A <code>void</code> async method cannot
+  return its failure to the caller. Configure an <code>AsyncUncaughtExceptionHandler</code> to log,
+  meter, and route such failures. Logging alone does not retry or recover lost work.
+</p>
+
+<figure class="code">
+  <figcaption><b>Observe uncaught void failures</b></figcaption>
+  <pre><code>@Override
+public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+    return (failure, method, arguments) -&gt; {
+        log.error(
+                "Async method failed method={} argumentCount={}",
+                method.toGenericString(),
+                arguments.length,
+                failure);
+        meterRegistry.counter(
+                "application.async.failures",
+                "method",
+                method.getName()).increment();
+    };
+}</code></pre>
+</figure>
+
+<p>
+  Do not log complete arguments automatically. They may contain passwords, tokens, personal data, or
+  large payloads. Use safe identifiers and a bounded method-name tag.
+</p>
+
+<h3 id="async-transactions">Transaction boundaries</h3>
+<p>
+  An imperative Spring transaction is normally bound to the caller thread. The async worker does not
+  inherit it. If the worker method has <code>@Transactional</code> and is invoked through the
+  appropriate proxy, it starts its own transaction. Passing a managed JPA entity to another thread
+  is unsafe because the persistence context is not transferred and entity state can be mutable. Pass
+  an immutable identifier or command and reload needed state inside the worker's transaction.
+</p>
+
+<div class="warning">
+  <strong>Do not submit work before commit and assume it sees committed data</strong>
+  <p>
+    The worker may start immediately, read before the caller commits, or act even if the caller
+    rolls back. Trigger after commit for best-effort local work, or use a transactional outbox when
+    the work must not disappear.
+  </p>
+</div>
+
+<h3 id="context-propagation">Security and diagnostic context</h3>
+<p>
+  Thread-local state such as MDC correlation values, locale, request attributes, and
+  <code>SecurityContext</code> does not automatically become correct on reused worker threads. Use a
+  deliberate <code>TaskDecorator</code> or supported context-propagation mechanism that captures
+  only required values, installs them for the task, and clears them in a <code>finally</code> block.
+  Blindly propagating a user security context into long-lived background work can grant permissions
+  after the request should have ended. Prefer explicit service identity and immutable audit data.
+</p>
+
+<h3 id="async-shutdown">Shutdown and cancellation</h3>
+<p>
+  Graceful shutdown stops new submissions, waits for a bounded interval, and then allows the
+  platform to terminate. Waiting forever can block deployments. Interrupts are cooperative, so code
+  should restore interruption status or exit when interrupted. A cancelled
+  <code>CompletableFuture</code> does not guarantee a remote call or database statement has been
+  undone.
+</p>
+
+<h2 id="events"><span class="num">10.</span> Spring application events</h2>
+<p class="lead">
+  An application event says that something happened inside one Spring application context and lets
+  publishers avoid direct knowledge of every listener.
+</p>
+
+<figure class="code">
+  <figcaption><b>Publish a past-tense immutable fact</b></figcaption>
+  <pre><code>public record OrderPlaced(
+        UUID eventId,
+        UUID orderId,
+        UUID customerId,
+        Instant occurredAt) {
+}
+
+@Service
+class OrderService {
+    private final ApplicationEventPublisher events;
+    private final OrderRepository orders;
+    private final Clock clock;
+
+    @Transactional
+    public UUID place(PlaceOrder command) {
+        Order order = orders.save(Order.create(command));
+        events.publishEvent(new OrderPlaced(
+                UUID.randomUUID(),
+                order.id(),
+                order.customerId(),
+                clock.instant()));
+        return order.id();
+    }
+}
+
+@Component
+class OrderProjectionListener {
+
+    @EventListener
+    void record(OrderPlaced event) {
+        // Runs synchronously by default.
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Publishing is a handoff to the application event multicaster, not proof that work is durable. By
+  default, listeners run synchronously in the publisher's thread. Their latency becomes publisher
+  latency, their exception may propagate to the publisher, and they can participate in the current
+  thread-bound transaction. Ordering can be set, but heavily ordered listeners often reveal hidden
+  workflow coupling.
+</p>
+
+<h3 id="event-design">Event design rules</h3>
+<ul class="clean">
+  <li>
+    Name facts in past tense, such as <code>OrderPlaced</code>, not commands such as
+    <code>SendEmail</code>.
+  </li>
+  <li>Use immutable payloads with stable identifiers and occurrence time.</li>
+  <li>Do not publish mutable JPA entities or request objects.</li>
+  <li>Keep payloads small and avoid secrets or unnecessary personal data.</li>
+  <li>Give events an identifier when duplicate handling or tracing matters.</li>
+  <li>
+    Let listeners own their side effect instead of making the event encode every implementation.
+  </li>
+</ul>
+
+<p>
+  <code>@EventListener(condition = "...")</code> can filter with SpEL. Listener methods can return
+  another event or collection of events for synchronous publication. That return-based publication
+  does not apply to asynchronous listeners, which should inject the publisher if they intentionally
+  emit another event.
+</p>
+
+<h3 id="async-events">Asynchronous listeners</h3>
+<p>
+  Adding <code>@Async</code> to a listener submits it to an executor. The publisher no longer waits,
+  but the event is still in memory and may be lost on crash or rejected under load. Configure a
+  dedicated bounded executor and failure handling. Use this for best-effort, low-consequence local
+  reactions, not for payments, audit records, or required integration delivery.
+</p>
+
+<h2 id="transactional-events"><span class="num">11.</span> Transactional and domain events</h2>
+<p class="lead">
+  <code>@TransactionalEventListener</code> binds listener execution to a transaction phase so a
+  listener can react to the transaction outcome.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Phase</th>
+        <th>When listener runs</th>
+        <th>Typical purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>BEFORE_COMMIT</code></td>
+        <td>Before commit processing completes</td>
+        <td>Required work that should still fail the transaction</td>
+      </tr>
+      <tr>
+        <td><code>AFTER_COMMIT</code></td>
+        <td>After a successful commit</td>
+        <td>Best-effort cache eviction or local follow-up</td>
+      </tr>
+      <tr>
+        <td><code>AFTER_ROLLBACK</code></td>
+        <td>After rollback</td>
+        <td>Rollback-specific cleanup or metrics</td>
+      </tr>
+      <tr>
+        <td><code>AFTER_COMPLETION</code></td>
+        <td>After commit or rollback</td>
+        <td>Outcome-independent cleanup</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Run only after the order transaction commits</b></figcaption>
+  <pre><code>@Component
+class OrderCacheListener {
+
+    private final CacheManager caches;
+
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    void evict(OrderPlaced event) {
+        Cache cache = Objects.requireNonNull(
+                caches.getCache("customerOrders"));
+        cache.evict(event.customerId());
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The default phase is <code>AFTER_COMMIT</code>. Without an active transaction, a transactional
+  listener is not invoked by default. <code>fallbackExecution = true</code> allows execution when no
+  transaction exists, but then the semantic guarantee changes. Use it only when both paths are
+  explicitly acceptable.
+</p>
+
+<div class="warning">
+  <strong>After commit does not mean durable</strong>
+  <p>
+    The database has committed, but the process can fail before or during the listener. Retrying an
+    in-memory listener after restart is not automatic. Also, data-access resources may still appear
+    bound during completion, but new writes in an after-commit listener need an explicit new
+    transaction if they are meant to commit.
+  </p>
+</div>
+
+<h3 id="domain-events">Domain events</h3>
+<p>
+  A domain event expresses a meaningful fact discovered by the domain model, such as
+  <code>SubscriptionExpired</code>. Spring Data aggregate support can expose domain events when an
+  aggregate is saved. This helps keep the model expressive, but repository publication is still an
+  in-process mechanism. Events may not be published if code changes state without the expected
+  repository operation, and they do not become durable automatically.
+</p>
+
+<p>
+  Keep domain events separate from external integration events. Internal events can use domain
+  language and process-local types. Integration events are versioned contracts for other systems,
+  often containing less data and stronger compatibility rules. An outbox publisher can translate a
+  committed domain outcome into an integration event.
+</p>
+
+<h3 id="outbox">Transactional outbox</h3>
+<p>
+  The outbox pattern stores the business change and an event row in the same local database
+  transaction. A separate publisher reads committed outbox rows and sends them to a broker, then
+  records publication. A crash can cause a message to be published more than once, so consumers must
+  be idempotent. The pattern closes the dangerous gap where a database commits but direct
+  publication fails.
+</p>
+
+<ol>
+  <li>Validate the command and update business tables.</li>
+  <li>Insert an outbox row with event ID, type, version, payload, and occurred time.</li>
+  <li>Commit both changes atomically.</li>
+  <li>A publisher claims committed rows in bounded batches.</li>
+  <li>Publish to the durable broker with the event ID.</li>
+  <li>Mark or delete published rows using a safe retention policy.</li>
+  <li>Consumers deduplicate by event ID and enforce business constraints.</li>
+</ol>
+
+<h2 id="retry"><span class="num">12.</span> Retry patterns</h2>
+<p class="lead">
+  Retry is correct only for a transient failure, with a bounded attempt budget, safe repeated
+  effects, and backoff that reduces pressure.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Retry?</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Connection reset before a safe read completes</td>
+        <td>Often</td>
+        <td>Temporary transport failure</td>
+      </tr>
+      <tr>
+        <td>HTTP 429 or 503 with bounded policy</td>
+        <td>Often</td>
+        <td>Remote service signals temporary inability</td>
+      </tr>
+      <tr>
+        <td>PostgreSQL serialization failure</td>
+        <td>Complete transaction</td>
+        <td>Concurrent outcome may succeed from a fresh snapshot</td>
+      </tr>
+      <tr>
+        <td>Validation failure or HTTP 400</td>
+        <td>No</td>
+        <td>The same invalid input remains invalid</td>
+      </tr>
+      <tr>
+        <td>Authentication or authorization failure</td>
+        <td>Normally no</td>
+        <td>Retry does not grant permission</td>
+      </tr>
+      <tr>
+        <td>Non-idempotent payment with unknown outcome</td>
+        <td>Only with provider idempotency key and status recovery</td>
+        <td>First attempt may already have succeeded</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="retry-policy">A production retry policy</h3>
+<ul class="clean">
+  <li>Classify a narrow set of transient exceptions.</li>
+  <li>Set a maximum attempt count and total elapsed-time budget.</li>
+  <li>Use exponential backoff so each failure increases the delay.</li>
+  <li>Add randomized jitter so many clients do not retry together.</li>
+  <li>Honor a trustworthy server-provided retry delay where applicable.</li>
+  <li>Set a timeout on each attempt and a deadline for the whole operation.</li>
+  <li>Record attempts, final outcome, cause, and exhausted count with bounded tags.</li>
+  <li>Combine with circuit breaking and concurrency limits when a dependency is unhealthy.</li>
+</ul>
+
+<p>
+  Never multiply retry layers accidentally. Three HTTP-client attempts inside three service attempts
+  inside three message redeliveries can create 27 calls. Define which layer owns retry and include
+  downstream attempt time in the caller's deadline.
+</p>
+
+<h3 id="spring-retry-versions">Spring Framework 7 and Spring Retry</h3>
+<p>
+  Spring Framework 7 includes core resilience support such as
+  <code>org.springframework.resilience.annotation.Retryable</code>, enabled with
+  <code>@EnableResilientMethods</code>. Its <code>maxRetries</code> means retries after the initial
+  call, so total attempts equal one plus <code>maxRetries</code>. It supports delay, multiplier,
+  maximum delay, jitter, included and excluded failures, and programmatic retry.
+</p>
+
+<figure class="code">
+  <figcaption><b>Framework 7 retry with backoff and jitter</b></figcaption>
+  <pre><code>@Configuration
+@EnableResilientMethods
+class ResilienceConfiguration {
+}
+
+@Service
+class RateClient {
+
+    @Retryable(
+            includes = {SocketTimeoutException.class},
+            maxRetries = 3,
+            delay = 100,
+            multiplier = 2,
+            maxDelay = 1_000,
+            jitter = 50)
+    public ExchangeRates loadRates() {
+        return remoteClient.load();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The separate Spring Retry project uses its own <code>@EnableRetry</code>,
+  <code>org.springframework.retry.annotation.Retryable</code>, <code>@Backoff</code>, and
+  <code>@Recover</code> model. It is in maintenance-only status because Spring Framework 7
+  supersedes it for new Framework 7 applications. Existing Spring Boot applications on earlier
+  Framework generations may still use Spring Retry. Do not mix the two annotations or assume that
+  similarly named attributes count attempts in the same way.
+</p>
+
+<h3 id="retry-proxy">Proxy and transaction placement</h3>
+<p>
+  Proxy-based retry needs an external call through the proxy. For a transaction retry, place retry
+  outside the transaction so each attempt receives a new transaction and persistence context. If
+  retry advice executes inside one transaction already marked rollback-only, later attempts cannot
+  repair it. Verify advice order with an integration test instead of relying on annotation order in
+  source code.
+</p>
+
+<h2 id="idempotency"><span class="num">13.</span> Idempotency and duplicate work</h2>
+<p class="lead">
+  An idempotent operation produces the intended business state when the same logical request is
+  processed more than once.
+</p>
+
+<p>
+  Retries, scheduler overlap, broker redelivery, client timeouts, and lease expiry all create
+  duplicates. "Exactly once" transport language does not remove the need for business idempotency
+  because a database commit and acknowledgement can fail at different moments.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>Example</th>
+        <th>Protection</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Natural unique constraint</td>
+        <td>One invoice per account and billing period</td>
+        <td>Concurrent duplicate creation</td>
+      </tr>
+      <tr>
+        <td>Idempotency key table</td>
+        <td>Client key maps to request hash and stored response</td>
+        <td>Repeated API command</td>
+      </tr>
+      <tr>
+        <td>Processed-event record</td>
+        <td>Unique consumer name plus event ID</td>
+        <td>Message redelivery</td>
+      </tr>
+      <tr>
+        <td>State transition guard</td>
+        <td>Update only where status is <code>PENDING</code></td>
+        <td>Repeated transition</td>
+      </tr>
+      <tr>
+        <td>Provider idempotency key</td>
+        <td>Stable payment request identifier</td>
+        <td>Unknown remote outcome</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="idempotency-key-flow">Safe API idempotency flow</h3>
+<ol>
+  <li>Require a high-entropy key scoped to authenticated client and operation.</li>
+  <li>Compute a canonical request hash and store it with the key.</li>
+  <li>Atomically claim the key using a unique database constraint.</li>
+  <li>Reject reuse of the same key with a different request hash.</li>
+  <li>Store the terminal status and response needed for an identical replay.</li>
+  <li>Handle an in-progress duplicate with wait, conflict, or status lookup semantics.</li>
+  <li>Retain records for at least the documented client retry window.</li>
+</ol>
+
+<p>
+  A Redis lock alone is not a complete idempotency record. It can expire, be evicted, or disappear
+  during failover. For important financial or externally visible operations, enforce the invariant
+  in the authoritative database or remote provider.
+</p>
+
+<h3 id="idempotent-consumer">Idempotent event consumer</h3>
+<p>
+  Insert the consumer and event ID into a table with a unique constraint in the same transaction as
+  the business mutation. If the insert conflicts, the event was already applied and can be
+  acknowledged. If the transaction rolls back, neither marker nor mutation remains. Keep the marker
+  long enough to cover broker retention and replay procedures.
+</p>
+
+<h2 id="durable-broker">
+  <span class="num">14.</span> When to move work to a durable message broker
+</h2>
+<p class="lead">
+  Use a durable broker when accepted work must survive process failure, cross service boundaries,
+  absorb bursts, or be retried independently.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>In-memory async or events</th>
+        <th>Durable broker</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Survive application restart</td>
+        <td>No</td>
+        <td>Designed to, subject to broker durability configuration</td>
+      </tr>
+      <tr>
+        <td>Cross-service delivery</td>
+        <td>No</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>Replay history</td>
+        <td>No</td>
+        <td>Available in log-oriented systems and retained queues</td>
+      </tr>
+      <tr>
+        <td>Backpressure</td>
+        <td>Bounded local queue and rejection</td>
+        <td>Durable backlog plus consumer flow control</td>
+      </tr>
+      <tr>
+        <td>Independent retry and dead-letter handling</td>
+        <td>Custom and process-local</td>
+        <td>Common broker and consumer capability</td>
+      </tr>
+      <tr>
+        <td>Very low local handoff latency</td>
+        <td>Excellent</td>
+        <td>Network and persistence overhead</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Strong signals for a broker include payment fulfillment, required email or webhook delivery,
+  inventory reservation, audit integration, long-running media processing, bursty fan-out,
+  multi-service workflows, and work that needs an operator-visible backlog. Keep local events for
+  decoupling code inside one process when loss is acceptable or the listener remains part of the
+  same synchronous transaction.
+</p>
+
+<h3 id="broker-realities">Broker realities</h3>
+<ul class="clean">
+  <li>Messages can be delivered more than once, so consumers must be idempotent.</li>
+  <li>Ordering is usually limited to a partition, key, or queue, not every message globally.</li>
+  <li>Acknowledgement should follow the durable business effect.</li>
+  <li>Retry topics or delayed queues need a bounded policy and dead-letter destination.</li>
+  <li>Poison messages need inspection, redaction, repair, and replay procedures.</li>
+  <li>Schema versions need backward and forward compatibility plans.</li>
+  <li>Outbox or change-data-capture closes the database-to-broker dual-write gap.</li>
+</ul>
+
+<h2 id="architecture"><span class="num">15.</span> Putting the tools together</h2>
+<p class="lead">
+  A production design assigns one clear responsibility and one failure policy to each boundary.
+</p>
+
+<h3 id="architecture-read">Read path with shared cache</h3>
+<ol>
+  <li>Authorize the request before returning protected data.</li>
+  <li>Compute a versioned, tenant-safe key.</li>
+  <li>Read Redis with a short timeout.</li>
+  <li>On a hit, return the immutable cached DTO.</li>
+  <li>On a miss, coalesce hot-key loads and query the authoritative database.</li>
+  <li>Store with TTL and jitter, then return.</li>
+  <li>On Redis failure, apply a bounded origin fallback rather than unlimited database traffic.</li>
+</ol>
+
+<h3 id="architecture-write">Write path with durable invalidation</h3>
+<ol>
+  <li>Validate an idempotency key and business rules.</li>
+  <li>Update business data and insert an outbox event in one database transaction.</li>
+  <li>Commit, then return the committed result.</li>
+  <li>An outbox publisher sends the versioned change event to a broker.</li>
+  <li>Consumers evict shared and local caches idempotently.</li>
+  <li>A short TTL limits stale data if invalidation is delayed.</li>
+</ol>
+
+<h3 id="architecture-job">Scheduled batch path</h3>
+<ol>
+  <li>An external or leader-aware scheduler triggers a lightweight coordinator.</li>
+  <li>The coordinator claims a bounded batch using database leases.</li>
+  <li>Workers process units with an idempotent state transition.</li>
+  <li>Transient remote failures use bounded retry and jitter.</li>
+  <li>Durable follow-up is published through an outbox.</li>
+  <li>Metrics report lag, claim age, completion rate, retry, and terminal failure.</li>
+</ol>
+
+<div class="key">
+  <strong>A useful architecture review question</strong>
+  <p>
+    At every arrow, ask what happens if the process stops immediately before it, during it, and
+    immediately after it. If the answer loses required work or repeats an unsafe effect, add a
+    durable record, idempotency guard, or changed acknowledgement boundary.
+  </p>
+</div>
+
+<h2 id="testing"><span class="num">16.</span> Testing strategies</h2>
+<p class="lead">
+  Test business logic without time or threads first, then test Spring interception and real
+  providers at the smallest useful integration boundary.
+</p>
+
+<h3 id="test-cache">Caching tests</h3>
+<ul class="clean">
+  <li>Unit-test key policy, TTL policy, and invalidation decisions as ordinary functions.</li>
+  <li>
+    Use a Spring integration test to prove the call crosses a proxy and a hit skips the loader.
+  </li>
+  <li>Verify different tenant, locale, and permission inputs never share an entry.</li>
+  <li>Verify mutation evicts or updates every affected detail, list, and aggregate cache.</li>
+  <li>
+    Use a real Redis test container for TTL, serialization, prefix, connection failure, and
+    concurrency.
+  </li>
+  <li>Test cold-cache load and mass-expiration behavior, not only warm hits.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Test observable caching behavior</b></figcaption>
+  <pre><code>@SpringBootTest
+class ProductCacheTest {
+    @Autowired ProductQueryService service;
+    @MockBean ProductRepository repository;
+
+    @Test
+    void repeatedLookupLoadsOnce() {
+        UUID id = UUID.randomUUID();
+        when(repository.findViewById(id))
+                .thenReturn(Optional.of(new ProductView(id, "Keyboard")));
+
+        assertThat(service.findProduct(id))
+                .isEqualTo(service.findProduct(id));
+
+        verify(repository, times(1)).findViewById(id);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Clear the relevant cache between tests because Spring's test context can be reused. Do not make
+  tests order-dependent. A mock-only unit test of the service cannot prove that cache advice runs.
+</p>
+
+<h3 id="test-scheduler">Scheduling tests</h3>
+<p>
+  Put real work in a service method that accepts a time window and batch size. Unit-test it with a
+  fixed <code>Clock</code>. Test cron calculation around month boundaries and daylight-saving
+  transitions. Keep annotation wiring tests small. Avoid sleep-based assertions; use latches,
+  Awaitility-style bounded polling, or directly invoke the coordinator when timing itself is not
+  under test.
+</p>
+
+<h3 id="test-async">Async tests</h3>
+<ul class="clean">
+  <li>Unit-test worker logic synchronously without an executor.</li>
+  <li>Integration-test that invocation returns and executes on the named thread or executor.</li>
+  <li>Use latches or controllable executors to make order deterministic.</li>
+  <li>Fill a tiny test pool and assert the selected rejection behavior.</li>
+  <li>Assert future failures, void exception handling, context cleanup, and graceful shutdown.</li>
+  <li>Test that the worker starts its own transaction and reloads data by identifier.</li>
+</ul>
+
+<h3 id="test-events-retry">Events, outbox, and retry tests</h3>
+<ul class="clean">
+  <li>Use <code>@RecordApplicationEvents</code> when the event contract itself matters.</li>
+  <li>Verify an after-commit listener does not run after rollback.</li>
+  <li>Test no-transaction behavior with and without <code>fallbackExecution</code>.</li>
+  <li>Commit a business change and assert the outbox row exists in the same outcome.</li>
+  <li>Simulate publish-before-mark failure and prove duplicate publication is safe.</li>
+  <li>
+    Use a fake clock and scripted transient failures to test exact retry delays and exhaustion.
+  </li>
+  <li>Prove permanent failures are attempted once and duplicate event IDs change state once.</li>
+</ul>
+
+<h2 id="operations"><span class="num">17.</span> Security, performance, and operations</h2>
+<p class="lead">
+  Background and cached paths need the same security review, capacity model, observability, and
+  recovery discipline as synchronous request paths.
+</p>
+
+<h3 id="security-practices">Security practices</h3>
+<ul class="clean">
+  <li>
+    Use Redis authentication, TLS, network isolation, least-privilege ACLs, and secret rotation.
+  </li>
+  <li>Do not expose Redis directly to untrusted networks or treat it as a public API.</li>
+  <li>
+    Never place passwords, access tokens, one-time codes, or unnecessary personal data in cache.
+  </li>
+  <li>Include tenant and authorization dimensions in keys where output differs.</li>
+  <li>Prevent unsafe polymorphic deserialization and restrict writable Redis clients.</li>
+  <li>Validate event payloads at trust boundaries and sign webhooks where required.</li>
+  <li>Run scheduled and async work with an explicit service identity and auditable actor.</li>
+  <li>Redact task arguments, cache values, event payloads, and broker messages from logs.</li>
+</ul>
+
+<h3 id="capacity-and-performance">Capacity and performance</h3>
+<ul class="clean">
+  <li>Give separate executors to workloads with different latency and criticality.</li>
+  <li>Keep every queue bounded and make rejection behavior part of the API contract.</li>
+  <li>Limit concurrency by the narrowest downstream resource, often database connections.</li>
+  <li>
+    Batch carefully: too small wastes overhead, while too large increases locks and recovery work.
+  </li>
+  <li>Use cache entries smaller than the network and serialization cost they save.</li>
+  <li>Spread TTL and recurring-job start times with jitter when exact alignment is unnecessary.</li>
+  <li>Apply deadlines across retries so backoff does not exceed caller usefulness.</li>
+</ul>
+
+<h3 id="operational-signals">Operational signals</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Metrics and diagnostics</th>
+        <th>Alert example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Cache</td>
+        <td>Hit ratio, load latency, Redis latency, error, eviction, memory</td>
+        <td>Origin load surges while Redis errors increase</td>
+      </tr>
+      <tr>
+        <td>Scheduler</td>
+        <td>Last success, duration, backlog, processed count, overlap</td>
+        <td>No successful run within expected interval</td>
+      </tr>
+      <tr>
+        <td>Executor</td>
+        <td>Active threads, pool size, queue depth, oldest task, rejection</td>
+        <td>Queue age violates the completion objective</td>
+      </tr>
+      <tr>
+        <td>Events and outbox</td>
+        <td>Published, listener failure, unpublished rows, oldest row age</td>
+        <td>Oldest outbox row continues to age</td>
+      </tr>
+      <tr>
+        <td>Retry</td>
+        <td>Attempts, recovered, exhausted, delay, final exception class</td>
+        <td>Retry volume rises before final failures rise</td>
+      </tr>
+      <tr>
+        <td>Broker</td>
+        <td>Consumer lag, redelivery, dead letter, publish latency</td>
+        <td>Lag or dead-letter growth exceeds recovery capacity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Thread dumps reveal executor starvation, lock waits, and blocked network calls. Give pools
+  recognizable thread-name prefixes. Do not tag metrics with cache key, event ID, customer ID, or
+  full exception message because unbounded dimensions can overload the monitoring system.
+</p>
+
+<h2 id="mistakes"><span class="num">18.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Calling a cached or async method on <code>this</code></td>
+        <td>Default proxy advice is bypassed</td>
+        <td>Move the operation to another injected bean</td>
+      </tr>
+      <tr>
+        <td>Caching a JPA entity</td>
+        <td>Lazy proxies, mutable state, and schema coupling escape</td>
+        <td>Cache an immutable, versioned DTO</td>
+      </tr>
+      <tr>
+        <td>Key omits tenant or locale</td>
+        <td>Wrong or protected result is reused</td>
+        <td>Model every result-varying dimension</td>
+      </tr>
+      <tr>
+        <td>One TTL for every cache</td>
+        <td>Volatility and stale tolerance differ</td>
+        <td>Set policy per named cache</td>
+      </tr>
+      <tr>
+        <td>Clearing all Redis keys</td>
+        <td>Unrelated workloads lose state and origin load spikes</td>
+        <td>Use versioned prefixes or targeted region eviction</td>
+      </tr>
+      <tr>
+        <td>Assuming <code>sync = true</code> is cluster single-flight</td>
+        <td>Provider semantics may be JVM-local</td>
+        <td>Verify provider or add appropriate coordination</td>
+      </tr>
+      <tr>
+        <td>Using default single scheduler thread unknowingly</td>
+        <td>One slow task delays unrelated jobs</td>
+        <td>Configure and isolate measured workloads</td>
+      </tr>
+      <tr>
+        <td>Running a global job on every replica</td>
+        <td>Side effects duplicate</td>
+        <td>Use idempotency plus leader, lock, or durable work queue</td>
+      </tr>
+      <tr>
+        <td>Using an unbounded async executor</td>
+        <td>Threads, tasks, or downstream calls grow without control</td>
+        <td>Bound pool and queue, define rejection</td>
+      </tr>
+      <tr>
+        <td>Ignoring <code>void</code> async exceptions</td>
+        <td>Caller cannot observe failure</td>
+        <td>Return a future or configure uncaught handling</td>
+      </tr>
+      <tr>
+        <td>Passing a managed entity to an async thread</td>
+        <td>Persistence context and thread safety do not transfer</td>
+        <td>Pass an immutable ID and reload</td>
+      </tr>
+      <tr>
+        <td>Publishing an event before commit for required work</td>
+        <td>Listener can observe rollback or uncommitted data</td>
+        <td>Use transaction phase or an outbox</td>
+      </tr>
+      <tr>
+        <td>Calling an after-commit event durable</td>
+        <td>Process failure can lose it</td>
+        <td>Persist an outbox in the original transaction</td>
+      </tr>
+      <tr>
+        <td>Retrying every exception immediately</td>
+        <td>Permanent errors repeat and outages amplify</td>
+        <td>Classify, bound, back off, and add jitter</td>
+      </tr>
+      <tr>
+        <td>Assuming a broker means exactly-once effects</td>
+        <td>Commit and acknowledgement can be separated by failure</td>
+        <td>Build idempotent consumers and constraints</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="practice"><span class="num">19.</span> Practice exercises</h2>
+<ol>
+  <li>
+    Implement a tenant-safe <code>productById</code> cache. Give products and missing products
+    different TTL policies. Prove with tests that tenants cannot share entries.
+  </li>
+  <li>
+    Add Redis with a versioned prefix and JSON format. Start with a prior cached schema and test one
+    rolling-deployment compatibility strategy.
+  </li>
+  <li>
+    Create a hot-key load test. Compare no coordination, local single-flight, TTL jitter, and stale
+    while revalidate. Record origin concurrency and P99 latency.
+  </li>
+  <li>
+    Build a daily job that accepts a time window and a fixed <code>Clock</code>. Test a
+    daylight-saving gap and overlap in a chosen business time zone.
+  </li>
+  <li>
+    Configure a two-thread, two-entry async executor. Fill it deliberately and verify the exact
+    rejection response seen by the caller.
+  </li>
+  <li>
+    Publish an application event inside a transaction. Prove ordinary listener, after-commit
+    listener, and rollback behavior with integration tests.
+  </li>
+  <li>
+    Implement an outbox table and publisher. Crash the publisher after send but before marking the
+    row, then prove the consumer processes the redelivered event once.
+  </li>
+  <li>
+    Define a retry matrix for one remote API. Include exception classification, maximum elapsed
+    time, backoff, jitter, idempotency key, and terminal recovery.
+  </li>
+  <li>
+    Create an idempotent invoice command backed by a unique account-period constraint. Run two
+    workers concurrently and verify only one invoice exists.
+  </li>
+  <li>
+    Draw failure points for database commit, cache eviction, event publication, and broker
+    acknowledgement. State the recovery and duplication behavior at every point.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">20.</span> Interview questions and answers</h2>
+
+<h3>1. What does Spring Cache abstract?</h3>
+<p>
+  It abstracts method-level cache operations through <code>Cache</code> and
+  <code>CacheManager</code>. It does not provide the physical store or standardize every provider
+  feature such as TTL, eviction, serialization, or distributed locking.
+</p>
+
+<h3>2. How does <code>@Cacheable</code> work?</h3>
+<p>
+  A Spring interceptor computes a cache and key before the method call. On a hit it returns the
+  cached value and skips the method. On a miss it invokes the method and normally stores the result.
+  In default proxy mode, self-invocation bypasses this behavior.
+</p>
+
+<h3>3. What is the difference between <code>@Cacheable</code> and <code>@CachePut</code>?</h3>
+<p>
+  <code>@Cacheable</code> can skip method execution on a hit. <code>@CachePut</code> always invokes
+  the method and stores its result. Put is useful when a completed update produces the exact cached
+  representation.
+</p>
+
+<h3>4. Why is cache invalidation difficult?</h3>
+<p>
+  The source and cache are separate systems, concurrent readers and writers can interleave, and a
+  process can fail between database commit and cache change. TTL bounds staleness, while durable
+  event-driven invalidation can close larger coordination gaps but introduces delivery and
+  idempotency work.
+</p>
+
+<h3>5. What is a cache stampede?</h3>
+<p>
+  Many callers miss the same key and perform the expensive load concurrently. Mitigations include
+  single-flight, <code>sync = true</code> where provider semantics fit, TTL jitter, refresh ahead,
+  stale while revalidate, and carefully designed distributed coordination.
+</p>
+
+<h3>6. Local cache or Redis?</h3>
+<p>
+  A local cache is faster and simpler but each application instance has a different copy. Redis
+  shares entries and capacity across instances but adds network, serialization, availability, and
+  security concerns. The consistency and latency requirements decide.
+</p>
+
+<h3>7. What is the difference between TTL and TTI?</h3>
+<p>
+  TTL normally counts from create or update and does not reset on read. TTI resets on access. Redis
+  natively uses expiration, while Spring Data Redis can emulate TTI using <code>GETEX</code> if all
+  access paths follow the same policy.
+</p>
+
+<h3>8. Fixed delay versus fixed rate?</h3>
+<p>
+  Fixed delay waits the configured duration after the previous run finishes. Fixed rate targets
+  start times separated by a period. Pool capacity and task duration still determine whether actual
+  starts overlap or wait.
+</p>
+
+<h3>9. Does <code>@Scheduled</code> run once in a cluster?</h3>
+<p>
+  No. Each application context registers its schedule. Use per-instance semantics intentionally or
+  add leader election, an external scheduler, a distributed coordination mechanism, Quartz
+  clustering, or durable queued work. Keep the business action idempotent.
+</p>
+
+<h3>10. What happens to missed scheduled runs during downtime?</h3>
+<p>
+  The basic in-memory scheduler does not persist and replay every missed business run. Store
+  checkpoints, scan for missing periods, or use a persistent scheduler or broker when missed work
+  must be recovered.
+</p>
+
+<h3>11. What does <code>@Async</code> guarantee?</h3>
+<p>
+  It submits an intercepted invocation to an executor so the caller need not execute it on the same
+  thread. It does not guarantee persistence, eventual completion, inherited transaction, context
+  propagation, or unlimited capacity.
+</p>
+
+<h3>12. Why must an async executor be bounded?</h3>
+<p>
+  Incoming work can exceed processing capacity. A bounded pool and queue cap memory and downstream
+  concurrency and make overload observable through rejection. An unbounded resource converts
+  overload into growing latency and eventual failure.
+</p>
+
+<h3>13. How are async exceptions handled?</h3>
+<p>
+  A future carries failure to a caller that observes it. A void async method has no return channel,
+  so an <code>AsyncUncaughtExceptionHandler</code> is needed for observation. Required recovery
+  usually belongs in durable workflow design rather than logs alone.
+</p>
+
+<h3>14. Does a transaction propagate into <code>@Async</code>?</h3>
+<p>
+  An imperative thread-bound transaction normally does not. The async method may start its own
+  transaction when its annotated call crosses the correct proxy. Pass IDs or immutable commands, not
+  managed entities.
+</p>
+
+<h3>15. Are Spring application events synchronous?</h3>
+<p>
+  By default, yes. Listeners execute in the publisher thread through the application event
+  multicaster. They add latency and may propagate exceptions. They can be made asynchronous, but
+  that makes the handoff in-memory rather than durable.
+</p>
+
+<h3>16. What does <code>@TransactionalEventListener</code> solve?</h3>
+<p>
+  It binds a listener to a transaction phase, most commonly after successful commit. It prevents a
+  reaction intended for committed state from running after rollback. It does not persist the event
+  or guarantee execution after a crash.
+</p>
+
+<h3>17. Domain event versus integration event?</h3>
+<p>
+  A domain event represents a fact meaningful inside the domain model. An integration event is a
+  versioned contract for another process or service. Translation and an outbox keep internal design
+  separate from external compatibility and delivery concerns.
+</p>
+
+<h3>18. What problem does the outbox pattern solve?</h3>
+<p>
+  It atomically records business state and publication intent in one database transaction, avoiding
+  the gap between database commit and direct broker send. The publisher can send more than once, so
+  consumers still need idempotency.
+</p>
+
+<h3>19. When should an operation be retried?</h3>
+<p>
+  Retry a classified transient failure only when another attempt has a meaningful chance of
+  succeeding and repeated effects are safe. Bound attempts and elapsed time, add exponential backoff
+  and jitter, and do not retry validation or authorization errors.
+</p>
+
+<h3>20. How do Spring Framework 7 retry counts differ from common Spring Retry examples?</h3>
+<p>
+  Framework 7's <code>maxRetries</code> counts retry attempts after the initial call. The separate
+  Spring Retry project's <code>maxAttempts</code> counts total attempts. They are different packages
+  and configuration models.
+</p>
+
+<h3>21. Why is jitter important?</h3>
+<p>
+  Without jitter, many clients that fail together use identical backoff and call the dependency
+  together again. Random variation spreads attempts and reduces synchronized load spikes.
+</p>
+
+<h3>22. What is idempotency?</h3>
+<p>
+  It is the property that processing the same logical operation more than once reaches the intended
+  business outcome without duplicate effects. Implement it with unique constraints, request keys,
+  state guards, processed-event records, and provider-supported keys.
+</p>
+
+<h3>23. When is a durable broker better than <code>@Async</code>?</h3>
+<p>
+  Use a broker when accepted work must survive restart, cross processes, absorb a durable backlog,
+  be retried independently, or support replay and dead-letter handling. <code>@Async</code> is best
+  for bounded, process-local work where loss semantics are acceptable.
+</p>
+
+<h3>24. Can message processing be exactly once?</h3>
+<p>
+  A transport may offer strong delivery or transactional features, but end-to-end business effects
+  still cross failure boundaries. Design for redelivery with idempotent consumers, database
+  constraints, stable event IDs, and correct acknowledgement placement.
+</p>
+
+<h3>25. How would you diagnose an async backlog?</h3>
+<p>
+  Inspect active thread count, pool maximum, queue depth and age, rejection count, task duration,
+  thread dumps, downstream latency, connection-pool waits, and incoming rate. Fix the bottleneck or
+  reduce admission before merely increasing threads.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">21.</span> Concise cheat sheet</h2>
+<div class="key">
+  <strong>Caching</strong>
+  <ul class="clean">
+    <li><code>@Cacheable</code> skips work on hit; <code>@CachePut</code> always runs.</li>
+    <li>Key every dimension that changes the result, especially tenant and permission.</li>
+    <li>Use immutable DTOs, versioned prefixes, targeted invalidation, TTL, and jitter.</li>
+    <li>Redis is shared but adds network, serialization, memory, and security concerns.</li>
+    <li>Plan cold start, stampede, cache outage, and origin protection.</li>
+  </ul>
+</div>
+
+<div class="key">
+  <strong>Scheduling and async</strong>
+  <ul class="clean">
+    <li>Fixed delay measures after completion; fixed rate targets periodic starts.</li>
+    <li>Set an explicit cron zone and design for daylight-saving behavior.</li>
+    <li>Every application replica schedules independently.</li>
+    <li>Use named, bounded pools and queues with explicit rejection and shutdown.</li>
+    <li>Transactions and thread-local context do not automatically cross async boundaries.</li>
+  </ul>
+</div>
+
+<div class="key">
+  <strong>Events, retry, and durability</strong>
+  <ul class="clean">
+    <li>Application events are synchronous and in-process by default.</li>
+    <li><code>@TransactionalEventListener</code> selects transaction phase, not durability.</li>
+    <li>Outbox plus broker handles required cross-process publication.</li>
+    <li>Retry only transient failures with bounds, backoff, jitter, deadlines, and idempotency.</li>
+    <li>
+      Assume duplicate work can happen and enforce business invariants at the source of truth.
+    </li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">22.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/integration/cache.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework cache abstraction</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring cache annotations</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/io/caching.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot caching support</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-data/redis/reference/redis/redis-cache.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Data Redis cache and expiration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring task execution and scheduling</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot task execution and scheduling</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/context-introduction.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring application context events</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring transaction-bound events</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/resilience.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework resilience and retry</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://github.com/spring-projects/spring-retry"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Retry project and migration status</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://redis.io/docs/latest/develop/use/keyspace/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Redis keys and expiration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://redis.io/docs/latest/develop/reference/eviction/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Redis memory and key eviction</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://redis.io/docs/latest/develop/use-cases/cache-aside/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Redis cache-aside pattern</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
