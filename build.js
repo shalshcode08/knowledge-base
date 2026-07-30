@@ -245,12 +245,26 @@ function extractSections(html) {
 
 function buildBreadcrumb(pagePath) {
   const parts = pagePath.split("/");
+  const topic = manifest.topics.find((candidate) =>
+    candidate.pages.some((page) => page.path === pagePath),
+  );
+  const page = topic && topic.pages.find((candidate) => candidate.path === pagePath);
+  const labels = parts.map((segment) =>
+    segment
+      .split("-")
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" "),
+  );
+
+  if (topic) labels[0] = topic.name;
+  if (page) labels[labels.length - 1] = page.title;
+
   const out = [];
-  parts.forEach((seg, i) => {
-    const last = i === parts.length - 1;
+  labels.forEach((label, i) => {
+    const last = i === labels.length - 1;
     // Parent crumbs + separators drop away on narrow screens; the current page always stays.
     if (i > 0) out.push(`<span class="crumb-hide">/</span>`);
-    out.push(`<span class="${last ? "here" : "crumb-hide"}">${seg}</span>`);
+    out.push(`<span class="${last ? "here" : "crumb-hide"}">${label}</span>`);
   });
   return out.join("");
 }

@@ -166,7 +166,9 @@
         var collapsedNavGroups = readCollapsedNavGroups();
         document.querySelectorAll(".nav-group-toggle").forEach(function (btn) {
           var key = btn.dataset.navKey;
-          if (key && collapsedNavGroups.indexOf(key) !== -1) {
+          var group = btn.closest(".nav-group");
+          var containsActiveLink = group && group.querySelector("a.active");
+          if (key && collapsedNavGroups.indexOf(key) !== -1 && !containsActiveLink) {
             btn.setAttribute("aria-expanded", "false");
           }
 
@@ -195,6 +197,21 @@
             if (label) label.textContent = open ? btn.dataset.more : "Show less";
           });
         });
+
+        function centerActiveSidebarLink() {
+          if (!sidebar) return;
+          var activeLink = sidebar.querySelector(".nav-group a.active");
+          if (!activeLink) return;
+
+          var sidebarRect = sidebar.getBoundingClientRect();
+          var activeRect = activeLink.getBoundingClientRect();
+          var activeTop = activeRect.top - sidebarRect.top + sidebar.scrollTop;
+          var targetTop = activeTop - (sidebar.clientHeight - activeRect.height) / 2;
+          var maxScrollTop = Math.max(0, sidebar.scrollHeight - sidebar.clientHeight);
+          sidebar.scrollTop = Math.min(Math.max(0, targetTop), maxScrollTop);
+        }
+
+        if (sidebar) window.requestAnimationFrame(centerActiveSidebarLink);
 
         var toTop = document.getElementById("toTop");
         if (toTop) {
