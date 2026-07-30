@@ -105,6 +105,15 @@
           "path": "spring/spring-internals-interview-preparation"
         }
       ]
+    },
+    {
+      "name": "System Design and Distributed Systems",
+      "pages": [
+        {
+          "title": "System Design Fundamentals and Capacity Estimation",
+          "path": "systemdesign/system-design-fundamentals-capacity-estimation"
+        }
+      ]
     }
   ]
 }
