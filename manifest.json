@@ -99,6 +99,10 @@
         {
           "title": "Observability and Production Operations",
           "path": "spring/observability-production-operations"
+        },
+        {
+          "title": "Spring Internals and Interview Preparation",
+          "path": "spring/spring-internals-interview-preparation"
         }
       ]
     }

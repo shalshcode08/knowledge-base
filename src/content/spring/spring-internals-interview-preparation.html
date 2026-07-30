@@ -1,0 +1,1876 @@
+<h1>Spring Internals and Interview Preparation - Complete Notes</h1>
+<p class="subtitle">
+  A practical guide to how Spring creates beans, resolves dependencies, applies post-processors,
+  builds proxies, selects auto-configuration, publishes startup events, diagnoses failures, and
+  turns framework knowledge into strong interview and system-design reasoning.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The internal mental model</h2>
+<p class="lead">
+  Spring is best understood as a metadata-driven object factory plus a set of extension points that
+  can change metadata, create objects, inject dependencies, run lifecycle callbacks, and wrap
+  objects with behavior.
+</p>
+
+<p>
+  Application code usually sees ordinary Java objects. The important difference is that the
+  container controls how managed objects come into existence. Configuration declares what should
+  exist. The bean factory stores that declaration as metadata. During creation, Spring resolves a
+  dependency graph, constructs each object, populates it, invokes lifecycle callbacks, and lets
+  infrastructure inspect or replace the object. The reference finally stored as a singleton may be
+  the original object or a proxy around it.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a restaurant kitchen. A bean definition is the recipe, the bean factory is the kitchen,
+    dependency resolution gathers ingredients, lifecycle callbacks perform preparation, and
+    post-processors are quality stations that may label, decorate, or package the result. A proxy is
+    the service counter through which a request can be checked, timed, authorized, or placed in a
+    transaction before it reaches the prepared object.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Main responsibility</th>
+        <th>Typical types</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Definition metadata</td>
+        <td>Describe class, factory, scope, dependencies, qualifiers, and lifecycle methods.</td>
+        <td><code>BeanDefinition</code>, <code>BeanDefinitionRegistry</code></td>
+      </tr>
+      <tr>
+        <td>Object factory</td>
+        <td>Resolve, create, cache, and return managed objects.</td>
+        <td><code>BeanFactory</code>, <code>DefaultListableBeanFactory</code></td>
+      </tr>
+      <tr>
+        <td>Application container</td>
+        <td>Add events, resources, messages, environment, and automatic extension discovery.</td>
+        <td><code>ApplicationContext</code></td>
+      </tr>
+      <tr>
+        <td>Metadata extension</td>
+        <td>Change definitions before ordinary beans are created.</td>
+        <td><code>BeanFactoryPostProcessor</code></td>
+      </tr>
+      <tr>
+        <td>Instance extension</td>
+        <td>Inspect, initialize, or replace individual bean instances.</td>
+        <td><code>BeanPostProcessor</code></td>
+      </tr>
+      <tr>
+        <td>Invocation extension</td>
+        <td>Run cross-cutting behavior around method calls.</td>
+        <td>Spring AOP proxy, interceptor, advice</td>
+      </tr>
+      <tr>
+        <td>Boot assembly</td>
+        <td>Select sensible infrastructure from classpath, beans, properties, and environment.</td>
+        <td>Auto-configuration and conditional annotations</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Three questions solve many Spring mysteries</strong>
+  <ol>
+    <li>Is this object actually managed by the same application context?</li>
+    <li>Is the caller invoking the object through the Spring-provided reference or directly?</li>
+    <li>At which lifecycle phase is this code running?</li>
+  </ol>
+</div>
+
+<h2 id="context-refresh"><span class="num">01.</span> ApplicationContext refresh pipeline</h2>
+<p class="lead">
+  Refresh is the coordinated process that turns configuration metadata into a usable application
+  context.
+</p>
+
+<p>
+  Exact implementation details vary between context types and framework versions, but the durable
+  sequence is stable. The context prepares internal state and the environment, obtains or refreshes
+  its bean factory, loads definitions, invokes factory-level extension points, registers
+  instance-level post-processors, initializes infrastructure such as messages and events,
+  pre-instantiates eligible singletons, and finally publishes completion events.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Phase</th>
+        <th>What happens</th>
+        <th>Why ordering matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Prepare context</td>
+        <td>Validate properties, initialize environment, and prepare early event handling.</td>
+        <td>Later processors need stable environment and context state.</td>
+      </tr>
+      <tr>
+        <td>Load definitions</td>
+        <td>Register configuration classes, scanned components, imports, and explicit beans.</td>
+        <td>Spring must know the candidate graph before creating ordinary singletons.</td>
+      </tr>
+      <tr>
+        <td>Process definitions</td>
+        <td>Invoke registry and bean-factory post-processors.</td>
+        <td>They may register or change definitions before instances exist.</td>
+      </tr>
+      <tr>
+        <td>Register bean post-processors</td>
+        <td>Sort and install processors that will participate in instance creation.</td>
+        <td>A bean created too early may miss annotation handling or proxying.</td>
+      </tr>
+      <tr>
+        <td>Initialize context infrastructure</td>
+        <td>
+          Prepare message source, event multicaster, listeners, and context-specific services.
+        </td>
+        <td>Lifecycle and application code may depend on these facilities.</td>
+      </tr>
+      <tr>
+        <td>Create non-lazy singletons</td>
+        <td>Resolve dependency graphs and complete bean lifecycles.</td>
+        <td>Eager creation finds configuration failures before traffic arrives.</td>
+      </tr>
+      <tr>
+        <td>Finish refresh</td>
+        <td>Start lifecycle components and publish refresh or Boot readiness events.</td>
+        <td>Consumers should not treat the application as ready too early.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Refresh is not merely a loop over classes. Configuration parsing can discover new configuration,
+  imports can add more definitions, post-processors can register infrastructure, and creating one
+  bean can recursively create its dependencies. This is why startup traces often look like a graph
+  rather than a flat list.
+</p>
+
+<div class="note">
+  <strong>BeanFactory versus ApplicationContext</strong>
+  <p>
+    <code>BeanFactory</code> is the core container contract. <code>ApplicationContext</code> builds
+    on it with automatic processor discovery, events, resource loading, internationalization, and
+    application integration. Most applications should use an <code>ApplicationContext</code>.
+  </p>
+</div>
+
+<h2 id="bean-definitions"><span class="num">02.</span> From configuration to BeanDefinition</h2>
+<p class="lead">Spring normally discovers metadata first and creates application objects later.</p>
+
+<p>
+  A <code>BeanDefinition</code> records how a bean should be created and managed. It can contain an
+  implementation class or factory method, constructor arguments, property values, scope, lazy flag,
+  qualifiers, primary status, initialization and destruction methods, dependencies, and other
+  attributes. It is a recipe, not the bean instance.
+</p>
+
+<p>
+  Definitions can come from component scanning, <code>@Bean</code> methods, imported configuration,
+  XML, programmatic registrars, or Boot auto-configuration.
+  <code>ConfigurationClassPostProcessor</code>
+  is a factory-level processor that parses configuration classes, component scans,
+  <code>@Import</code>, and <code>@Bean</code> methods and registers the resulting definitions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Java configuration becomes two managed definitions</b></figcaption>
+  <pre><code>@Configuration(proxyBeanMethods = false)
+class BillingConfiguration {
+
+    @Bean
+    ExchangeRateClient exchangeRateClient(HttpClient httpClient) {
+        return new ExchangeRateClient(httpClient);
+    }
+
+    @Bean
+    InvoiceService invoiceService(ExchangeRateClient exchangeRateClient) {
+        return new InvoiceService(exchangeRateClient);
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Method parameters express dependencies without calling another <code>@Bean</code> method. This
+  works with both full and lite configuration modes. In full mode, direct calls between
+  <code>@Bean</code> methods can be intercepted through a generated CGLIB subclass so calls respect
+  container scope. With <code>proxyBeanMethods = false</code>, direct calls are normal Java calls
+  and create normal objects. Method-parameter injection avoids that surprise and reduces
+  configuration proxy overhead.
+</p>
+
+<h3 id="factory-bean">FactoryBean is not the same as a factory method</h3>
+<p>
+  A <code>FactoryBean&lt;T&gt;</code> is a special managed bean whose
+  <code>getObject()</code> result is exposed under its bean name. Calling
+  <code>getBean("reportClient")</code> returns the product, while
+  <code>getBean("&amp;reportClient")</code> returns the factory itself. Framework integrations use
+  this pattern when object creation is complex. Do not confuse it with an ordinary
+  <code>@Bean</code> factory method.
+</p>
+
+<h2 id="dependency-resolution"><span class="num">03.</span> Dependency resolution internals</h2>
+<p class="lead">Autowiring is a candidate-selection algorithm, not a magical field assignment.</p>
+
+<p>
+  For a constructor or factory-method parameter, Spring creates a dependency descriptor containing
+  the required type, generic information, annotations, declaring element, and whether the dependency
+  is required. The bean factory finds type-compatible candidates, removes candidates that are not
+  autowire candidates, applies qualifiers, considers <code>@Primary</code> and priority, uses name
+  matching when appropriate, and either selects one result or reports ambiguity.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Injection shape</th>
+        <th>Resolution behavior</th>
+        <th>Useful purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>PaymentGateway</code></td>
+        <td>Requires one matching candidate after qualifiers and priority rules.</td>
+        <td>A mandatory collaboration.</td>
+      </tr>
+      <tr>
+        <td><code>Optional&lt;PaymentGateway&gt;</code></td>
+        <td>Supplies a candidate when present without requiring one.</td>
+        <td>Optional application capability.</td>
+      </tr>
+      <tr>
+        <td><code>ObjectProvider&lt;PaymentGateway&gt;</code></td>
+        <td>Defers lookup and supports optional, ordered, or stream access.</td>
+        <td>Lazy or programmatic selection without storing the context.</td>
+      </tr>
+      <tr>
+        <td><code>List&lt;PaymentGateway&gt;</code></td>
+        <td>Injects all compatible candidates, ordered by Spring ordering rules.</td>
+        <td>Strategy chain or plugin collection.</td>
+      </tr>
+      <tr>
+        <td><code>Map&lt;String, PaymentGateway&gt;</code></td>
+        <td>Injects candidates keyed by bean name.</td>
+        <td>Named strategy registry.</td>
+      </tr>
+      <tr>
+        <td><code>@Qualifier("card")</code></td>
+        <td>Narrows candidates using qualifier metadata.</td>
+        <td>Stable semantic selection.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Generic types are part of modern resolution. For example, <code>Handler&lt;Invoice&gt;</code> and
+  <code>Handler&lt;Refund&gt;</code> can be distinct candidates when their generic metadata is
+  available. Type erasure, raw types, broad factory return types, or proxies can make runtime type
+  prediction harder. Declare the most specific practical return type on <code>@Bean</code> methods,
+  especially when conditions or autowiring must inspect it before instantiation.
+</p>
+
+<div class="warning">
+  <strong>Do not solve every ambiguity with @Primary</strong>
+  <p>
+    <code>@Primary</code> expresses a default, not business routing. If the choice depends on
+    tenant, transaction, request, feature, or data, inject a strategy registry and make the decision
+    explicitly. Hidden selection rules make systems hard to test and operate.
+  </p>
+</div>
+
+<h2 id="bean-lifecycle"><span class="num">04.</span> Bean creation lifecycle in detail</h2>
+<p class="lead">
+  A singleton becomes visible as a fully initialized managed reference only after a multi-stage
+  creation pipeline succeeds.
+</p>
+
+<ol>
+  <li>
+    <strong>Resolve merged definition:</strong> combine parent metadata, scope, factory information,
+    and definition attributes.
+  </li>
+  <li>
+    <strong>Choose construction path:</strong> select a constructor, factory method, supplier, or
+    factory bean.
+  </li>
+  <li>
+    <strong>Instantiate:</strong> allocate the raw object. Advanced post-processors can participate
+    before or during constructor selection.
+  </li>
+  <li>
+    <strong>Populate dependencies:</strong> resolve constructor arguments during construction and
+    inject annotated fields, methods, or configured properties at the appropriate processor phase.
+  </li>
+  <li>
+    <strong>Invoke aware callbacks:</strong> supply container infrastructure such as bean name,
+    factory, class loader, environment, or application context when explicitly requested.
+  </li>
+  <li>
+    <strong>Run before-initialization processors:</strong> processors may invoke lifecycle
+    annotations or adapt state before init methods.
+  </li>
+  <li>
+    <strong>Run initialization callbacks:</strong> normally <code>@PostConstruct</code>, then
+    <code>InitializingBean.afterPropertiesSet()</code>, then a custom init method when these are
+    different methods.
+  </li>
+  <li>
+    <strong>Run after-initialization processors:</strong> processors may return the object or
+    replace it with a proxy.
+  </li>
+  <li>
+    <strong>Publish managed reference:</strong> cache the completed singleton and return the final
+    reference to callers.
+  </li>
+  <li>
+    <strong>Destroy on context close:</strong> normally <code>@PreDestroy</code>, then
+    <code>DisposableBean.destroy()</code>, then a custom destroy method when applicable.
+  </li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>A lifecycle bean with framework-independent callbacks</b></figcaption>
+  <pre><code>@Component
+final class RulesIndex {
+    private final RulesRepository repository;
+    private Map&lt;String, Rule&gt; rules = Map.of();
+
+    RulesIndex(RulesRepository repository) {
+        this.repository = repository;
+    }
+
+    @PostConstruct
+    void load() {
+        this.rules = Map.copyOf(repository.loadEnabled());
+    }
+
+    @PreDestroy
+    void clear() {
+        this.rules = Map.of();
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Constructor code runs before field and setter injection, so injected members are not ready there.
+  <code>@PostConstruct</code> runs after dependency population but before the final post-processing
+  result is necessarily returned to other beans. Avoid slow remote calls, unbounded work, and calls
+  that depend on this bean's own proxy behavior. Startup should be deterministic and bounded.
+</p>
+
+<h3 id="smart-singletons">After all regular singletons</h3>
+<p>
+  <code>SmartInitializingSingleton.afterSingletonsInstantiated()</code> runs after regular singleton
+  pre-instantiation finishes. It is useful when infrastructure must inspect a complete singleton set
+  without forcing accidental early initialization. It still belongs to startup, so failures can fail
+  refresh and long work delays readiness.
+</p>
+
+<h3 id="prototype-destruction">Prototype destruction is the caller's responsibility</h3>
+<p>
+  Spring creates and configures prototype beans but does not track their full lifetime after
+  returning them. Destruction callbacks are therefore not automatically invoked for prototypes. The
+  consumer that owns the prototype resource must close or dispose it. Use singleton-managed resource
+  pools rather than prototypes for most expensive resources.
+</p>
+
+<h2 id="post-processors"><span class="num">05.</span> Bean factory and bean post-processors</h2>
+<p class="lead">
+  Post-processors are the mechanism behind much of Spring's apparent annotation magic.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Extension</th>
+        <th>Operates on</th>
+        <th>Runs</th>
+        <th>Typical use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>BeanDefinitionRegistryPostProcessor</code></td>
+        <td>Definition registry</td>
+        <td>Before other factory post-processors</td>
+        <td>Register additional definitions.</td>
+      </tr>
+      <tr>
+        <td><code>BeanFactoryPostProcessor</code></td>
+        <td>Definition metadata and factory</td>
+        <td>Before ordinary bean creation</td>
+        <td>Resolve placeholders or alter scopes and properties.</td>
+      </tr>
+      <tr>
+        <td><code>BeanPostProcessor</code></td>
+        <td>Bean instances</td>
+        <td>During every eligible bean lifecycle</td>
+        <td>Annotation callbacks, validation, adaptation, proxy creation.</td>
+      </tr>
+      <tr>
+        <td><code>InstantiationAwareBeanPostProcessor</code></td>
+        <td>Construction and properties</td>
+        <td>Before and after instantiation, before population</td>
+        <td>Annotated injection and custom property handling.</td>
+      </tr>
+      <tr>
+        <td><code>SmartInstantiationAwareBeanPostProcessor</code></td>
+        <td>Candidate constructors and early references</td>
+        <td>Advanced creation phases</td>
+        <td>Constructor prediction and consistent early proxy references.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  <code>AutowiredAnnotationBeanPostProcessor</code> processes <code>@Autowired</code> and
+  <code>@Value</code>. A common-annotation processor handles callbacks such as
+  <code>@PostConstruct</code> and <code>@PreDestroy</code>. Auto-proxy creators are also
+  post-processors. An annotation has behavior only because some registered infrastructure reads it.
+</p>
+
+<figure class="code">
+  <figcaption><b>A small diagnostic BeanPostProcessor</b></figcaption>
+  <pre><code>@Component
+final class CriticalClientVerifier implements BeanPostProcessor {
+
+    @Override
+    public Object postProcessAfterInitialization(Object bean, String name) {
+        Class&lt;?&gt; targetType = AopUtils.getTargetClass(bean);
+        if (targetType.isAnnotationPresent(CriticalClient.class)) {
+            verifyConfiguration(name, targetType);
+        }
+        return bean;
+    }
+}</code></pre>
+</figure>
+
+<div class="warning">
+  <strong>Post-processors are infrastructure, not ordinary services</strong>
+  <p>
+    They are created early. Dependencies directly pulled into a post-processor may also be created
+    early and become ineligible for the complete processor chain, including auto-proxying. Keep
+    processors small, avoid broad autowiring, declare factory-level processors through static
+    <code>@Bean</code> methods when appropriate, and never perform network work in them.
+  </p>
+</div>
+
+<h2 id="circular-references">
+  <span class="num">06.</span> Circular references and early exposure
+</h2>
+<p class="lead">
+  A dependency cycle is usually a design signal, and constructor cycles are not resolvable because
+  neither object can be constructed first.
+</p>
+
+<p>
+  For some singleton property-injection cycles, the core container can expose an early reference
+  after instantiation but before full initialization. Bean A can receive an early reference to B
+  while B is being completed, or the reverse. Advanced auto-proxy infrastructure must ensure that
+  this early reference is compatible with the final proxied reference. The mechanism is complex and
+  means a collaborator can observe an object before its lifecycle finishes.
+</p>
+
+<p>
+  Spring Boot applications should not depend on automatic circular-reference recovery. Modern Boot
+  behavior rejects circular references by default, and enabling them can still fail for constructor
+  cycles or proxy combinations. Fix the graph instead of treating the setting as an architecture
+  option.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Cause</th>
+        <th>Better redesign</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Two services coordinate each other.</td>
+        <td>Extract an orchestration service above both.</td>
+      </tr>
+      <tr>
+        <td>Domain logic calls infrastructure which calls domain logic.</td>
+        <td>Use ports, events, or a result returned to the outer layer.</td>
+      </tr>
+      <tr>
+        <td>Shared mutable state needs callbacks.</td>
+        <td>Give one component ownership and expose narrow operations.</td>
+      </tr>
+      <tr>
+        <td>Initialization order is being modeled as dependency.</td>
+        <td>
+          Use explicit startup orchestration or <code>@DependsOn</code> only for a real order.
+        </td>
+      </tr>
+      <tr>
+        <td>Rare callback needs the other service.</td>
+        <td>Consider an event or narrowly scoped <code>ObjectProvider</code>, then document it.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="proxy-model"><span class="num">07.</span> The Spring proxy mental model</h2>
+<p class="lead">A proxy works only when a call crosses the proxy boundary.</p>
+
+<p>
+  A Spring AOP proxy holds or delegates to a target and runs an interceptor chain around eligible
+  method calls. Transaction management, method security, caching, retry integrations, and async
+  execution commonly use this design. The container injects the proxy as the managed reference.
+  Calling a method through that reference allows advice to run.
+</p>
+
+<figure class="code">
+  <figcaption><b>External call is advised, self-invocation is not</b></figcaption>
+  <pre><code>@Service
+class InvoiceService {
+
+    @Transactional
+    public void issue(InvoiceCommand command) {
+        persist(command);
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void persist(InvoiceCommand command) {
+        // This call is direct when invoked through this.persist(...).
+    }
+}</code></pre>
+</figure>
+
+<p>
+  A client calling <code>invoiceService.issue(...)</code> crosses the proxy, so transaction advice
+  can wrap <code>issue</code>. The internal call from <code>issue</code> to
+  <code>persist</code> uses <code>this</code>, which is the target object. It does not return to the
+  proxy, so the <code>REQUIRES_NEW</code> declaration is not applied.
+</p>
+
+<div class="key">
+  <strong>Prefer refactoring over proxy self-access</strong>
+  <p>
+    Move the separately advised operation to another bean and inject it. This makes the boundary
+    visible and testable. Self-injection or <code>AopContext.currentProxy()</code> couples business
+    code to proxy mechanics and is rarely a good production design.
+  </p>
+</div>
+
+<h2 id="proxy-types"><span class="num">08.</span> JDK proxies versus CGLIB proxies</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>JDK dynamic proxy</th>
+        <th>CGLIB class proxy</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Mechanism</td>
+        <td>Generated object implements one or more interfaces.</td>
+        <td>Generated subclass extends the target class.</td>
+      </tr>
+      <tr>
+        <td>Advisable API</td>
+        <td>Interface methods visible through the proxy.</td>
+        <td>Overridable methods on the class.</td>
+      </tr>
+      <tr>
+        <td>Type seen by callers</td>
+        <td>Usually inject by interface.</td>
+        <td>Assignable to the concrete target class.</td>
+      </tr>
+      <tr>
+        <td>Important limits</td>
+        <td>Concrete-only methods are not part of the proxy contract.</td>
+        <td>Final class cannot be subclassed; final or private methods cannot be overridden.</td>
+      </tr>
+      <tr>
+        <td>Module concerns</td>
+        <td>Uses standard Java proxy facilities.</td>
+        <td>Subclass generation may face module-access restrictions.</td>
+      </tr>
+      <tr>
+        <td>Self-invocation</td>
+        <td>Bypasses advice.</td>
+        <td>Also bypasses advice for calls made on <code>this</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The most important distinction is the type surface, not a simplistic performance claim. Program to
+  meaningful interfaces when they represent an architectural boundary. Do not create interfaces only
+  to obtain a proxy. Class proxies are appropriate for concrete services, but proxyable methods must
+  not be final. Always test the behavior through the Spring-managed bean, not by directly
+  constructing the target.
+</p>
+
+<h3 id="identity">Proxy identity and runtime inspection</h3>
+<p>
+  <code>bean.getClass()</code> may return a generated proxy class, so exact class comparisons and
+  annotation lookups on the runtime class can fail. Use Spring utilities such as
+  <code>AopUtils.getTargetClass(bean)</code> when infrastructure needs the underlying type. Domain
+  equality should not depend on proxy class identity. JPA entities have additional proxy and
+  equality concerns and should use a carefully designed identity strategy.
+</p>
+
+<h2 id="aop"><span class="num">09.</span> AOP terminology and interceptor chains</h2>
+<p class="lead">
+  Spring AOP applies cross-cutting behavior to method-execution join points on Spring-managed beans.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Meaning</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Aspect</td>
+        <td>A module containing cross-cutting policy.</td>
+        <td>Audit policy or latency measurement.</td>
+      </tr>
+      <tr>
+        <td>Join point</td>
+        <td>A point where behavior could apply. In Spring AOP, method execution is central.</td>
+        <td>Calling <code>checkout()</code> through a proxy.</td>
+      </tr>
+      <tr>
+        <td>Pointcut</td>
+        <td>A rule selecting join points.</td>
+        <td>Public methods annotated with <code>@Audited</code>.</td>
+      </tr>
+      <tr>
+        <td>Advice</td>
+        <td>Code run at selected join points.</td>
+        <td>Before, after returning, after throwing, after finally, or around.</td>
+      </tr>
+      <tr>
+        <td>Advisor</td>
+        <td>A pointcut plus advice.</td>
+        <td>Transaction attribute source plus transaction interceptor.</td>
+      </tr>
+      <tr>
+        <td>Target</td>
+        <td>The object containing business behavior.</td>
+        <td><code>CheckoutService</code>.</td>
+      </tr>
+      <tr>
+        <td>Proxy</td>
+        <td>The object exposed to clients that runs the interceptor chain.</td>
+        <td>Generated JDK or CGLIB object.</td>
+      </tr>
+      <tr>
+        <td>Weaving</td>
+        <td>Linking aspects to code. Spring AOP does it through runtime proxies.</td>
+        <td>Different from AspectJ bytecode weaving.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>An around advice that preserves exceptions and return values</b></figcaption>
+  <pre><code>@Aspect
+@Component
+final class TimingAspect {
+    private final MeterRegistry registry;
+
+    TimingAspect(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    @Around("@annotation(MeasuredOperation)")
+    Object time(ProceedingJoinPoint call) throws Throwable {
+        Timer.Sample sample = Timer.start(registry);
+        try {
+            return call.proceed();
+        } finally {
+            sample.stop(registry.timer(
+                    "application.operation",
+                    "method", call.getSignature().getName()));
+        }
+    }
+}</code></pre>
+</figure>
+
+<p>
+  Around advice is powerful because it controls whether and when the target runs. It can also break
+  semantics by swallowing exceptions, calling <code>proceed()</code> twice, changing arguments, or
+  returning an incompatible value. Use the narrowest advice type that solves the need.
+</p>
+
+<h3 id="advice-order">Advice ordering</h3>
+<p>
+  Multiple advisors can wrap one method. Ordering decides which is outermost on entry and therefore
+  last on exit. For example, retry outside transaction can create a fresh transaction per attempt,
+  while transaction outside retry can repeat attempts inside one transaction that may already be
+  rollback-only. Security, tracing, caching, retry, and transactions need an intentional order and
+  an integration test that proves the required semantics.
+</p>
+
+<h2 id="annotation-processing"><span class="num">10.</span> How annotations become behavior</h2>
+<p class="lead">
+  Java annotations are metadata. Scanners, registrars, post-processors, advisors, or compilers must
+  interpret them.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Annotation</th>
+        <th>Primary interpreter</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@Component</code> stereotypes</td>
+        <td>Classpath scanner and configuration parser</td>
+        <td>Bean definition registration.</td>
+      </tr>
+      <tr>
+        <td><code>@Configuration</code>, <code>@Bean</code>, <code>@Import</code></td>
+        <td><code>ConfigurationClassPostProcessor</code></td>
+        <td>Configuration model and bean definitions.</td>
+      </tr>
+      <tr>
+        <td><code>@Autowired</code>, <code>@Value</code></td>
+        <td><code>AutowiredAnnotationBeanPostProcessor</code></td>
+        <td>Dependency and value injection.</td>
+      </tr>
+      <tr>
+        <td><code>@PostConstruct</code>, <code>@PreDestroy</code></td>
+        <td>Lifecycle annotation post-processor</td>
+        <td>Initialization and destruction callbacks.</td>
+      </tr>
+      <tr>
+        <td><code>@Transactional</code></td>
+        <td>Transaction attribute source, advisor, and interceptor</td>
+        <td>Transactional proxy behavior.</td>
+      </tr>
+      <tr>
+        <td><code>@Async</code></td>
+        <td>Async annotation post-processor and interceptor</td>
+        <td>Executor submission through a proxy.</td>
+      </tr>
+      <tr>
+        <td>Boot <code>@Conditional...</code></td>
+        <td>Configuration condition evaluation</td>
+        <td>Include or skip configuration metadata.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Meta-annotations allow a custom annotation to combine semantics. Spring searches merged annotation
+  metadata, including composed annotations and aliases. Design composed annotations sparingly.
+  Hiding ten unrelated policies behind one annotation makes behavior difficult to understand and
+  upgrade.
+</p>
+
+<h3 id="reflection-aot">Reflection, generated metadata, and AOT</h3>
+<p>
+  Traditional Spring applications can inspect classes and annotations at runtime. Build-time
+  processors and ahead-of-time processing can precompute hints and generated code to reduce runtime
+  discovery and support native images. Dynamic class loading, reflection, resource lookup, and proxy
+  generation may need explicit runtime hints in native deployments. A feature that works on the JVM
+  is not automatically native-compatible.
+</p>
+
+<h2 id="auto-configuration">
+  <span class="num">11.</span> Spring Boot auto-configuration internals
+</h2>
+<p class="lead">
+  Auto-configuration is conditional configuration chosen from known candidates, not runtime
+  guessing.
+</p>
+
+<p>
+  <code>@SpringBootApplication</code> combines Boot configuration, component scanning, and
+  auto-configuration enablement. Boot imports candidate auto-configuration classes listed by
+  libraries in
+  <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code>.
+  Each candidate is ordinary configuration guarded by conditions. Candidates that do not match are
+  skipped; matching candidates contribute bean definitions.
+</p>
+
+<figure class="code">
+  <figcaption><b>A small library auto-configuration</b></figcaption>
+  <pre><code>@AutoConfiguration
+@ConditionalOnClass(NotificationClient.class)
+@ConditionalOnProperty(
+        prefix = "notification",
+        name = "enabled",
+        havingValue = "true",
+        matchIfMissing = true)
+public class NotificationAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    NotificationClient notificationClient(NotificationProperties properties) {
+        return new HttpNotificationClient(properties.endpoint());
+    }
+}</code></pre>
+</figure>
+
+<p>
+  The corresponding imports file contains the fully qualified auto-configuration class name. A
+  starter usually supplies dependencies and points users toward auto-configuration, while the
+  auto-configuration module contains the conditional configuration itself.
+</p>
+
+<div class="key">
+  <strong>Back-off is a contract</strong>
+  <p>
+    <code>@ConditionalOnMissingBean</code> lets user configuration replace a default. This is why
+    declaring a custom <code>DataSource</code>, security chain, executor, or mapper can cause Boot
+    to back off. It is intentional when the condition report confirms it.
+  </p>
+</div>
+
+<h3 id="auto-config-order">Ordering does not create dependencies</h3>
+<p>
+  <code>@AutoConfigureBefore</code> and <code>@AutoConfigureAfter</code> influence definition
+  processing order between auto-configurations. They do not guarantee bean initialization order.
+  Express real bean dependencies through constructor or method parameters. Use
+  <code>@DependsOn</code> only for an initialization dependency that cannot be represented as an
+  injected collaboration.
+</p>
+
+<h2 id="conditions"><span class="num">12.</span> Conditional annotations and their traps</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Condition</th>
+        <th>Question</th>
+        <th>Common trap</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@ConditionalOnClass</code></td>
+        <td>Is a class available?</td>
+        <td>Method signatures may load an absent type too early. Isolate configuration.</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnMissingBean</code></td>
+        <td>Has the user already supplied a compatible bean?</td>
+        <td>
+          Evaluation sees definitions processed so far, so use it mainly in auto-configuration.
+        </td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnBean</code></td>
+        <td>Does required infrastructure exist?</td>
+        <td>A bean may exist in a parent or have a less specific declared return type.</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnProperty</code></td>
+        <td>Does configuration request this feature?</td>
+        <td>Missing, blank, and false values can differ. State defaults explicitly.</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnResource</code></td>
+        <td>Is a resource present?</td>
+        <td>Classpath and filesystem locations behave differently after packaging.</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnWebApplication</code></td>
+        <td>Is this a servlet or reactive web application?</td>
+        <td>Tests may create a different context kind than production.</td>
+      </tr>
+      <tr>
+        <td><code>@ConditionalOnExpression</code></td>
+        <td>Does a SpEL expression evaluate to true?</td>
+        <td>Referencing a bean can initialize it too early and skip full post-processing.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Test auto-configuration as a matrix of classpath, property, and user-bean conditions.
+  <code>ApplicationContextRunner</code> creates small contexts and supports filtered class loaders,
+  property values, user configuration, and condition report logging. A single happy-path
+  <code>@SpringBootTest</code> does not prove back-off behavior.
+</p>
+
+<h2 id="startup-events"><span class="num">13.</span> Spring Boot startup events</h2>
+<p class="lead">
+  Startup events describe milestones, and a listener must be registered before the milestone it
+  wants to observe.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Event</th>
+        <th>Meaning</th>
+        <th>Appropriate use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ApplicationStartingEvent</code></td>
+        <td>Run has begun before most processing.</td>
+        <td>Very early infrastructure registered outside the context.</td>
+      </tr>
+      <tr>
+        <td><code>ApplicationEnvironmentPreparedEvent</code></td>
+        <td>Environment is ready before the context exists.</td>
+        <td>Early environment inspection or customization.</td>
+      </tr>
+      <tr>
+        <td><code>ApplicationContextInitializedEvent</code></td>
+        <td>Context initializers have run, definitions are not yet fully loaded.</td>
+        <td>Context-level bootstrapping.</td>
+      </tr>
+      <tr>
+        <td><code>ApplicationPreparedEvent</code></td>
+        <td>Definitions are loaded and refresh has not completed.</td>
+        <td>Advanced startup infrastructure.</td>
+      </tr>
+      <tr>
+        <td><code>ApplicationStartedEvent</code></td>
+        <td>Context refreshed, before runners complete.</td>
+        <td>Measure post-refresh startup work.</td>
+      </tr>
+      <tr>
+        <td><code>ApplicationReadyEvent</code></td>
+        <td>Runners completed and the application is ready to serve.</td>
+        <td>Small final readiness actions and startup measurement.</td>
+      </tr>
+      <tr>
+        <td><code>ApplicationFailedEvent</code></td>
+        <td>Startup failed.</td>
+        <td>Last-resort failure reporting with minimal dependencies.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Very early events occur before listener beans can exist, so register listeners on
+  <code>SpringApplication</code>, through a builder, or with supported library metadata. Do not
+  start important business workflows merely because a refresh event arrived. Multiple application
+  contexts can publish similar framework events, and a listener should check its context and
+  idempotency.
+</p>
+
+<h3 id="startup-profiling">Startup profiling</h3>
+<p>
+  Enable <code>--debug</code> or the condition-report logger to understand configuration decisions.
+  Use <code>BufferingApplicationStartup</code> with the Actuator startup endpoint for structured
+  startup steps, or <code>FlightRecorderApplicationStartup</code> to correlate Spring startup with
+  class loading, allocation, garbage collection, and JVM activity. Compare repeated measurements
+  with the same classpath and machine conditions.
+</p>
+
+<h2 id="transaction-proxy"><span class="num">14.</span> @Transactional proxy limitations</h2>
+<p class="lead">
+  Transaction annotations describe policy, while an interceptor and transaction manager implement
+  that policy around an intercepted invocation.
+</p>
+
+<p>
+  In default proxy mode, the call must enter through the proxy. Self-invocation does not apply a new
+  declaration. A directly constructed object is not transactional. A method invoked during
+  <code>@PostConstruct</code> should not depend on the bean's transaction proxy being complete.
+  Method visibility and proxy type also matter. Interface-based proxies expose public interface
+  methods. Class-based proxies can support additional non-private methods, but final and private
+  methods cannot be overridden.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely cause</th>
+        <th>Focused fix</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>No transaction on an annotated method.</td>
+        <td>
+          Object created with <code>new</code>, self-call, wrong context, or method not proxyable.
+        </td>
+        <td>Call a Spring-managed bean across an explicit service boundary.</td>
+      </tr>
+      <tr>
+        <td><code>REQUIRES_NEW</code> behaves like the outer transaction.</td>
+        <td>The inner method was called on <code>this</code>.</td>
+        <td>Move the inner boundary to another bean.</td>
+      </tr>
+      <tr>
+        <td>Transaction disappears in a new thread.</td>
+        <td>Imperative transactions are normally thread-bound.</td>
+        <td>Start a new explicit transaction in the worker or redesign the workflow.</td>
+      </tr>
+      <tr>
+        <td>Unexpected rollback at commit.</td>
+        <td>
+          Inner work marked the shared transaction rollback-only and the exception was caught.
+        </td>
+        <td>Choose propagation and exception policy deliberately.</td>
+      </tr>
+      <tr>
+        <td>Annotation on interface is inconsistent across modes.</td>
+        <td>Annotation discovery and proxy or weaving strategy differ.</td>
+        <td>Prefer annotations on concrete implementation methods or classes.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  AspectJ mode can weave transactional behavior into bytecode and therefore cover self-invocation,
+  but it adds build or load-time complexity. It should be an explicit architecture choice, not a
+  quick repair for unclear service boundaries.
+</p>
+
+<h2 id="async-proxy"><span class="num">15.</span> @Async proxy limitations</h2>
+<p class="lead">
+  <code>@Async</code> normally means an interceptor submits the invocation to a
+  <code>TaskExecutor</code>; it does not make arbitrary code automatically asynchronous.
+</p>
+
+<ul>
+  <li>The call must cross the proxy, so self-invocation runs synchronously.</li>
+  <li><code>@Async</code> cannot be relied on in the same bean's lifecycle callback.</li>
+  <li>Private methods cannot be intercepted by the normal proxy mechanism.</li>
+  <li>
+    <code>void</code> methods cannot deliver exceptions to the caller. Configure an
+    <code>AsyncUncaughtExceptionHandler</code> or return <code>CompletableFuture</code>.
+  </li>
+  <li>
+    Thread-local state such as imperative transactions, security context, MDC, locale, and request
+    attributes does not automatically cross every executor boundary.
+  </li>
+  <li>
+    An unbounded executor queue can accept work faster than the application can finish it, producing
+    memory growth and extreme latency instead of backpressure.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Explicit async boundary with a named executor</b></figcaption>
+  <pre><code>@Service
+class ReceiptDispatcher {
+
+    @Async("receiptExecutor")
+    CompletableFuture&lt;DispatchResult&gt; dispatch(Receipt receipt) {
+        return CompletableFuture.completedFuture(send(receipt));
+    }
+}
+
+@Bean
+ThreadPoolTaskExecutor receiptExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(4);
+    executor.setMaxPoolSize(12);
+    executor.setQueueCapacity(200);
+    executor.setThreadNamePrefix("receipt-");
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    return executor;
+}</code></pre>
+</figure>
+
+<p>
+  Size the pool from task behavior, downstream capacity, latency objective, and memory budget.
+  Define rejection and shutdown semantics. If work must survive process crashes or deployment, use a
+  durable broker or database-backed queue instead of in-memory <code>@Async</code>.
+</p>
+
+<h2 id="failure-scenarios"><span class="num">16.</span> Common Spring Boot failure scenarios</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Evidence to inspect</th>
+        <th>Typical root causes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>NoSuchBeanDefinitionException</code></td>
+        <td>Required type, qualifiers, scan root, conditions, active profiles.</td>
+        <td>Class outside scan, skipped configuration, wrong context, or missing dependency.</td>
+      </tr>
+      <tr>
+        <td><code>NoUniqueBeanDefinitionException</code></td>
+        <td>Candidate names, primary and qualifier metadata.</td>
+        <td>Multiple strategies without an explicit default or selector.</td>
+      </tr>
+      <tr>
+        <td><code>BeanCurrentlyInCreationException</code></td>
+        <td>Full dependency path in the cause chain.</td>
+        <td>Circular dependency or reentrant lookup during initialization.</td>
+      </tr>
+      <tr>
+        <td><code>UnsatisfiedDependencyException</code></td>
+        <td>Deepest cause, not only the outer constructor.</td>
+        <td>Missing candidate, conversion error, or dependency creation failure.</td>
+      </tr>
+      <tr>
+        <td>Configuration binding failure</td>
+        <td>Property prefix, origin, target field, validation message.</td>
+        <td>Wrong key, invalid type, missing required value, or profile mismatch.</td>
+      </tr>
+      <tr>
+        <td>Web server fails to start</td>
+        <td>Failure analysis, port ownership, connector and TLS configuration.</td>
+        <td>Port in use, bad certificate, unsupported protocol, or missing web stack.</td>
+      </tr>
+      <tr>
+        <td>Database startup failure</td>
+        <td>Driver, URL, credentials source, DNS, TLS, pool timeout, migration logs.</td>
+        <td>Wrong profile, missing driver, network policy, secret, or failed migration.</td>
+      </tr>
+      <tr>
+        <td>Expected auto-config bean absent</td>
+        <td>Condition evaluation report and classpath.</td>
+        <td>Class condition failed, user bean caused back-off, or property disabled feature.</td>
+      </tr>
+      <tr>
+        <td>Annotation appears ignored</td>
+        <td>Runtime bean type, proxy status, call path, processor registration.</td>
+        <td>Direct construction, self-invocation, final/private method, or missing enablement.</td>
+      </tr>
+      <tr>
+        <td>Application starts but first request fails</td>
+        <td>Lazy initialization, request path, health design, startup readiness.</td>
+        <td>Misconfigured lazy bean or initialization deferred until traffic.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="debugging"><span class="num">17.</span> A systematic debugging playbook</h2>
+<ol>
+  <li>
+    <strong>Preserve the first failure.</strong> Read the entire cause chain and find the deepest
+    actionable exception. Later shutdown warnings are often consequences.
+  </li>
+  <li>
+    <strong>Identify the bean and phase.</strong> Was Spring registering metadata, selecting a
+    constructor, binding configuration, populating a dependency, running init code, or applying a
+    post-processor?
+  </li>
+  <li>
+    <strong>Draw the dependency path.</strong> Translate nested bean-creation messages into
+    <code>A -&gt; B -&gt; C</code>. The root problem is frequently C.
+  </li>
+  <li>
+    <strong>Inspect configuration origin.</strong> Check active profiles and property source origin,
+    not only the value expected from one YAML file.
+  </li>
+  <li>
+    <strong>Inspect conditional decisions.</strong> Run with <code>--debug</code> or enable the
+    condition report. Search for the exact auto-configuration class and its matched or unmatched
+    condition.
+  </li>
+  <li>
+    <strong>Verify ownership and call path.</strong> Confirm the object came from the context,
+    inspect whether it is proxied, and determine whether the failing call crossed the proxy.
+  </li>
+  <li>
+    <strong>Reduce the context.</strong> Reproduce a configuration issue with
+    <code>ApplicationContextRunner</code>, a slice test, or a minimal application.
+  </li>
+  <li>
+    <strong>Compare the effective runtime.</strong> Inspect dependency tree, packaged JAR contents,
+    Java version, environment, image digest, and configuration supplied in the failing deployment.
+  </li>
+  <li>
+    <strong>Fix the model.</strong> Prefer correcting component boundaries, configuration contracts,
+    or dependency alignment over exclusions and global flags that hide symptoms.
+  </li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Useful diagnostic commands</b></figcaption>
+  <pre><code># Show the auto-configuration condition report
+java -jar app.jar --debug
+
+# Maven runtime dependency tree
+./mvnw dependency:tree
+
+# Gradle dependency insight
+./gradlew dependencyInsight \
+  --dependency spring-core \
+  --configuration runtimeClasspath
+
+# Inspect packaged Boot archive entries
+jar tf build/libs/app.jar | sort
+
+# Record startup for Java Flight Recorder
+java -XX:StartFlightRecording=filename=startup.jfr,duration=60s \
+  -jar build/libs/app.jar</code></pre>
+</figure>
+
+<h3 id="debug-endpoints">Use diagnostics safely</h3>
+<p>
+  Actuator endpoints such as conditions, beans, mappings, configuration properties, environment,
+  startup, loggers, and thread dump can shorten diagnosis. They also expose architecture, property
+  names, runtime state, and sometimes sensitive values. Keep them disabled or private by default,
+  authorize operators, audit access, and remove temporary exposure after the incident.
+</p>
+
+<h2 id="production">
+  <span class="num">18.</span> Performance, security, and production practices
+</h2>
+
+<h3 id="startup-performance">Startup and memory</h3>
+<ul>
+  <li>Keep component scans within intentional package roots.</li>
+  <li>Avoid network calls and large data loads in constructors and post-processors.</li>
+  <li>Measure startup steps before enabling broad lazy initialization.</li>
+  <li>
+    Lazy initialization can improve startup time but moves configuration failure and allocation to
+    live requests. Mark critical beans eager and size memory for the fully initialized application.
+  </li>
+  <li>
+    Use current dependency-management releases instead of manually mixing Spring module versions.
+  </li>
+  <li>
+    Test AOT or native deployments separately because reflection and proxy assumptions differ.
+  </li>
+</ul>
+
+<h3 id="proxy-performance">Proxy and advice cost</h3>
+<p>
+  A proxy call has overhead, but database, network, serialization, and logging work normally
+  dominate it. The larger risk is accidentally applying expensive advice to high-volume methods or
+  creating excessive metric dimensions and logs inside advice. Use narrow pointcuts, stable tags,
+  sampling where appropriate, and measurements before optimization.
+</p>
+
+<h3 id="container-security">Container extension security</h3>
+<ul>
+  <li>
+    Treat third-party starters and auto-configurations as executable code with access to application
+    classes, configuration, network, filesystem, and secrets.
+  </li>
+  <li>Pin and scan dependencies, verify publishers, and remove unused starters.</li>
+  <li>
+    Never expose the context or a general <code>getBean(String)</code> facility to untrusted input.
+    That creates an object-selection and invocation surface.
+  </li>
+  <li>
+    Do not evaluate untrusted Spring Expression Language. Expression evaluation can expose methods
+    and objects far beyond simple property substitution.
+  </li>
+  <li>
+    Keep dynamic plugin loading behind signatures, isolation, explicit capability contracts, and an
+    operational disable path.
+  </li>
+  <li>
+    Minimize diagnostic endpoint exposure and assume heap dumps and environment reports are
+    sensitive.
+  </li>
+</ul>
+
+<h3 id="extension-design">Production extension design</h3>
+<p>
+  An internal starter should publish configuration metadata, use a unique property prefix, validate
+  required configuration, back off when users provide beans, avoid scanning the user's packages, and
+  test every condition branch. It should have no hidden remote startup call and should explain which
+  beans and endpoints it creates.
+</p>
+
+<h2 id="system-design"><span class="num">19.</span> System-design connections</h2>
+<p class="lead">
+  Spring internals matter because framework boundaries often become architecture boundaries.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Spring concept</th>
+        <th>System-design connection</th>
+        <th>Design lesson</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Dependency graph</td>
+        <td>Module coupling and ownership</td>
+        <td>Constructor cycles often reveal unclear responsibility.</td>
+      </tr>
+      <tr>
+        <td>Proxy boundary</td>
+        <td>Unit of transaction, authorization, caching, or retry</td>
+        <td>Make cross-cutting boundaries explicit at service APIs.</td>
+      </tr>
+      <tr>
+        <td>Application event</td>
+        <td>In-process observer pattern</td>
+        <td>It decouples beans, but is not automatically durable or distributed.</td>
+      </tr>
+      <tr>
+        <td>Auto-configuration</td>
+        <td>Platform convention and paved road</td>
+        <td>Defaults need back-off, visibility, and safe operational contracts.</td>
+      </tr>
+      <tr>
+        <td>ApplicationContext</td>
+        <td>Process boundary</td>
+        <td>It does not coordinate state across replicas or survive process loss.</td>
+      </tr>
+      <tr>
+        <td><code>@Async</code></td>
+        <td>Local concurrency</td>
+        <td>Use durable messaging for crash survival, replay, and cross-service load leveling.</td>
+      </tr>
+      <tr>
+        <td>Singleton scope</td>
+        <td>One instance per context, not global cluster state</td>
+        <td>Never use it as a distributed lock or source of shared truth.</td>
+      </tr>
+      <tr>
+        <td>Transaction interceptor</td>
+        <td>Local atomic boundary</td>
+        <td>External effects need idempotency, outbox, saga, or compensation patterns.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="events-boundary">Application events versus durable messages</h3>
+<p>
+  Spring application events are normally in-memory calls within one process. Synchronous listeners
+  can participate in the publisher's call stack and transaction. Async listeners use local executor
+  capacity. Neither form guarantees survival after a crash. When an event represents a business fact
+  that must be delivered, store it transactionally through an outbox and publish it to durable
+  messaging infrastructure.
+</p>
+
+<h3 id="multi-context">Context hierarchies</h3>
+<p>
+  Parent and child contexts can separate shared infrastructure from web-layer beans, but visibility
+  is directional: a child can normally see parent beans, while the parent cannot see child beans.
+  Annotation infrastructure such as transaction or async enablement applies in the context where it
+  is registered. Most Boot services should keep one clear context unless a framework integration
+  genuinely requires a hierarchy.
+</p>
+
+<h2 id="mistakes"><span class="num">20.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Construct an annotated service with <code>new</code>.</td>
+        <td>It misses injection, lifecycle, proxy, and configuration behavior.</td>
+        <td>Obtain it through injection or explicitly treat it as a plain object.</td>
+      </tr>
+      <tr>
+        <td>Put <code>@Transactional</code> on a private helper.</td>
+        <td>Normal proxy advice cannot intercept it.</td>
+        <td>Place the boundary on a proxyable service operation.</td>
+      </tr>
+      <tr>
+        <td>Call an advised method through <code>this</code>.</td>
+        <td>The call bypasses the proxy.</td>
+        <td>Extract a collaborating bean with an explicit boundary.</td>
+      </tr>
+      <tr>
+        <td>Inject <code>ApplicationContext</code> everywhere.</td>
+        <td>Service locator usage hides dependencies and spreads container coupling.</td>
+        <td>Use constructor injection or a narrow provider for a real dynamic need.</td>
+      </tr>
+      <tr>
+        <td>Enable circular references globally.</td>
+        <td>Partially initialized objects and fragile proxy interactions remain.</td>
+        <td>Redesign ownership and orchestration.</td>
+      </tr>
+      <tr>
+        <td>Assume annotation presence guarantees behavior.</td>
+        <td>Required processor, advisor, context, or proxy may be absent.</td>
+        <td>Identify the interpreter and test observable behavior.</td>
+      </tr>
+      <tr>
+        <td>Use broad pointcuts such as every service method.</td>
+        <td>Unexpected methods gain cost and semantic changes.</td>
+        <td>Select stable annotations or narrow package and method contracts.</td>
+      </tr>
+      <tr>
+        <td>Add starters until a missing bean appears.</td>
+        <td>It expands classpath behavior and hides the real condition.</td>
+        <td>Read the condition report and add only the required dependency.</td>
+      </tr>
+      <tr>
+        <td>Catch startup exceptions inside init methods.</td>
+        <td>The context becomes ready with broken required capability.</td>
+        <td>Fail fast for required dependencies; model optional degradation explicitly.</td>
+      </tr>
+      <tr>
+        <td>Use lazy initialization as a universal startup fix.</td>
+        <td>Failures and resource spikes move to production traffic.</td>
+        <td>Profile startup and optimize the responsible steps.</td>
+      </tr>
+      <tr>
+        <td>Assume local events or async work are durable.</td>
+        <td>Process termination loses queued or unpublished work.</td>
+        <td>Use durable messaging and idempotent consumers.</td>
+      </tr>
+      <tr>
+        <td>Debug only the outer exception.</td>
+        <td>Bean-creation wrappers hide the actionable cause.</td>
+        <td>Follow the deepest cause and dependency path.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="practice"><span class="num">21.</span> Practice exercises</h2>
+<ol>
+  <li>
+    Draw the complete lifecycle of a singleton that uses constructor injection,
+    <code>@PostConstruct</code>, a custom init method, and a transaction proxy. Mark where the raw
+    target and final managed reference differ.
+  </li>
+  <li>
+    A method annotated <code>@Transactional(REQUIRES_NEW)</code> is called from another method in
+    the same class. Predict the transaction behavior, prove it with an integration test, and
+    refactor the boundary.
+  </li>
+  <li>
+    Build an <code>ApplicationContextRunner</code> test matrix for an auto-configuration that
+    depends on a class, an enabled property, and a missing user bean.
+  </li>
+  <li>
+    Diagnose a <code>NoUniqueBeanDefinitionException</code> with three payment gateways. Decide
+    whether <code>@Primary</code>, qualifiers, or a runtime strategy registry models the real need.
+  </li>
+  <li>
+    Given services A, B, and C where A depends on B, B depends on C, and C depends on A, propose two
+    designs that remove the cycle and explain the new ownership.
+  </li>
+  <li>
+    Create one JDK-proxied and one CGLIB-proxied service. Inspect their runtime classes, method
+    surfaces, final-method behavior, and self-invocation behavior.
+  </li>
+  <li>
+    Design advice ordering for authorization, tracing, retry, and transaction behavior. Explain
+    which concern is outermost and whether each retry receives a fresh transaction.
+  </li>
+  <li>
+    A Boot service starts locally but fails in its container. Build an evidence checklist covering
+    Java version, packaged archive, active profiles, property origins, DNS, secrets, and classpath.
+  </li>
+  <li>
+    Replace a critical <code>@Async</code> email workflow with a durable design. Include commit
+    atomicity, retry, idempotency, dead-letter handling, ordering, and observability.
+  </li>
+  <li>
+    Profile startup with condition reporting and application-startup data. Identify one slow bean
+    and choose between redesign, deferral, parallelism, caching, or removal.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">22.</span> Comprehensive interview questions and answers</h2>
+
+<h3>What is the difference between BeanFactory and ApplicationContext?</h3>
+<p>
+  <code>BeanFactory</code> is the core dependency injection and bean lifecycle contract.
+  <code>ApplicationContext</code> extends the container model with automatic post-processor
+  discovery, events, resources, messages, environment support, and application integrations. Most
+  applications use an application context, while low-level framework code may interact directly with
+  a bean factory.
+</p>
+
+<h3>What is a BeanDefinition?</h3>
+<p>
+  It is metadata describing how the container should create and manage a bean. It can hold the
+  implementation type or factory, arguments, properties, scope, lazy state, qualifiers, lifecycle
+  methods, and other attributes. It is not the object instance.
+</p>
+
+<h3>What are the main phases of bean creation?</h3>
+<p>
+  Spring resolves metadata, chooses a construction path, instantiates the raw object, populates
+  dependencies, invokes aware callbacks, runs before-initialization processors, invokes
+  initialization callbacks, runs after-initialization processors, and exposes the final managed
+  reference. On context close it invokes applicable destruction callbacks.
+</p>
+
+<h3>What is the difference between BeanFactoryPostProcessor and BeanPostProcessor?</h3>
+<p>
+  A factory post-processor changes bean definitions or factory state before ordinary beans are
+  created. A bean post-processor participates in individual bean instance lifecycles and may inspect
+  or replace each object. Configuration parsing is a factory-level concern; annotated injection and
+  auto-proxying are instance-level concerns.
+</p>
+
+<h3>How does @Autowired work internally?</h3>
+<p>
+  An annotation-aware bean post-processor finds injection points and asks the bean factory to
+  resolve a dependency descriptor. The factory finds type-compatible candidates and applies
+  qualifiers, primary and priority rules, name fallback, generic metadata, and required or optional
+  semantics.
+</p>
+
+<h3>Why is constructor injection preferred?</h3>
+<p>
+  It makes required dependencies explicit, allows immutable fields, creates objects that are valid
+  after construction, supports plain unit testing, and exposes cycles immediately. Optional or
+  reconfigurable collaborations may use other patterns, but field injection hides dependencies and
+  complicates direct testing.
+</p>
+
+<h3>Why are constructor circular dependencies impossible?</h3>
+<p>
+  A requires a completed B to construct, while B requires a completed A. Neither raw object exists
+  early enough to supply the other constructor. Property cycles can sometimes use early references,
+  but they expose partial initialization and should be redesigned.
+</p>
+
+<h3>What does a BeanPostProcessor commonly do?</h3>
+<p>
+  It may invoke lifecycle annotations, inject annotated fields or methods through specialized
+  subinterfaces, validate instances, adapt framework interfaces, or wrap eligible beans with
+  proxies. Much of Spring's annotation behavior is implemented through post-processors.
+</p>
+
+<h3>Why might a bean be ineligible for auto-proxying?</h3>
+<p>
+  It may have been instantiated while post-processors themselves were being created, before the full
+  chain was registered. A post-processor that directly autowires ordinary application beans can
+  trigger this. Keep infrastructure dependencies minimal and avoid early application-bean creation.
+</p>
+
+<h3>What is the difference between a JDK proxy and CGLIB proxy?</h3>
+<p>
+  A JDK dynamic proxy implements interfaces and intercepts calls through that interface surface. A
+  CGLIB proxy subclasses the concrete target and overrides proxyable methods. Final classes cannot
+  be subclassed, and final or private methods cannot be advised through class overriding. Both
+  approaches still have the self-invocation limitation in proxy-based AOP.
+</p>
+
+<h3>Why does self-invocation bypass @Transactional?</h3>
+<p>
+  The external caller enters through a proxy, but a method calling another method on
+  <code>this</code> invokes the target directly. The call never returns to the proxy's transaction
+  interceptor. Extract the inner transactional operation to another managed bean.
+</p>
+
+<h3>What are aspect, pointcut, advice, join point, and proxy?</h3>
+<p>
+  An aspect groups cross-cutting policy. A join point is a place behavior can apply, primarily
+  method execution in Spring AOP. A pointcut selects join points. Advice is the behavior run before,
+  after, or around them. The proxy is the client-facing object that executes the interceptor chain
+  and then delegates to the target.
+</p>
+
+<h3>How does Spring Boot auto-configuration work?</h3>
+<p>
+  Boot imports known auto-configuration candidates from library metadata. Conditional annotations
+  evaluate classpath, bean, property, resource, and application facts. Matching configuration adds
+  definitions, while non-matching configuration is skipped. Missing-bean conditions allow user
+  configuration to replace defaults.
+</p>
+
+<h3>Does @ConditionalOnMissingBean check every future bean?</h3>
+<p>
+  It evaluates against definitions processed when the condition runs. This ordering sensitivity is
+  why it is intended mainly for auto-configuration, which runs after user definitions are available.
+  A condition report and context-runner tests should verify the intended back-off.
+</p>
+
+<h3>What is the difference between @Configuration full and lite mode?</h3>
+<p>
+  Full mode can enhance the configuration class so direct calls between <code>@Bean</code> methods
+  are redirected through container semantics. Lite mode, including
+  <code>proxyBeanMethods = false</code>, treats them as ordinary factory methods, so a direct Java
+  call creates a new ordinary object. Method-parameter injection works clearly in either mode.
+</p>
+
+<h3>What is FactoryBean?</h3>
+<p>
+  It is a bean that creates another object exposed as its product. Looking up the normal bean name
+  returns the product, while prefixing the name with <code>&amp;</code> returns the factory. It is
+  useful for complex framework-managed construction.
+</p>
+
+<h3>What is the order of initialization callbacks?</h3>
+<p>
+  After dependencies and aware callbacks, before-initialization processors run. For distinct
+  callback methods, <code>@PostConstruct</code> is invoked before
+  <code>InitializingBean.afterPropertiesSet()</code>, followed by a configured custom init method.
+  After-initialization processors then receive the result and may return a proxy.
+</p>
+
+<h3>When is ApplicationReadyEvent published?</h3>
+<p>
+  It is published after the context has refreshed and application runners have completed. It is a
+  late startup milestone, but listeners should still be quick, bounded, and idempotent. Operational
+  readiness must also account for the platform's readiness state and dependencies.
+</p>
+
+<h3>How do you debug why auto-configuration did not apply?</h3>
+<p>
+  Enable the condition evaluation report, find the exact auto-configuration class, and inspect each
+  matched and unmatched condition. Then verify classpath, property origins, active profiles, user
+  beans that caused back-off, context type, and declared bean return types.
+</p>
+
+<h3>Why can @Async silently run synchronously?</h3>
+<p>
+  The invocation may be a self-call, the object may not be managed, async support may not be
+  enabled, or the method may not be proxyable. Confirm the injected object is proxied and that the
+  caller crosses that proxy using the intended executor.
+</p>
+
+<h3>Does @Transactional propagate into an @Async thread?</h3>
+<p>
+  An imperative transaction is normally bound to the calling thread, so it does not propagate to a
+  newly started executor thread. The async method can start its own transaction through its own
+  proxy boundary. Passing managed entities across the boundary also risks detached state and stale
+  assumptions.
+</p>
+
+<h3>How does advice order affect retry and transactions?</h3>
+<p>
+  If retry advice wraps transaction advice, every attempt can enter a fresh transaction. If
+  transaction advice wraps retry, several attempts may occur inside one transaction that has already
+  been marked rollback-only. Set ordering deliberately and prove it with failure-path tests.
+</p>
+
+<h3>What is the first step when a Boot application fails to start?</h3>
+<p>
+  Preserve the first failure output and follow the deepest cause chain. Identify the bean and
+  lifecycle phase, draw the dependency path, and use failure analysis and the condition report.
+  Shutdown errors printed later are often secondary.
+</p>
+
+<h3>When should an application use ApplicationContextRunner?</h3>
+<p>
+  Use it to test focused configuration and auto-configuration combinations quickly. It can vary user
+  beans, properties, classpath, and context type without starting the complete application, making
+  it ideal for testing conditional matching and back-off.
+</p>
+
+<h3>Are Spring application events a message broker?</h3>
+<p>
+  No. They are in-process publication within an application context. They do not inherently provide
+  durable storage, cross-process delivery, replay, partitioning, or crash recovery. Use a durable
+  broker and an outbox when delivery is a business requirement.
+</p>
+
+<h3>What are the risks of broad lazy initialization?</h3>
+<p>
+  It delays configuration errors until first use, shifts allocation and latency to live traffic,
+  complicates readiness, and can hide memory needs during startup. Profile the actual slow steps and
+  keep critical capabilities eager.
+</p>
+
+<h3>How would you design a company Spring Boot starter?</h3>
+<p>
+  Separate dependencies from auto-configuration, use imports metadata and a unique property prefix,
+  validate configuration, guard optional technologies with class conditions, back off for user
+  beans, avoid broad scanning and remote startup work, provide context-runner tests, publish
+  configuration metadata, document created beans, and maintain an operational disable switch.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">23.</span> Concise cheat sheet</h2>
+<div class="cheat">
+  <ul>
+    <li><code>BeanDefinition</code> is a recipe; the managed bean is the resulting reference.</li>
+    <li>
+      <code>ApplicationContext</code> adds events, resources, environment, and processor discovery.
+    </li>
+    <li>Factory post-processors change metadata; bean post-processors change instances.</li>
+    <li>Annotation behavior exists because registered infrastructure interprets the annotation.</li>
+    <li>The final singleton reference may be a proxy rather than the raw target.</li>
+    <li>Calls must cross the proxy for normal Spring AOP advice to run.</li>
+    <li>
+      Self-invocation bypasses <code>@Transactional</code>, <code>@Async</code>, and similar advice.
+    </li>
+    <li>JDK proxies expose interfaces; CGLIB proxies subclass concrete classes.</li>
+    <li>Final and private methods cannot be overridden by class-based proxy advice.</li>
+    <li>Constructor cycles are unresolvable and usually expose confused ownership.</li>
+    <li>Do not depend on early references or globally enable circular dependencies.</li>
+    <li>
+      Use method parameters between <code>@Bean</code> methods for clear dependency resolution.
+    </li>
+    <li>Auto-configuration imports known candidates and keeps only condition matches.</li>
+    <li>Missing-bean conditions implement default back-off for user configuration.</li>
+    <li>The condition report explains why auto-configuration matched or did not match.</li>
+    <li>Use <code>ApplicationContextRunner</code> to test condition and back-off matrices.</li>
+    <li>Startup listeners must be registered before the events they need to observe.</li>
+    <li>
+      Imperative transactions and thread-local context do not automatically cross async threads.
+    </li>
+    <li>Advice ordering changes semantics, especially for retry and transactions.</li>
+    <li>
+      Read the deepest startup cause and map the dependency path before changing configuration.
+    </li>
+    <li>Profile startup before using broad lazy initialization.</li>
+    <li>Local events and executors are not durable distributed infrastructure.</li>
+    <li>Treat starters, diagnostics, SpEL, and dynamic extensions as security surfaces.</li>
+  </ul>
+</div>
+
+<h2 id="references"><span class="num">24.</span> Official references</h2>
+<ul class="links">
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/definition.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework bean definitions</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework dependency resolution and circular dependencies</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/factory-extension.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework container extension points</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/factory-nature.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework lifecycle callbacks</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/annotation-config/autowired.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework autowired dependencies</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/beans/java/basic-concepts.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework @Bean and @Configuration concepts</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/aop/introduction-defn.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring AOP concepts</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/core/aop/proxying.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring AOP proxying mechanisms</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework declarative transaction annotations</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Framework task execution and @Async</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/using/auto-configuration.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot auto-configuration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/developing-auto-configuration.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Creating Spring Boot auto-configuration</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/features/spring-application.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot application startup, events, and startup tracking</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.spring.io/spring-boot/reference/actuator/endpoints.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Spring Boot Actuator diagnostic endpoints</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
