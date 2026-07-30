@@ -19,6 +19,7 @@
 }
 html {
   height: 100%;
+  height: -webkit-fill-available;
   scroll-behavior: smooth;
   overscroll-behavior-y: none;
 }
@@ -27,6 +28,8 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: -webkit-fill-available;
+  height: 100dvh;
   margin: 0;
   overflow: hidden;
   font-family: var(--sans);
@@ -169,6 +172,7 @@ a {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
   scrollbar-gutter: stable;
 }
 
@@ -660,6 +664,7 @@ footer.doc-footer {
   padding: 56px 24px 96px;
   overflow-y: auto;
   overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
   scrollbar-gutter: stable;
 }
 .home {
@@ -787,6 +792,25 @@ footer.doc-footer {
   }
 }
 @media (max-width: 840px) {
+  .page-scroll,
+  .home-main {
+    scrollbar-width: thin;
+    scrollbar-color: #bbb transparent;
+    scrollbar-gutter: auto;
+  }
+  .page-scroll::-webkit-scrollbar,
+  .home-main::-webkit-scrollbar {
+    width: 4px;
+  }
+  .page-scroll::-webkit-scrollbar-track,
+  .home-main::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .page-scroll::-webkit-scrollbar-thumb,
+  .home-main::-webkit-scrollbar-thumb {
+    border-radius: 4px;
+    background: #bbb;
+  }
   .layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -808,7 +832,7 @@ footer.doc-footer {
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
-    padding: 16px 14px 32px 20px;
+    padding: 16px 14px calc(32px + env(safe-area-inset-bottom)) 20px;
     border-right: 1px solid var(--border);
     transform: translateX(-100%);
     transition: transform 0.2s ease;
@@ -824,7 +848,7 @@ footer.doc-footer {
     top: var(--header-h);
   }
   .content {
-    padding: 24px 22px;
+    padding: 24px 22px calc(24px + env(safe-area-inset-bottom));
   }
   .toc {
     display: block;
@@ -859,7 +883,10 @@ footer.doc-footer {
   }
   .to-top {
     right: 10px;
-    bottom: 24px;
+    bottom: calc(24px + env(safe-area-inset-bottom));
+  }
+  .home-main {
+    padding-bottom: calc(96px + env(safe-area-inset-bottom));
   }
 }
 @media (max-width: 480px) {
