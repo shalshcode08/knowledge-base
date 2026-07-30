@@ -172,7 +172,6 @@ a {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior-y: contain;
-  -webkit-overflow-scrolling: touch;
   scrollbar-gutter: stable;
 }
 
@@ -664,7 +663,6 @@ footer.doc-footer {
   padding: 56px 24px 96px;
   overflow-y: auto;
   overscroll-behavior-y: contain;
-  -webkit-overflow-scrolling: touch;
   scrollbar-gutter: stable;
 }
 .home {
@@ -832,6 +830,7 @@ footer.doc-footer {
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
     padding: 16px 14px calc(32px + env(safe-area-inset-bottom)) 20px;
     border-right: 1px solid var(--border);
     transform: translateX(-100%);
