@@ -272,7 +272,8 @@ function buildBreadcrumb(pagePath) {
 function noteMain(pagePath, prefix, contentHtml) {
   return (
     `<div class="overlay" id="overlay"></div>\n` +
-    `    <div class="layout">\n` +
+    `    <div class="page-scroll" id="pageScroll">\n` +
+    `      <div class="layout">\n` +
     `      <aside class="sidebar" id="sidebar" aria-label="Topics">\n` +
     `${buildSidebar(pagePath, prefix)}\n` +
     `      </aside>\n` +
@@ -280,6 +281,7 @@ function noteMain(pagePath, prefix, contentHtml) {
     `        <article class="article">${contentHtml.trim()}</article>\n` +
     `      </main>\n` +
     `${buildContents(contentHtml)}\n` +
+    `      </div>\n` +
     `    </div>`
   );
 }
@@ -302,7 +304,7 @@ function homeMain() {
     })
     .join("\n");
   return (
-    `<main class="home-main">\n` +
+    `<main class="home-main" id="pageScroll">\n` +
     `      <div class="home">\n` +
     `        <img class="home-logo" src="knowledge_base_logo.png" alt="" width="76" height="76" />\n` +
     `        <h1>knowledge base</h1>\n` +
