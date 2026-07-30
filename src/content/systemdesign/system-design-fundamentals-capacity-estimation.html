@@ -1,0 +1,1583 @@
+<h1>System Design Fundamentals and Capacity Estimation - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral method for turning an unclear product idea into measurable requirements,
+  capacity estimates, architecture decisions, failure plans, and a design that can be explained,
+  tested, operated, and improved.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The system-design mental model</h2>
+<p class="lead">
+  System design is the disciplined process of choosing boundaries, data flows, state, and failure
+  behavior that satisfy a specific workload under explicit constraints.
+</p>
+
+<p>
+  A design is not a collection of fashionable components. It is an argument. Requirements describe
+  the result users and the business need. Estimates describe the expected pressure. The architecture
+  describes how work and state move through the system. Trade-offs explain why this shape is more
+  suitable than credible alternatives. Measurements and tests show whether the argument remains true
+  in production.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of designing a bridge. The answer is not "use steel." The engineer first asks what must
+    cross the bridge, how often, in what weather, how much failure is tolerable, how repairs will
+    happen, and what budget exists. Software design follows the same pattern. A database, queue,
+    cache, or framework is a material selected after the load and constraints are understood.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Design output</th>
+        <th>Failure when skipped</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>What must the system do?</td>
+        <td>Functional requirements and critical user flows</td>
+        <td>Solving the wrong problem well</td>
+      </tr>
+      <tr>
+        <td>How well must it do it?</td>
+        <td>Latency, availability, durability, security, and cost targets</td>
+        <td>No objective way to judge the design</td>
+      </tr>
+      <tr>
+        <td>How much work and data exist?</td>
+        <td>Traffic, concurrency, bandwidth, storage, and growth estimates</td>
+        <td>Overbuilding, underbuilding, or missing a bottleneck</td>
+      </tr>
+      <tr>
+        <td>Where does state live and move?</td>
+        <td>APIs, events, data models, ownership, and consistency boundaries</td>
+        <td>Hidden coupling and unreliable dual writes</td>
+      </tr>
+      <tr>
+        <td>What fails?</td>
+        <td>Failure modes, fault domains, degraded modes, and recovery plans</td>
+        <td>A happy-path diagram mistaken for a production design</td>
+      </tr>
+      <tr>
+        <td>How will we know?</td>
+        <td>SLIs, SLOs, tests, dashboards, alerts, and review triggers</td>
+        <td>Opinions replace evidence</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The core loop</strong>
+  <p>
+    Clarify, quantify, design, challenge, measure, and revise. Every later topic in distributed
+    systems adds tools to this loop, but never replaces it.
+  </p>
+</div>
+
+<h2 id="requirements"><span class="num">01.</span> Start with requirements, not components</h2>
+<p class="lead">
+  Requirements define the decision space. Components are possible answers inside that space.
+</p>
+
+<h3 id="functional-requirements">Functional requirements</h3>
+<p>
+  Functional requirements describe observable capabilities. They should be written as user or system
+  flows with clear inputs, outputs, and important state changes. "Build a URL shortener" is not
+  precise enough. A useful first scope might say:
+</p>
+
+<ul>
+  <li>Create a short URL for a valid destination URL.</li>
+  <li>Redirect a short code to its active destination.</li>
+  <li>Allow an owner to disable or expire a link.</li>
+  <li>Record aggregate click counts without slowing the redirect path.</li>
+  <li>Prevent a disabled, malicious, or expired link from redirecting.</li>
+</ul>
+
+<p>
+  Separate must-have behavior from optional behavior. Custom aliases, detailed analytics, link
+  previews, geographic routing, QR codes, and campaign management can radically change the design.
+  Do not silently include them. State what is excluded and when the decision should be revisited.
+</p>
+
+<h3 id="critical-flows">Critical flows and correctness</h3>
+<p>
+  Not every flow has the same importance. Identify the business-critical and safety-critical paths.
+  A payment authorization may require stronger consistency and auditability than an analytics
+  counter. A redirect may prioritize latency and availability, while link creation can accept a
+  slightly slower response.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Flow</th>
+        <th>Correctness rule</th>
+        <th>Likely priority</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Create link</td>
+        <td>One allocated code identifies exactly one destination</td>
+        <td>Correctness, durability, then latency</td>
+      </tr>
+      <tr>
+        <td>Redirect</td>
+        <td>Return the current allowed destination or a clear failure</td>
+        <td>Availability and tail latency</td>
+      </tr>
+      <tr>
+        <td>Disable link</td>
+        <td>Disabled links stop redirecting within the stated propagation bound</td>
+        <td>Security and bounded staleness</td>
+      </tr>
+      <tr>
+        <td>Count click</td>
+        <td>Approximate analytics may lag but must not block redirects</td>
+        <td>Throughput and cost</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="requirement-questions">High-value clarification questions</h3>
+<ul>
+  <li>Who are the users, tenants, administrators, and dependent systems?</li>
+  <li>Which operations are reads, writes, streams, jobs, or scheduled work?</li>
+  <li>Which result must be immediately consistent, and which may be stale?</li>
+  <li>What data loss, duplication, or reordering is acceptable?</li>
+  <li>What happens when a dependency is slow, unavailable, or returns an uncertain result?</li>
+  <li>Which regions, devices, protocols, accessibility needs, and regulations apply?</li>
+  <li>What is the expected launch load, peak load, growth rate, and retention period?</li>
+  <li>Which requirement is expensive enough that changing it would simplify the design?</li>
+</ul>
+
+<div class="note">
+  <strong>Do not invent precision</strong>
+  <p>
+    If the stakeholder does not know a number, choose a documented assumption and continue. A
+    visible assumption can be corrected. A hidden assumption silently corrupts every downstream
+    decision.
+  </p>
+</div>
+
+<h2 id="quality-attributes">
+  <span class="num">02.</span> Non-functional requirements and quality attributes
+</h2>
+<p class="lead">
+  Non-functional requirements describe how the system must behave while delivering its functions.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Attribute</th>
+        <th>Useful question</th>
+        <th>Example target</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Latency</td>
+        <td>How quickly must a user-visible operation finish?</td>
+        <td>99% of redirects complete within 150 ms</td>
+      </tr>
+      <tr>
+        <td>Throughput</td>
+        <td>How much useful work must finish per unit of time?</td>
+        <td>Sustain 20,000 redirects per second at peak</td>
+      </tr>
+      <tr>
+        <td>Availability</td>
+        <td>What fraction of valid requests must succeed?</td>
+        <td>99.95% successful redirects per calendar month</td>
+      </tr>
+      <tr>
+        <td>Durability</td>
+        <td>What acknowledged state may be lost?</td>
+        <td>No acknowledged link creations lost after a single-zone failure</td>
+      </tr>
+      <tr>
+        <td>Consistency</td>
+        <td>How current and coordinated must observations be?</td>
+        <td>A disabled link stops resolving globally within 60 seconds</td>
+      </tr>
+      <tr>
+        <td>Scalability</td>
+        <td>How efficiently does capacity grow with resources?</td>
+        <td>Double redirect capacity with at most 2.2 times the serving cost</td>
+      </tr>
+      <tr>
+        <td>Security</td>
+        <td>What must be protected from whom?</td>
+        <td>Only an owner or administrator can mutate a link</td>
+      </tr>
+      <tr>
+        <td>Privacy</td>
+        <td>Which personal data is collected, retained, or shared?</td>
+        <td>Do not store raw client IP addresses in long-term analytics</td>
+      </tr>
+      <tr>
+        <td>Operability</td>
+        <td>Can people detect, diagnose, mitigate, and recover?</td>
+        <td>On-call can disable link creation independently of redirects</td>
+      </tr>
+      <tr>
+        <td>Cost</td>
+        <td>What budget and cost-per-unit are acceptable?</td>
+        <td>Keep redirect infrastructure below a stated cost per million requests</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Quality attributes conflict. Stronger durability may add synchronous replicas and latency. Lower
+  tail latency may require more idle capacity. More detailed analytics can increase storage cost and
+  privacy risk. A design review should expose these tensions and state which attribute wins for each
+  critical flow.
+</p>
+
+<h2 id="sli-slo-sla"><span class="num">03.</span> SLIs, SLOs, SLAs, and error budgets</h2>
+<p class="lead">
+  A reliability statement is useful only when its event, threshold, population, and measurement
+  window are explicit.
+</p>
+
+<dl>
+  <dt>Service level indicator, or SLI</dt>
+  <dd>
+    A quantitative measure of service behavior, such as the proportion of valid redirect requests
+    that succeed or the distribution of end-to-end latency.
+  </dd>
+  <dt>Service level objective, or SLO</dt>
+  <dd>
+    A target for an SLI over a defined window, such as 99.95% successful redirects over a calendar
+    month.
+  </dd>
+  <dt>Service level agreement, or SLA</dt>
+  <dd>
+    A business or contractual commitment that normally includes consequences when the commitment is
+    not met. An internal SLO is commonly stricter than the public SLA.
+  </dd>
+  <dt>Error budget</dt>
+  <dd>
+    The allowed amount of unsuccessful service implied by an SLO. For a success-rate SLO, the budget
+    is usually <code>1 - SLO</code> over the measurement window.
+  </dd>
+</dl>
+
+<figure class="code">
+  <figcaption><b>A precise request-based SLO</b></figcaption>
+  <pre><code>SLI =
+  valid redirect requests returning the correct redirect or approved not-found response
+  -------------------------------------------------------------------------------
+  all valid redirect requests received at the public edge
+
+SLO =
+  SLI &gt;= 99.95% over each calendar month
+
+Latency objective =
+  99% of successful redirects complete within 150 ms at the public edge</code></pre>
+</figure>
+
+<p>
+  Define which requests count. Exclude synthetic load only if it is separately controlled. Decide
+  whether client cancellations, invalid input, rate-limited abuse, and dependency-caused failures
+  count. Measure as close to the user as practical. A server may report success after the client has
+  already timed out.
+</p>
+
+<h3 id="availability-math">Availability and budget math</h3>
+<p>
+  Time-based availability is intuitive but request-based availability often matches user experience
+  better. A ten-minute outage at peak traffic affects more requests than a ten-minute outage during
+  an idle period.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Monthly availability target</th>
+        <th>Approximate unavailable time in a 30-day month</th>
+        <th>Error budget per 1,000,000 requests</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>99%</td>
+        <td>7 hours 12 minutes</td>
+        <td>10,000 failed requests</td>
+      </tr>
+      <tr>
+        <td>99.9%</td>
+        <td>43 minutes 12 seconds</td>
+        <td>1,000 failed requests</td>
+      </tr>
+      <tr>
+        <td>99.95%</td>
+        <td>21 minutes 36 seconds</td>
+        <td>500 failed requests</td>
+      </tr>
+      <tr>
+        <td>99.99%</td>
+        <td>4 minutes 19 seconds</td>
+        <td>100 failed requests</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  More nines are not free. They demand smaller failure domains, more automation, safer changes,
+  faster detection, tested recovery, dependency alignment, and spare capacity. Choose a target from
+  user and business needs, not prestige.
+</p>
+
+<h2 id="workload-model"><span class="num">04.</span> Build a workload model</h2>
+<p class="lead">Capacity estimates start with counts and distributions, not machine types.</p>
+
+<p>Record at least these workload dimensions:</p>
+
+<ul>
+  <li>Daily and monthly active users, tenants, devices, or producers.</li>
+  <li>Operations per active user and the read-to-write ratio.</li>
+  <li>Average, peak, and exceptional traffic rather than one average value.</li>
+  <li>Request and response sizes, object sizes, and batch sizes.</li>
+  <li>Data retention, update frequency, deletion policy, and annual growth.</li>
+  <li>Geographic distribution and time-zone-driven peaks.</li>
+  <li>Interactive, background, scheduled, and replay traffic.</li>
+  <li>Hot-key, celebrity, tenant-skew, and large-payload distributions.</li>
+</ul>
+
+<h3 id="average-and-peak">Average is a baseline, not a capacity target</h3>
+<p>
+  Average requests per second are useful for checking arithmetic. Production capacity must account
+  for peaks, retries, maintenance, deployments, failures, uneven balancing, and future growth. Model
+  at least:
+</p>
+
+<ul>
+  <li>
+    <strong>Normal peak:</strong> a predictable busy interval the system must serve routinely.
+  </li>
+  <li>
+    <strong>Failure peak:</strong> the same demand after losing a zone, replica, or dependency path.
+  </li>
+  <li>
+    <strong>Exceptional event:</strong> a campaign, breaking-news event, customer import, or replay.
+  </li>
+  <li>
+    <strong>Recovery load:</strong> queued work, cache warming, replication catch-up, and retries.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Core workload formulas</b></figcaption>
+  <pre><code>average requests per second =
+  requests per day / 86,400
+
+peak requests per second =
+  average requests per second * measured or assumed peak factor
+
+concurrent in-flight requests =
+  arrival rate per second * average time in system in seconds
+
+annual objects =
+  writes per second * 86,400 * 365
+
+raw storage =
+  object count * average stored bytes per object</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Peak factors are workload-specific</strong>
+  <p>
+    A guessed five-times peak is not a law. Record it as an assumption, instrument real traffic, and
+    replace it with observed percentiles. Some workloads are nearly flat. Others can jump by
+    hundreds of times in seconds.
+  </p>
+</div>
+
+<h2 id="estimation"><span class="num">05.</span> Back-of-the-envelope estimation</h2>
+<p class="lead">
+  Estimation finds orders of magnitude, impossible assumptions, and likely bottlenecks before
+  detailed implementation begins.
+</p>
+
+<h3 id="traffic-estimates">Traffic and concurrency</h3>
+<p>
+  Separate operations because their costs differ. A cached lookup, database write, full-text search,
+  image upload, and analytics aggregation cannot share one meaningful requests-per-second number.
+  Estimate each critical flow.
+</p>
+
+<p>
+  Concurrency connects throughput and latency. Little's Law states that, for a stable system,
+  average items in the system equal average arrival rate multiplied by average time in the system.
+  At 20,000 requests per second and 0.1 seconds average completion time, approximately 2,000
+  requests are in flight. If latency rises to one second while arrivals stay constant, concurrency
+  becomes 20,000. That can exhaust sockets, threads, memory, database connections, and queues.
+</p>
+
+<h3 id="storage-estimates">Storage</h3>
+<p>Estimate more than payload bytes:</p>
+
+<figure class="code">
+  <figcaption><b>Storage budget</b></figcaption>
+  <pre><code>logical data
++ row or document metadata
++ primary and secondary indexes
++ write-ahead or replication logs
++ replicas
++ temporary compaction or migration space
++ backups and retained snapshots
++ safety headroom
+= provisioned storage</code></pre>
+</figure>
+
+<p>
+  Compression, deletion, index structure, update rate, and replication can move the result
+  substantially. State a range and identify the inputs that need measurement.
+</p>
+
+<h3 id="bandwidth-estimates">Bandwidth</h3>
+<p>
+  Estimate ingress and egress separately. Include protocol overhead, replication, backups, cache
+  fills, internal fan-out, and cross-region traffic. A 500-byte response at 20,000 responses per
+  second is 10 MB/s of application payload, or about 80 Mb/s before overhead. If one external
+  request causes five internal requests, internal network traffic can dominate.
+</p>
+
+<h3 id="compute-estimates">Compute and instance count</h3>
+<p>
+  Convert load into instances only after benchmarking representative work. Use a safe operating
+  capacity below the observed breaking point. If one instance can sustain 5,000 requests per second
+  in a realistic test but latency begins to rise sharply above 60% CPU, design around the tested
+  safe capacity, not the final successful request.
+</p>
+
+<figure class="code">
+  <figcaption><b>Instance estimate with failure capacity</b></figcaption>
+  <pre><code>safe capacity per instance = 3,000 requests/second
+normal peak               = 20,000 requests/second
+instances for traffic     = ceil(20,000 / 3,000) = 7
+
+Three-zone layout:
+  4 instances per zone = 12 total
+  lose one zone        = 8 remaining
+  remaining capacity   = 8 * 3,000 = 24,000 requests/second</code></pre>
+</figure>
+
+<p>
+  This simple model has deliberate spare capacity and survives a zone loss at normal peak. It still
+  requires tests for balancing efficiency, dependency capacity, deployment overlap, and exceptional
+  traffic.
+</p>
+
+<h3 id="typescript-estimator">Small TypeScript estimation helper</h3>
+<p>
+  A script can make assumptions repeatable, but the model matters more than the language. Keep the
+  variables readable and store the assumptions beside the result.
+</p>
+
+<figure class="code">
+  <figcaption><b>TypeScript: transparent capacity arithmetic</b></figcaption>
+  <pre><code>type EstimateInput = {
+  monthlyWrites: number;
+  readsPerWrite: number;
+  peakFactor: number;
+  averageLatencyMs: number;
+  bytesPerRecord: number;
+  retentionYears: number;
+};
+
+function estimate(input: EstimateInput) {
+  const secondsPerMonth = 30 * 24 * 60 * 60;
+  const averageWriteRps = input.monthlyWrites / secondsPerMonth;
+  const averageReadRps = averageWriteRps * input.readsPerWrite;
+  const peakReadRps = averageReadRps * input.peakFactor;
+  const concurrentReads = peakReadRps * (input.averageLatencyMs / 1000);
+  const retainedRecords = input.monthlyWrites * 12 * input.retentionYears;
+  const rawStorageBytes = retainedRecords * input.bytesPerRecord;
+
+  return {
+    averageWriteRps,
+    averageReadRps,
+    peakReadRps,
+    concurrentReads,
+    retainedRecords,
+    rawStorageBytes,
+  };
+}</code></pre>
+</figure>
+
+<p>
+  Production models should include ranges and sensitivity analysis. If doubling one assumption
+  changes the architecture, that assumption deserves measurement and an explicit review trigger.
+</p>
+
+<h2 id="latency"><span class="num">06.</span> Latency, throughput, and percentiles</h2>
+<p class="lead">
+  Throughput says how much work completes. Latency says how long individual work takes. Both change
+  under load.
+</p>
+
+<p>
+  Averages hide users in the slow tail. Report a distribution using percentiles such as p50, p95,
+  p99, and p99.9. If p99 is 400 ms, approximately one request in one hundred is slower than 400 ms
+  during the measurement window. Percentiles must identify the population, location, and window.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Measure</th>
+        <th>What it reveals</th>
+        <th>Common mistake</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>p50</td>
+        <td>Typical request experience</td>
+        <td>Treating it as proof that almost everyone is fast</td>
+      </tr>
+      <tr>
+        <td>p95</td>
+        <td>Broad tail behavior</td>
+        <td>Ignoring the remaining 5% at high volume</td>
+      </tr>
+      <tr>
+        <td>p99 or p99.9</td>
+        <td>Rare but user-visible slow paths</td>
+        <td>Using a sample too small to estimate it reliably</td>
+      </tr>
+      <tr>
+        <td>Throughput</td>
+        <td>Completed useful work per interval</td>
+        <td>Counting accepted or queued work as completed work</td>
+      </tr>
+      <tr>
+        <td>Saturation</td>
+        <td>How close a constrained resource is to its useful limit</td>
+        <td>Watching CPU while a connection pool or lock is exhausted</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Latency normally rises nonlinearly near saturation because work waits in queues. A service can
+  appear healthy at average load and cross a performance cliff during a modest spike. Load tests
+  should find both the sustainable capacity and the failure behavior beyond it.
+</p>
+
+<h2 id="reliability">
+  <span class="num">07.</span> Availability, reliability, durability, and recoverability
+</h2>
+<p class="lead">These words describe different promises and should not be used interchangeably.</p>
+
+<dl>
+  <dt>Availability</dt>
+  <dd>The system can provide the defined service when requested.</dd>
+  <dt>Reliability</dt>
+  <dd>The system continues to perform correctly over time under stated conditions.</dd>
+  <dt>Durability</dt>
+  <dd>Acknowledged data remains intact over the promised retention period.</dd>
+  <dt>Recoverability</dt>
+  <dd>The system can restore service and data within stated recovery targets.</dd>
+  <dt>Resilience</dt>
+  <dd>The system can absorb, adapt to, and recover from faults without unacceptable harm.</dd>
+</dl>
+
+<p>
+  A service may be highly available but return stale or incorrect data. A storage system may keep
+  data durably while its read API is unavailable. A replicated database may lose multiple copies
+  through one bad deletion propagated everywhere. Backups improve recoverability only after restore
+  tests demonstrate that they are complete and usable.
+</p>
+
+<h3 id="dependency-availability">Dependency availability</h3>
+<p>
+  A serial critical path cannot be more available than its required dependencies. If a request
+  requires services A and B, each with 99.9% independent availability, the rough combined
+  availability is <code>0.999 * 0.999 = 99.8001%</code>. Real failures are often correlated, so
+  simple multiplication can be optimistic.
+</p>
+
+<p>
+  Remove unnecessary hard dependencies from critical paths. Cache stable configuration, make
+  optional analytics asynchronous, define degraded modes, and ensure the control plane is not
+  required for every data-plane request.
+</p>
+
+<h2 id="architecture-shape"><span class="num">08.</span> Boundaries, state, and critical paths</h2>
+<p class="lead">
+  A useful high-level design shows ownership and communication, not every class or cloud icon.
+</p>
+
+<p>For each component, answer:</p>
+
+<ul>
+  <li>What responsibility and data does it own?</li>
+  <li>Which API, event, or protocol crosses its boundary?</li>
+  <li>Is the interaction synchronous or asynchronous?</li>
+  <li>What is the timeout, retry, and idempotency behavior?</li>
+  <li>What happens if it is slow, unavailable, duplicated, or partitioned?</li>
+  <li>How does it scale, deploy, observe, secure, and recover?</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Minimal read path</b></figcaption>
+  <pre><code>Client
+  |
+  v
+Public edge and rate limit
+  |
+  v
+Stateless redirect service
+  | cache hit
+  +----------------------&gt; Return redirect
+  |
+  | cache miss
+  v
+Durable link store ------&gt; Fill cache ------&gt; Return redirect
+  |
+  +---- asynchronous click event ----&gt; Analytics pipeline</code></pre>
+</figure>
+
+<p>
+  The critical redirect path excludes analytics. A slow analytics system should not make redirects
+  fail. This is an architectural decision derived from flow priority, not a preference for queues.
+</p>
+
+<h3 id="single-points">Single points of failure and hidden shared fate</h3>
+<p>
+  Multiple instances do not create redundancy when they share one database, one network path, one
+  certificate, one deployment, one configuration service, or one operator mistake. Identify shared
+  fate across compute, storage, network, identity, configuration, deployment, and people.
+</p>
+
+<h2 id="failure-domains"><span class="num">09.</span> Failure domains, redundancy, and headroom</h2>
+<p class="lead">
+  Redundancy is useful only when replicas do not fail together and the remaining capacity can carry
+  the load.
+</p>
+
+<p>
+  Common failure domains include a process, host, rack, zone, region, network provider, identity
+  provider, deployment wave, software version, account, and administrative control plane. Map each
+  critical component to the failures it must survive.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Design question</th>
+        <th>Evidence required</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Can one zone fail?</td>
+        <td>Remaining-zone capacity, data placement, routing, and a fault test</td>
+      </tr>
+      <tr>
+        <td>Can one deployment fail?</td>
+        <td>Progressive rollout, compatibility, fast rollback, and separated waves</td>
+      </tr>
+      <tr>
+        <td>Can the control plane fail?</td>
+        <td>Data plane continues with last known safe configuration</td>
+      </tr>
+      <tr>
+        <td>Can a credential be revoked?</td>
+        <td>Rotation procedure that does not require simultaneous global change</td>
+      </tr>
+      <tr>
+        <td>Can backup recovery meet the promise?</td>
+        <td>Timed restore tests and verified application-level integrity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Headroom is deliberate spare capacity for peaks, failures, deployments, and uncertainty. It is not
+  waste when it protects an explicit reliability target. Measure headroom at every constrained
+  dependency, not only at stateless application servers.
+</p>
+
+<h2 id="diagrams"><span class="num">10.</span> Diagrams and decision records</h2>
+<p class="lead">
+  Different diagrams answer different questions. One overloaded diagram answers none of them well.
+</p>
+
+<ul>
+  <li>
+    <strong>Context diagram:</strong> users, external systems, trust boundaries, and the system.
+  </li>
+  <li>
+    <strong>Container or component diagram:</strong> deployable units, data stores, and ownership.
+  </li>
+  <li>
+    <strong>Data-flow diagram:</strong> where sensitive or durable data enters, moves, and rests.
+  </li>
+  <li><strong>Sequence diagram:</strong> ordering, timeouts, retries, and failures in one flow.</li>
+  <li>
+    <strong>Deployment diagram:</strong> zones, regions, networks, replicas, and fault domains.
+  </li>
+  <li>
+    <strong>State machine:</strong> valid states, transitions, retries, and terminal outcomes.
+  </li>
+</ul>
+
+<p>
+  Label arrows with protocols and whether they are synchronous or asynchronous. Label stores with
+  the data they own. Add trust and failure boundaries. A diagram that says only "service talks to
+  database" hides the decisions that reviewers need.
+</p>
+
+<h3 id="adr">Architecture decision records</h3>
+<p>
+  An architecture decision record, or ADR, captures context, the chosen decision, alternatives,
+  consequences, and review triggers. It prevents a current decision from becoming an unexplained
+  permanent rule.
+</p>
+
+<figure class="code">
+  <figcaption><b>Small ADR template</b></figcaption>
+  <pre><code>Title:
+Status:
+Context and constraints:
+Decision:
+Alternatives considered:
+Positive consequences:
+Negative consequences and risks:
+Measurements and safeguards:
+Revisit when:</code></pre>
+</figure>
+
+<h2 id="design-method"><span class="num">11.</span> A repeatable design method</h2>
+<p class="lead">
+  A consistent sequence keeps interviews and real design reviews focused on the highest-risk
+  decisions.
+</p>
+
+<ol>
+  <li>
+    <strong>Clarify scope.</strong> Identify actors, must-have flows, exclusions, correctness rules,
+    and business priorities.
+  </li>
+  <li>
+    <strong>Define quality targets.</strong> State latency, availability, durability, consistency,
+    security, privacy, retention, recovery, and cost requirements.
+  </li>
+  <li>
+    <strong>Estimate load.</strong> Calculate average and peak traffic, concurrency, bandwidth,
+    storage, growth, and failure capacity.
+  </li>
+  <li>
+    <strong>Define contracts and data.</strong> Sketch APIs, events, idempotency, primary entities,
+    ownership, indexes, and state transitions.
+  </li>
+  <li>
+    <strong>Draw the high-level design.</strong> Show critical synchronous paths, asynchronous work,
+    stores, caches, and external dependencies.
+  </li>
+  <li>
+    <strong>Deep-dive the risks.</strong> Examine hot paths, contention, consistency, partitions,
+    security boundaries, data loss, overload, and migrations.
+  </li>
+  <li>
+    <strong>Challenge failures.</strong> Remove a process, zone, dependency, credential, network
+    path, and operator assumption. Describe degraded behavior and recovery.
+  </li>
+  <li>
+    <strong>Make it operable.</strong> Define SLIs, dashboards, alerts, runbooks, capacity signals,
+    deployment safety, and restore tests.
+  </li>
+  <li>
+    <strong>Summarize trade-offs.</strong> State what the design optimizes, what it sacrifices, and
+    which changes would force a redesign.
+  </li>
+</ol>
+
+<div class="key">
+  <strong>Interview pacing</strong>
+  <p>
+    Clarify before drawing. Estimate before scaling. Present one simple correct design before
+    evolving it. Spend depth on the largest risk instead of naming every technology you know.
+  </p>
+</div>
+
+<h2 id="worked-example"><span class="num">12.</span> Worked design: URL-shortening service</h2>
+<p class="lead">
+  This first-pass design demonstrates the method. It is not the only correct design.
+</p>
+
+<h3 id="url-requirements">Requirements and assumptions</h3>
+<ul>
+  <li>Create 100 million short links per month.</li>
+  <li>Serve 100 redirects for every link creation.</li>
+  <li>Retain links for five years unless an owner deletes or expires them.</li>
+  <li>Normal peak is five times average traffic.</li>
+  <li>Redirect SLO is 99.95% successful requests per month.</li>
+  <li>Redirect latency target is p99 below 150 ms at the public edge.</li>
+  <li>A disabled link must stop redirecting globally within 60 seconds.</li>
+  <li>Click analytics may be delayed and may use approximate aggregates.</li>
+</ul>
+
+<p>
+  Custom aliases, detailed visitor analytics, preview generation, and billing are outside the first
+  version. The design leaves places to add them later.
+</p>
+
+<h3 id="url-capacity">Capacity calculation</h3>
+<figure class="code">
+  <figcaption><b>Traffic</b></figcaption>
+  <pre><code>100,000,000 creates/month
+/ 2,592,000 seconds/month
+= about 38.6 average creates/second
+
+100 redirects per create
+= about 3,860 average redirects/second
+
+5x normal peak
+= about 200 creates/second
+= about 20,000 redirects/second
+
+At 100 ms average redirect time:
+20,000 * 0.1 = about 2,000 concurrent redirects</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><b>Storage</b></figcaption>
+  <pre><code>100,000,000 links/month * 12 * 5 years
+= 6,000,000,000 retained links
+
+Assume 250 bytes logical storage/link:
+6 billion * 250 bytes = about 1.5 TB raw
+
+With 3 replicas:
+about 4.5 TB before indexes, logs, backups, migration space, and headroom
+
+Planning range:
+about 7 to 10 TB provisioned for primary serving data and indexes,
+with backups budgeted separately</code></pre>
+</figure>
+
+<p>
+  The range matters more than false precision. Measure actual destination length, metadata, index
+  size, compression, expiration, and backup policy before provisioning.
+</p>
+
+<h3 id="url-code-space">Short-code space</h3>
+<p>
+  Eight base-62 characters provide <code>62^8</code>, or roughly 218 trillion combinations. Six
+  billion retained links occupy a small fraction of that space. Random generation still needs a
+  uniqueness check and retry. An allocated numeric ID encoded as base 62 avoids random collisions
+  but introduces an ID-allocation and predictability decision. The API must also prevent enumeration
+  from exposing private metadata.
+</p>
+
+<h3 id="url-api">Minimal API contracts</h3>
+<figure class="code">
+  <figcaption><b>Language-neutral HTTP surface</b></figcaption>
+  <pre><code>POST /links
+Idempotency-Key: client-generated-key
+{ "destination": "https://example.com/article", "expiresAt": null }
+
+201 Created
+{ "code": "aZ91kLm2", "shortUrl": "https://sho.rt/aZ91kLm2" }
+
+GET /{code}
+302 Found
+Location: https://example.com/article
+
+DELETE /links/{code}
+204 No Content</code></pre>
+</figure>
+
+<p>
+  Creation uses an idempotency key so a client timeout and retry do not create multiple links.
+  Redirect returns not found or gone for missing, expired, disabled, or blocked codes according to a
+  documented policy.
+</p>
+
+<h3 id="url-data">Data model</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>code</code></td>
+        <td>Unique primary lookup key</td>
+      </tr>
+      <tr>
+        <td><code>destination</code></td>
+        <td>Validated destination URL</td>
+      </tr>
+      <tr>
+        <td><code>owner_id</code></td>
+        <td>Authorization and tenant boundary</td>
+      </tr>
+      <tr>
+        <td><code>status</code></td>
+        <td>Active, disabled, expired, or blocked</td>
+      </tr>
+      <tr>
+        <td><code>created_at</code>, <code>expires_at</code></td>
+        <td>Lifecycle and retention</td>
+      </tr>
+      <tr>
+        <td><code>version</code></td>
+        <td>Cache invalidation and concurrent update control</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The primary access pattern is an exact lookup by code. The owner-management path needs a secondary
+  access pattern by owner and creation time. Click analytics should not update the primary link row
+  on every redirect because that creates contention on popular links.
+</p>
+
+<h3 id="url-architecture">High-level architecture</h3>
+<figure class="code">
+  <figcaption><b>First production shape</b></figcaption>
+  <pre><code>                         +----------------------+
+Client -&gt; Edge -&gt; Router | Redirect service     |
+                         +----------+-----------+
+                                    |
+                              cache | lookup
+                                    v
+                         +----------------------+
+                         | Distributed cache    |
+                         +----------+-----------+
+                                    | miss
+                                    v
+                         +----------------------+
+                         | Durable link store   |
+                         +----------------------+
+
+Redirect service -&gt; durable event buffer -&gt; analytics consumers -&gt; aggregate store
+
+Authenticated client -&gt; management service -&gt; durable link store -&gt; cache invalidation</code></pre>
+</figure>
+
+<p>
+  Redirect instances are stateless and spread across failure domains. The cache serves hot codes and
+  reduces database reads. Cache misses fall through to the durable store and fill the cache. The
+  redirect response does not wait for analytics. Management writes commit to the durable store
+  before invalidation is published.
+</p>
+
+<h3 id="url-consistency">Consistency and failure behavior</h3>
+<ul>
+  <li>
+    <strong>Cache unavailable:</strong> fall back to a protected database path with concurrency
+    limits. Do not allow cache failure to overload the database.
+  </li>
+  <li>
+    <strong>Store unavailable:</strong> cached active links may continue during a carefully bounded
+    degraded mode, but new links and cache misses fail clearly.
+  </li>
+  <li>
+    <strong>Invalidation delayed:</strong> cache entries use a TTL no greater than the promised
+    disable propagation window, and urgent blocks may use an edge denylist.
+  </li>
+  <li>
+    <strong>Analytics unavailable:</strong> buffer events durably up to a capacity limit, sample or
+    drop noncritical analytics according to policy, and keep redirects serving.
+  </li>
+  <li>
+    <strong>One zone unavailable:</strong> routing removes the zone and remaining zones have enough
+    tested capacity for peak traffic.
+  </li>
+</ul>
+
+<h3 id="url-evolution">Evolution triggers</h3>
+<p>
+  Do not shard on day one only because the long-term count is large. Begin with a store that meets
+  the current load and has a measured growth path. Revisit partitioning when storage size, write
+  rate, index maintenance, replica lag, or operational windows approach tested limits. Revisit
+  global placement when user latency or regional recovery targets require it.
+</p>
+
+<h2 id="security"><span class="num">13.</span> Security, privacy, and abuse requirements</h2>
+<p class="lead">
+  Security is a design input, not a final checklist added after components are chosen.
+</p>
+
+<p>At minimum, identify:</p>
+
+<ul>
+  <li>
+    Assets: credentials, destinations, ownership, click metadata, and administrative controls.
+  </li>
+  <li>Actors: anonymous users, owners, administrators, services, attackers, and insiders.</li>
+  <li>
+    Trust boundaries: public edge, internal services, data stores, operations, and third parties.
+  </li>
+  <li>
+    Abuse: phishing, malware redirects, enumeration, scraping, denial of service, and quota evasion.
+  </li>
+  <li>
+    Privacy: IP addresses, user agents, location, referrers, retention, deletion, and access logs.
+  </li>
+</ul>
+
+<p>
+  Validate destination schemes and length, prevent unsafe internal destinations where server-side
+  fetching exists, rate-limit creation and redirect abuse separately, authorize mutations by owner,
+  audit administrative actions, encrypt traffic and durable data, rotate credentials, and define a
+  fast block mechanism. Avoid collecting analytics fields that have no product purpose.
+</p>
+
+<div class="warn">
+  <strong>Security can change capacity</strong>
+  <p>
+    Authentication, encryption, malware scanning, audit logging, and rate-limit checks consume CPU,
+    storage, and dependency capacity. Include them in the critical path and benchmark, not only in a
+    policy document.
+  </p>
+</div>
+
+<h2 id="production"><span class="num">14.</span> Production readiness and observability</h2>
+<p class="lead">
+  A design is incomplete until operators can understand its health and safely change it.
+</p>
+
+<h3 id="production-signals">Signals</h3>
+<ul>
+  <li>Request rate, success rate, latency percentiles, and payload distributions by operation.</li>
+  <li>Queue depth, age of oldest work, consumption rate, retries, and dead-letter volume.</li>
+  <li>Cache hit ratio, miss latency, eviction rate, hot keys, errors, and memory pressure.</li>
+  <li>
+    Database latency, throughput, connection use, lock waits, replication lag, and storage growth.
+  </li>
+  <li>
+    CPU, memory, garbage collection where applicable, sockets, threads, event-loop lag, and
+    saturation.
+  </li>
+  <li>Error-budget consumption and burn rate for each critical SLO.</li>
+</ul>
+
+<p>
+  Break down metrics only by bounded-cardinality dimensions. A short code, URL, user ID, or request
+  ID must not become a metric label. Use logs or traces for high-cardinality investigation, with
+  redaction and access controls.
+</p>
+
+<h3 id="production-change">Safe change</h3>
+<ul>
+  <li>Backward-compatible API, event, and schema changes.</li>
+  <li>Progressive rollout with automated health comparison and rollback.</li>
+  <li>Capacity for old and new versions during deployment.</li>
+  <li>Feature flags with owners, expiry, safe defaults, and failure behavior.</li>
+  <li>
+    Runbooks for dependency failure, overload, data corruption, credential loss, and rollback.
+  </li>
+  <li>Regular restore, failover, and degraded-mode tests.</li>
+</ul>
+
+<h2 id="testing"><span class="num">15.</span> Testing the design assumptions</h2>
+<p class="lead">Tests should target the claims that justify the architecture.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Test</th>
+        <th>Question answered</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Unit and property tests</td>
+        <td>Are estimators, ID rules, state transitions, and validators correct?</td>
+      </tr>
+      <tr>
+        <td>Integration tests</td>
+        <td>
+          Do contracts, persistence, timeouts, and error mappings work with real dependencies?
+        </td>
+      </tr>
+      <tr>
+        <td>Contract tests</td>
+        <td>Can clients and services evolve independently without accidental breakage?</td>
+      </tr>
+      <tr>
+        <td>Load test</td>
+        <td>Does the system meet SLOs at normal peak and expected data size?</td>
+      </tr>
+      <tr>
+        <td>Stress test</td>
+        <td>Where is the performance cliff and how does overload fail?</td>
+      </tr>
+      <tr>
+        <td>Soak test</td>
+        <td>Do leaks, compaction, cache churn, or background work appear over time?</td>
+      </tr>
+      <tr>
+        <td>Fault test</td>
+        <td>Does losing a process, zone, network path, cache, or store match the failure plan?</td>
+      </tr>
+      <tr>
+        <td>Recovery test</td>
+        <td>Can operators restore service and data within the promised time?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Use production-shaped data and traffic. A database with ten rows does not exercise index depth,
+  cache behavior, compaction, query planning, or storage limits. A load test with no failures does
+  not validate failure capacity.
+</p>
+
+<h2 id="tradeoffs"><span class="num">16.</span> Trade-offs and review triggers</h2>
+<p class="lead">
+  A good design makes reversible decisions cheaply and records when expensive decisions must be
+  revisited.
+</p>
+
+<p>
+  Classify decisions by cost of reversal. Naming, payload shape, public API semantics, data
+  ownership, partition keys, and externally visible consistency can be costly to change. Instance
+  sizes and many internal libraries are easier to replace. Spend review time accordingly.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Decision</th>
+        <th>Current reason</th>
+        <th>Revisit when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One primary link store</td>
+        <td>Current write rate and data size fit tested limits</td>
+        <td>Storage, write rate, maintenance, or recovery approaches a limit</td>
+      </tr>
+      <tr>
+        <td>Asynchronous analytics</td>
+        <td>Analytics is not required for redirect correctness</td>
+        <td>A product contract requires real-time exact counts</td>
+      </tr>
+      <tr>
+        <td>Bounded cache staleness</td>
+        <td>Fast redirects with a 60-second disable guarantee</td>
+        <td>Safety policy requires immediate global revocation</td>
+      </tr>
+      <tr>
+        <td>Single-region write ownership</td>
+        <td>Simpler correctness and current recovery target</td>
+        <td>Regional write availability or latency becomes a hard requirement</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="mistakes"><span class="num">17.</span> Common mistakes and corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Starting with a technology list</td>
+        <td>The design has no workload or requirement argument</td>
+        <td>Clarify flows, targets, and estimates first</td>
+      </tr>
+      <tr>
+        <td>Using only daily averages</td>
+        <td>Peaks and failure capacity determine saturation</td>
+        <td>Model normal peak, failure peak, events, and recovery</td>
+      </tr>
+      <tr>
+        <td>Giving one exact capacity number</td>
+        <td>Inputs are uncertain and distributions matter</td>
+        <td>Use ranges, headroom, sensitivity analysis, and measurements</td>
+      </tr>
+      <tr>
+        <td>Treating p99 as a maximum</td>
+        <td>One percent of requests are slower</td>
+        <td>Define timeout, failure, and extreme-tail behavior</td>
+      </tr>
+      <tr>
+        <td>Calling replicas highly available</td>
+        <td>They may share fate or lack remaining capacity</td>
+        <td>Map fault domains and test the intended loss</td>
+      </tr>
+      <tr>
+        <td>Ignoring dependency objectives</td>
+        <td>A hard dependency can consume the service budget</td>
+        <td>Align objectives, remove hard paths, and design degradation</td>
+      </tr>
+      <tr>
+        <td>Equating durability with backup</td>
+        <td>Untested backups may be incomplete or too slow to restore</td>
+        <td>Define RPO and RTO and perform restore tests</td>
+      </tr>
+      <tr>
+        <td>Adding cache, queue, or microservices automatically</td>
+        <td>Each adds failure modes and operational cost</td>
+        <td>Add a component only for a named requirement or bottleneck</td>
+      </tr>
+      <tr>
+        <td>Designing only the happy path</td>
+        <td>Partial and slow failures dominate distributed incidents</td>
+        <td>Write failure timelines and degraded behavior</td>
+      </tr>
+      <tr>
+        <td>Claiming infinite scale</td>
+        <td>Every design has finite resources and coordination points</td>
+        <td>Name the next bottleneck and its review trigger</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="exercises"><span class="num">18.</span> Practice exercises</h2>
+<ol>
+  <li>
+    A service receives 120 million requests per day with a six-times peak factor. Calculate average
+    and peak requests per second. Add 40% headroom.
+  </li>
+  <li>
+    Peak traffic is 50,000 requests per second and average latency is 240 ms. Estimate in-flight
+    concurrency. Recalculate at 1.5 seconds during overload and explain the operational effect.
+  </li>
+  <li>
+    Design SLIs and SLOs for redirect, creation, disable, and analytics flows. State which failures
+    count and where measurements are taken.
+  </li>
+  <li>
+    Estimate five-year storage for 20 million 800-byte records per month with three replicas, 60%
+    index overhead, and 30% headroom.
+  </li>
+  <li>
+    Draw a context, data-flow, sequence, and deployment diagram for the URL shortener. Explain the
+    different question each diagram answers.
+  </li>
+  <li>
+    Remove the cache, primary store, one zone, event buffer, and identity provider one at a time.
+    Define user behavior, protection, signals, mitigation, and recovery.
+  </li>
+  <li>
+    The product changes link-disable propagation from 60 seconds to one second. Identify every
+    design, cost, capacity, and operational decision that must be revisited.
+  </li>
+  <li>Write an ADR comparing random short codes with allocated numeric IDs encoded as base 62.</li>
+  <li>
+    Create a load-test plan that finds sustainable capacity and the failure mode beyond saturation.
+  </li>
+  <li>
+    Review a design that uses ten services, three databases, two queues, and a cache for 100
+    requests per minute. Identify unnecessary complexity and propose a simpler baseline.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">19.</span> Interview questions and model answers</h2>
+
+<h3 id="qa-functional">1. Functional versus non-functional requirements?</h3>
+<p>
+  Functional requirements describe capabilities and state changes, such as creating and resolving a
+  short link. Non-functional requirements describe qualities and constraints, such as p99 latency,
+  availability, durability, privacy, and cost. The distinction helps select architecture, but both
+  must be testable.
+</p>
+
+<h3 id="qa-estimate">2. Why estimate before choosing components?</h3>
+<p>
+  Estimates reveal the order of magnitude and workload shape. A design for 100 requests per second
+  and 10 GB differs from one for 100,000 requests per second and 10 PB. Estimates also expose
+  whether the main problem is compute, storage, bandwidth, concurrency, or operational complexity.
+</p>
+
+<h3 id="qa-average">3. Why is average requests per second insufficient?</h3>
+<p>
+  Capacity is consumed during peaks, failures, deployments, retries, and recovery. An average hides
+  bursts and uneven distributions. Model normal peak, failure peak, exceptional events, and backlog
+  recovery, then validate with real traffic.
+</p>
+
+<h3 id="qa-little">4. How does Little's Law help?</h3>
+<p>
+  For a stable system, average in-flight work equals arrival rate multiplied by average time in the
+  system. It connects throughput and latency to concurrency. If latency rises while arrivals remain,
+  in-flight work grows and can exhaust bounded resources.
+</p>
+
+<h3 id="qa-percentile">5. Why use latency percentiles?</h3>
+<p>
+  Latency distributions are normally skewed. A mean can remain acceptable while a meaningful
+  fraction of users is very slow. p50 describes typical behavior, while p95, p99, and p99.9 reveal
+  different parts of the tail. Always state population, location, and window.
+</p>
+
+<h3 id="qa-sli">6. SLI versus SLO versus SLA?</h3>
+<p>
+  An SLI is the measured behavior. An SLO is the target for that measurement. An SLA is a business
+  or contractual commitment with consequences. Teams usually operate to an internal SLO stricter
+  than the public SLA.
+</p>
+
+<h3 id="qa-budget">7. What is an error budget?</h3>
+<p>
+  It is the amount of unreliability allowed by an SLO. A 99.9% success SLO permits 0.1% unsuccessful
+  events in the window. Teams use budget consumption to balance release velocity and reliability
+  work.
+</p>
+
+<h3 id="qa-availability">8. Availability versus durability?</h3>
+<p>
+  Availability means the service can be used now. Durability means acknowledged data remains intact.
+  A system can be unavailable while data is safe, or available while returning data that will later
+  be lost.
+</p>
+
+<h3 id="qa-nines">9. Why not always require more availability nines?</h3>
+<p>
+  Each additional nine reduces the error budget and demands more isolation, redundancy, automation,
+  testing, and spare capacity. It can slow delivery and increase cost. The target should follow user
+  harm and business need.
+</p>
+
+<h3 id="qa-critical-path">10. What is a critical path?</h3>
+<p>
+  It is the sequence of work and dependencies that must succeed for a critical operation to
+  complete. Optional work should be removed from it when possible. Every hard dependency adds
+  latency and failure exposure.
+</p>
+
+<h3 id="qa-spof">11. What is a single point of failure?</h3>
+<p>
+  Any one failure whose loss makes the required service unavailable or incorrect. It can be a
+  process, data store, zone, network path, certificate, deployment, control plane, or human
+  procedure. Multiple replicas are not independent when they share the same failure.
+</p>
+
+<h3 id="qa-headroom">12. Why keep headroom?</h3>
+<p>
+  Headroom absorbs normal peaks, forecast error, deployments, retries, zone loss, cache warming, and
+  recovery work. It should be tied to a failure and growth model, not chosen as an unexplained
+  percentage.
+</p>
+
+<h3 id="qa-scale">13. Scalability versus performance?</h3>
+<p>
+  Performance describes behavior at a particular load and resource level. Scalability describes how
+  performance or throughput changes as load and resources change. A fast single instance may scale
+  poorly because of shared locks or centralized state.
+</p>
+
+<h3 id="qa-state">14. Why identify state early?</h3>
+<p>
+  State determines ownership, consistency, durability, recovery, migration, and scaling boundaries.
+  Stateless compute is easy to replace, while state movement and coordination are usually the hard
+  parts of system evolution.
+</p>
+
+<h3 id="qa-adr">15. What belongs in an ADR?</h3>
+<p>
+  Context, constraints, decision, alternatives, positive and negative consequences, safeguards, and
+  review triggers. It records why the decision made sense at the time without pretending it is
+  permanent.
+</p>
+
+<h3 id="qa-bottleneck">16. How do you find a bottleneck?</h3>
+<p>
+  Trace the critical path, estimate demand per resource, measure utilization, wait time, queue
+  depth, and throughput, then increase load until useful throughput stops scaling or latency rises
+  sharply. The saturated resource or coordination point is the current bottleneck.
+</p>
+
+<h3 id="qa-design-interview">17. How should a system-design interview begin?</h3>
+<p>
+  Clarify users, must-have flows, scale, quality targets, constraints, and exclusions. State
+  assumptions, estimate the workload, sketch a simple correct design, then deep-dive the largest
+  risks and trade-offs.
+</p>
+
+<h3 id="qa-simple">18. Why start simple?</h3>
+<p>
+  Simplicity reduces failure modes, cost, and cognitive load. It establishes a correct baseline and
+  makes each later component answer a named need. Premature distribution can make ordinary
+  correctness and operations much harder.
+</p>
+
+<h3 id="qa-test">19. How do you validate a paper design?</h3>
+<p>
+  Turn assumptions into tests and measurements: representative integration tests, production-shaped
+  load, stress beyond saturation, fault injection, long-running soak tests, restore drills, security
+  tests, and SLO monitoring.
+</p>
+
+<h3 id="qa-tradeoff">20. What makes a trade-off explanation strong?</h3>
+<p>
+  It names the requirement being optimized, credible alternatives, costs accepted, risks introduced,
+  safeguards, and the condition that would trigger reevaluation. "Technology X scales" is not
+  enough.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">20.</span> Concise cheat sheet</h2>
+<ul>
+  <li>Requirements first, estimates second, components third.</li>
+  <li>Separate must-have functions from optional scope.</li>
+  <li>Make latency, availability, durability, consistency, security, and cost measurable.</li>
+  <li>Average RPS equals daily requests divided by 86,400.</li>
+  <li>Concurrency is approximately arrival rate multiplied by time in system.</li>
+  <li>Model normal peak, failure peak, exceptional events, and recovery load.</li>
+  <li>
+    Storage includes data, metadata, indexes, logs, replicas, backups, migration space, and
+    headroom.
+  </li>
+  <li>Use percentiles for skewed latency, and state the population and window.</li>
+  <li>An SLI is a measurement, an SLO is a target, and an SLA is a commitment.</li>
+  <li>Error budget is the allowed unreliability implied by the SLO.</li>
+  <li>Availability, reliability, durability, recoverability, and resilience are different.</li>
+  <li>Every hard dependency adds latency and failure exposure to a critical path.</li>
+  <li>Replicas need independent failure domains and enough remaining capacity.</li>
+  <li>
+    Draw context, data-flow, sequence, deployment, and state diagrams for different questions.
+  </li>
+  <li>Record costly decisions and review triggers in ADRs.</li>
+  <li>Name the next bottleneck. No real system scales infinitely.</li>
+  <li>Test the claims: capacity, overload, fault behavior, and recovery.</li>
+  <li>A good design explains why, what it sacrifices, and when it must change.</li>
+</ul>
+
+<h2 id="references"><span class="num">21.</span> Official references</h2>
+<ul>
+  <li>
+    <a
+      href="https://sre.google/sre-book/service-level-objectives/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Service Level Objectives</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/workbook/implementing-slos/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Workbook: Implementing SLOs</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/workbook/error-budget-policy/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Workbook: Example Error Budget Policy</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/sre-book/availability-table/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Availability Table</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/sre-book/monitoring-distributed-systems/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Monitoring Distributed Systems</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/sre-book/addressing-cascading-failures/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Addressing Cascading Failures</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/static/pdf/nalsd-workbook-letter.pdf"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE: Non-Abstract Large System Design Workbook</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >AWS Builders' Library: Static Stability Using Availability Zones</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >AWS Well-Architected Framework</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://learn.microsoft.com/en-us/azure/well-architected/what-is-well-architected-framework"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Microsoft Azure Well-Architected Framework</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://learn.microsoft.com/en-us/azure/well-architected/reliability/checklist"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Microsoft Azure Reliability Design Review Checklist</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://learn.microsoft.com/en-us/azure/architecture/guide/design-principles/scale-out"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Microsoft Azure Architecture Center: Design to Scale Out</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
