@@ -112,6 +112,10 @@
         {
           "title": "System Design Fundamentals and Capacity Estimation",
           "path": "systemdesign/system-design-fundamentals-capacity-estimation"
+        },
+        {
+          "title": "Caching and Content Delivery",
+          "path": "systemdesign/caching-content-delivery"
         }
       ]
     }
