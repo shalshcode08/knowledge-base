@@ -112,6 +112,10 @@
         {
           "title": "System Design Fundamentals and Capacity Estimation",
           "path": "systemdesign/system-design-fundamentals-capacity-estimation"
+        },
+        {
+          "title": "Networking, DNS, TCP, TLS, HTTP, REST, and RPC",
+          "path": "systemdesign/networking-dns-tcp-tls-http-rpc"
         }
       ]
     }
