@@ -1,0 +1,1345 @@
+<h1>Caching and Content Delivery - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to placing reusable copies of data safely, reasoning about freshness and
+  invalidation, protecting origins from bursts, operating multi-layer caches, and explaining the
+  trade-offs clearly in production and system-design interviews.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The cache mental model</h2>
+<p class="lead">
+  A cache is a faster, limited, and disposable copy of data whose authority still belongs somewhere
+  else.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a busy restaurant. The pantry near the cook holds ingredients used often, while the
+    warehouse holds the full stock. The pantry shortens each trip, but it has limited space and its
+    labels can become wrong when the warehouse changes. A useful pantry needs rules for what enters,
+    how long it remains trusted, what leaves first, and what happens when it is empty.
+  </p>
+</div>
+
+<p>
+  Caching exchanges one kind of work for another. It avoids repeated computation, storage reads, or
+  network transfers, but introduces copies, freshness rules, memory pressure, coordination, and new
+  failure modes. A cache is valuable only when the avoided cost is larger than the cost of managing
+  those copies.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Precise meaning</th>
+        <th>Design question</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Source of truth</td>
+        <td>The authoritative system allowed to decide the current value</td>
+        <td>Where must writes commit before success is acknowledged?</td>
+      </tr>
+      <tr>
+        <td>Cache entry</td>
+        <td>A value plus identity, freshness, metadata, and sometimes validation state</td>
+        <td>Can two users or versions ever share this identity safely?</td>
+      </tr>
+      <tr>
+        <td>Hit</td>
+        <td>A request satisfied from a reusable cached entry</td>
+        <td>Was it fresh, validated, or deliberately stale?</td>
+      </tr>
+      <tr>
+        <td>Miss</td>
+        <td>No reusable entry exists, so the underlying path must run</td>
+        <td>Can the source absorb simultaneous misses?</td>
+      </tr>
+      <tr>
+        <td>Freshness</td>
+        <td>The period or condition under which a copy may be reused</td>
+        <td>What staleness can this business operation tolerate?</td>
+      </tr>
+      <tr>
+        <td>Invalidation</td>
+        <td>Making a cached representation unusable after authoritative state changes</td>
+        <td>What happens if the invalidation message is delayed or lost?</td>
+      </tr>
+      <tr>
+        <td>Eviction</td>
+        <td>Removing an entry to reclaim limited capacity</td>
+        <td>Which entry has the lowest expected future value?</td>
+      </tr>
+      <tr>
+        <td>Warm cache</td>
+        <td>A cache containing much of the active working set</td>
+        <td>How is capacity protected during restart or failover?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Start with correctness</strong>
+  <p>
+    Define ownership, key identity, allowed staleness, and failure behavior before selecting a cache
+    product. "Put Redis in front" or "add a CDN" is not a complete design.
+  </p>
+</div>
+
+<h2 id="why-caches-work"><span class="num">01.</span> Why caches work</h2>
+<p class="lead">
+  Caches work when future access is predictable enough that a small, fast layer can serve a large
+  share of requests.
+</p>
+
+<h3 id="locality">Locality and working sets</h3>
+<dl>
+  <dt>Temporal locality</dt>
+  <dd>Something used recently is likely to be used again soon, such as a trending product.</dd>
+  <dt>Spatial locality</dt>
+  <dd>Items near a requested item are likely to be requested, such as adjacent bytes in a file.</dd>
+  <dt>Frequency skew</dt>
+  <dd>A small set receives a large fraction of traffic, such as popular profile pages.</dd>
+  <dt>Working set</dt>
+  <dd>The data actively needed during a relevant period, not the total stored dataset.</dd>
+</dl>
+
+<p>
+  If a 10 TB catalog has a 4 GB hourly working set, a 6 GB cache may perform well. If every request
+  chooses a random object uniformly from 10 TB, the same cache will churn and provide little value.
+  Measure reuse-distance distributions and key popularity instead of assuming a universal percentage
+  of the database belongs in memory.
+</p>
+
+<h3 id="hit-ratio">Hit ratio, byte hit ratio, and miss cost</h3>
+<figure class="code">
+  <figcaption><b>Basic cache economics</b></figcaption>
+  <pre><code>request_hit_ratio = cache_hits / cache_lookups
+byte_hit_ratio    = bytes_served_from_cache / total_bytes_served
+
+average_latency =
+  hit_ratio * hit_latency
+  + (1 - hit_ratio) * miss_latency
+
+origin_requests_per_second =
+  total_requests_per_second * (1 - hit_ratio)</code></pre>
+</figure>
+
+<p>
+  A request hit ratio treats a 1 KB response and a 1 GB video equally. A CDN often cares about byte
+  hit ratio because bandwidth and origin egress dominate cost. An application cache may care more
+  about avoided database CPU or tail latency. Count hits only when they satisfy correctness. Serving
+  the wrong tenant's value is not a successful hit.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Example</th>
+        <th>Without cache</th>
+        <th>With 95% hit ratio</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>20,000 reads/s, source takes 40 ms</td>
+        <td>20,000 source reads/s</td>
+        <td>About 1,000 source reads/s in steady state</td>
+      </tr>
+      <tr>
+        <td>Cache hit takes 2 ms</td>
+        <td>Average near 40 ms</td>
+        <td>Average near 3.9 ms before queueing effects</td>
+      </tr>
+      <tr>
+        <td>Cache becomes empty</td>
+        <td>No behavior change</td>
+        <td>Source load can jump 20 times immediately</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>Averages hide the dangerous part</strong>
+  <p>
+    Misses are usually slower than hits and may queue behind other misses. Track hit and miss
+    latency separately at p50, p95, p99, and p99.9. A high overall hit ratio can still hide a severe
+    hot-key or cold-start tail.
+  </p>
+</div>
+
+<h2 id="cache-layers"><span class="num">02.</span> Cache layers and placement</h2>
+<p class="lead">
+  Placement decides latency, sharing, failure scope, consistency, and who controls the copy.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Useful for</th>
+        <th>Main limitation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CPU and operating-system cache</td>
+        <td>Instructions, memory pages, filesystem blocks</td>
+        <td>Mostly implicit and local to one machine</td>
+      </tr>
+      <tr>
+        <td>Browser or mobile client</td>
+        <td>Static assets, HTTP responses, offline data</td>
+        <td>Hard to purge and physically outside server control</td>
+      </tr>
+      <tr>
+        <td>Process-local application cache</td>
+        <td>Small computed values, metadata, configuration</td>
+        <td>Duplicated across instances and lost on restart</td>
+      </tr>
+      <tr>
+        <td>Distributed application cache</td>
+        <td>Shared objects, sessions when appropriate, expensive query results</td>
+        <td>Network hop, serialization cost, shared failure domain</td>
+      </tr>
+      <tr>
+        <td>Database cache</td>
+        <td>Pages, plans, materialized results, indexes</td>
+        <td>May still consume database CPU and connections</td>
+      </tr>
+      <tr>
+        <td>Reverse proxy</td>
+        <td>Whole HTTP responses near the application</td>
+        <td>Cache key and authentication mistakes affect many users</td>
+      </tr>
+      <tr>
+        <td>Edge cache or CDN</td>
+        <td>Static and explicitly cacheable dynamic content near users</td>
+        <td>Globally distributed invalidation and privacy risk</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Multi-level caching is common: browser, edge, regional shield, application cache, then database
+  buffer cache. Each layer should have a named owner, observable behavior, and a freshness policy.
+  More layers can reduce latency and origin traffic, but make incident diagnosis and invalidation
+  harder. An entry might be absent in one layer, stale in another, and fresh in a third.
+</p>
+
+<h3 id="private-shared">Private and shared caches</h3>
+<p>
+  A private cache serves one user or process. A shared cache serves many users. The distinction is a
+  security boundary. A response personalized by cookies, authorization, locale, experiment, or
+  tenant must not enter a shared cache unless every relevant dimension is represented safely in the
+  cache key and the response is explicitly allowed to be shared.
+</p>
+
+<h3 id="cdn">Content delivery networks</h3>
+<p>
+  A CDN stores reusable HTTP objects at geographically distributed points of presence. A nearby edge
+  reduces round-trip time and origin bandwidth. A tiered topology can let an edge miss consult a
+  regional or upper-tier cache before the origin, concentrating origin connections and reducing
+  duplicate fills. It does not remove the need for origin capacity, because a purge, expiry wave,
+  routing shift, or new popular object can still create misses.
+</p>
+
+<h2 id="read-patterns"><span class="num">03.</span> Read caching patterns</h2>
+
+<h3 id="cache-aside">Cache-aside, or lazy loading</h3>
+<p>
+  The application checks the cache, reads the source on a miss, and places the result in the cache.
+  It is simple and keeps the cache focused on requested data.
+</p>
+
+<figure class="code">
+  <figcaption><b>Cache-aside read path</b></figcaption>
+  <pre><code>READ(key):
+  cached = cache.get(key)
+  if cached exists and cached.version is acceptable:
+    return cached.value
+
+  value = source.read(key)
+  cache.put(key, value, ttl = policy_for(value))
+  return value
+
+Client -&gt; Service -&gt; Cache
+                    | hit  -&gt; value
+                    | miss
+                    v
+                  Source -&gt; value -&gt; Cache -&gt; Client</code></pre>
+</figure>
+
+<p>
+  The race is important. A reader can miss, read old source state, then populate the cache after a
+  concurrent writer invalidates it. Version checks, delete-after-write ordering, short TTLs, or a
+  second invalidation can bound the problem. For strict correctness, read directly from the
+  authority or use a cache protocol that validates versions.
+</p>
+
+<h3 id="read-through">Read-through</h3>
+<p>
+  The cache abstraction loads from the source when a key is absent. Callers see one interface. This
+  centralizes loading, TTL, and coalescing, but the loader must preserve source authorization,
+  cancellation, timeouts, and error semantics. A generic cache library cannot guess business
+  freshness.
+</p>
+
+<h3 id="memoization">Memoization</h3>
+<p>
+  Memoization caches a function result by its inputs. It is safe when the function is deterministic
+  for the complete key. Hidden inputs such as current time, feature flags, permissions, model
+  versions, locale, and database state must either enter the key or make the result non-cacheable.
+  Bound memoization by size and lifetime. An unbounded map is a memory leak with a convenient name.
+</p>
+
+<h3 id="negative-caching">Negative caching</h3>
+<p>
+  Negative caching stores "not found," empty, or known failure results briefly. It protects the
+  source from repeated requests for absent keys and automated enumeration. Use a shorter TTL than
+  for existing data, because a missing object can be created. Distinguish authoritative absence from
+  temporary source failure. Never cache an authorization failure under a key shared by other users.
+</p>
+
+<h2 id="write-patterns"><span class="num">04.</span> Write caching and consistency patterns</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Write flow</th>
+        <th>Benefit</th>
+        <th>Primary risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Write-through</td>
+        <td>Write cache layer, which synchronously writes authority</td>
+        <td>Cache is warm after acknowledged writes</td>
+        <td>Added write latency and cache dependency</td>
+      </tr>
+      <tr>
+        <td>Write-around</td>
+        <td>Write authority, then invalidate or bypass cache</td>
+        <td>One-time writes do not pollute cache</td>
+        <td>Next read misses</td>
+      </tr>
+      <tr>
+        <td>Write-behind</td>
+        <td>Accept into cache or queue, persist later</td>
+        <td>Low latency and batchable writes</td>
+        <td>Data loss, reordering, and complex recovery</td>
+      </tr>
+      <tr>
+        <td>Refresh-ahead</td>
+        <td>Refresh popular entries before expiry</td>
+        <td>Fewer user-visible misses</td>
+        <td>Refreshes unused data and can overload source</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Write-behind makes the cache or durable queue part of the authoritative write path. It is no
+  longer "just a cache." Acknowledged writes need replication, durable logging, idempotent replay,
+  ordering rules, backpressure, and reconciliation. If losing an accepted payment or inventory
+  update is unacceptable, a volatile cache is not sufficient.
+</p>
+
+<h3 id="safe-write-invalidation">A safe write and invalidation flow</h3>
+<figure class="code">
+  <figcaption><b>Database first, then invalidate with durable repair</b></figcaption>
+  <pre><code>UPDATE_PRODUCT(command):
+  begin source transaction
+    update product, increment version
+    append cache-invalidation event to transactional outbox
+  commit
+
+  best_effort cache.delete(product_key)
+  return committed version
+
+RELAY:
+  repeatedly publish unprocessed outbox events
+
+INVALIDATION_CONSUMER:
+  delete cache key or reject versions older than event.version
+  acknowledge event only after the cache action succeeds</code></pre>
+</figure>
+
+<p>
+  The direct deletion gives low propagation latency. The transactional outbox repairs a lost
+  deletion after a crash. TTL is the final bound if both paths fail. A version in the cached value
+  prevents an old fill from overwriting a newer one when the cache supports compare-and-set or the
+  application checks versions.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure point</th>
+        <th>State</th>
+        <th>Recovery</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Source transaction fails</td>
+        <td>No committed change and no valid outbox event</td>
+        <td>Return failure; do not invalidate as if write succeeded</td>
+      </tr>
+      <tr>
+        <td>Process crashes after commit</td>
+        <td>Source is new, cache may be old</td>
+        <td>Outbox relay invalidates; TTL bounds delay</td>
+      </tr>
+      <tr>
+        <td>Invalidation delivered twice</td>
+        <td>Same key deleted repeatedly</td>
+        <td>Deletion is idempotent</td>
+      </tr>
+      <tr>
+        <td>Old miss fill races new write</td>
+        <td>Old value may be reinserted</td>
+        <td>Versioned put, second delete, or short TTL</td>
+      </tr>
+      <tr>
+        <td>Cache unavailable</td>
+        <td>Source remains authoritative</td>
+        <td>Choose bounded source fallback or fail closed by domain</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="freshness"><span class="num">05.</span> Freshness, TTL, validation, and invalidation</h2>
+<p class="lead">
+  A TTL is a business staleness decision expressed as time, not a correctness mechanism by itself.
+</p>
+
+<h3 id="ttl-tti">TTL and time to idle</h3>
+<dl>
+  <dt>Time to live, or TTL</dt>
+  <dd>Expire a fixed duration after creation or refresh, whether or not the entry is read.</dd>
+  <dt>Time to idle, or TTI</dt>
+  <dd>Expire after the entry has not been accessed for a duration.</dd>
+  <dt>Absolute expiry</dt>
+  <dd>Expire at a specified instant, such as the end of a pricing promotion.</dd>
+</dl>
+
+<p>
+  Choose TTL from the harm caused by stale data, update frequency, source load, and recovery needs.
+  Product descriptions might tolerate minutes. Authorization revocation may tolerate seconds or no
+  shared caching at all. A longer TTL raises hit ratio and outage tolerance but lengthens stale
+  exposure. Add random jitter so millions of entries do not expire simultaneously.
+</p>
+
+<figure class="code">
+  <figcaption><b>Jittered expiry</b></figcaption>
+  <pre><code>effective_ttl = base_ttl * random_between(0.8, 1.2)</code></pre>
+</figure>
+
+<h3 id="validation">Version validation</h3>
+<p>
+  Validation asks whether a stored representation is still current. HTTP uses validators such as
+  <code>ETag</code> with <code>If-None-Match</code>, or <code>Last-Modified</code> with
+  <code>If-Modified-Since</code>. A <code>304 Not Modified</code> response avoids retransmitting the
+  body while confirming reuse. Application caches can store entity versions, revision numbers, or
+  content hashes. Validation still costs a round trip, but may save computation and bandwidth.
+</p>
+
+<h3 id="versioned-keys">Versioned keys and tagging</h3>
+<p>
+  A versioned key such as <code>asset:sha256:...</code> or <code>catalog:v42:item:123</code> turns
+  invalidation into publishing a new name. Immutable assets can receive long lifetimes because old
+  URLs still identify old bytes. The application must switch references atomically enough for its
+  consistency needs, and old versions still require eventual cleanup.
+</p>
+
+<p>
+  Tags group entries by dependency, such as <code>product:123</code> or
+  <code>tenant:acme:catalog</code>. Tag invalidation is operationally convenient, but the reverse
+  index consumes memory and a broad purge can cause a miss storm. Prefer precise tags and stage
+  large invalidations.
+</p>
+
+<h3 id="stale-while-revalidate">Serving stale intentionally</h3>
+<p>
+  Stale-while-revalidate serves a stale value immediately while one controlled refresh happens in
+  the background. Stale-if-error serves stale data when the source fails. Both trade freshness for
+  availability and lower tail latency. State explicit maximum stale windows, exclude safety-critical
+  values, preserve authorization, and expose stale age to operators.
+</p>
+
+<div class="note">
+  <strong>Stale is a policy outcome</strong>
+  <p>
+    "The cache was stale" is not a full incident explanation. Ask whether the age was within policy,
+    whether the client was told, whether the source was healthy, and whether the represented data
+    was eligible for stale service.
+  </p>
+</div>
+
+<h2 id="http-caching"><span class="num">06.</span> HTTP caching and cache keys</h2>
+<p class="lead">
+  HTTP already defines a distributed cache protocol. Use its semantics before inventing custom
+  headers.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Directive or field</th>
+        <th>Meaning</th>
+        <th>Common misunderstanding</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>max-age</code></td>
+        <td>Freshness lifetime in seconds for receiving caches</td>
+        <td>It is relative to response generation, not a purge guarantee</td>
+      </tr>
+      <tr>
+        <td><code>s-maxage</code></td>
+        <td>Shared-cache freshness overriding <code>max-age</code></td>
+        <td>It does not set browser freshness</td>
+      </tr>
+      <tr>
+        <td><code>public</code></td>
+        <td>Allows storage by shared caches where otherwise restricted</td>
+        <td>It does not make private data safe to share</td>
+      </tr>
+      <tr>
+        <td><code>private</code></td>
+        <td>Response is intended for a private cache, not a shared cache</td>
+        <td>It does not encrypt the response</td>
+      </tr>
+      <tr>
+        <td><code>no-cache</code></td>
+        <td>Stored response requires validation before reuse</td>
+        <td>It does not mean "never store"</td>
+      </tr>
+      <tr>
+        <td><code>no-store</code></td>
+        <td>Caches must not store the response under normal HTTP rules</td>
+        <td>It cannot erase copies already leaked elsewhere</td>
+      </tr>
+      <tr>
+        <td><code>must-revalidate</code></td>
+        <td>Stale response cannot normally be reused without successful validation</td>
+        <td>It does not force validation while the entry is fresh</td>
+      </tr>
+      <tr>
+        <td><code>Vary</code></td>
+        <td>Names request fields that affect representation selection</td>
+        <td>Unbounded variation can destroy hit ratio</td>
+      </tr>
+      <tr>
+        <td><code>Age</code></td>
+        <td>Approximate seconds since generation or successful validation</td>
+        <td>It is not application object age</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Separating browser and shared-cache freshness</b></figcaption>
+  <pre><code>Cache-Control: public, max-age=60, s-maxage=600, stale-while-revalidate=30
+ETag: "product-123-v42"
+Vary: Accept-Encoding</code></pre>
+</figure>
+
+<p>
+  The cache key commonly begins with method, target URI, and selected request fields. Query
+  normalization, host, scheme, headers, cookies, compression, locale, device variants, experiments,
+  and authorization can change the representation. If a representation varies but the key does not,
+  users receive wrong content. If the key varies on noisy data that does not affect the response,
+  the cache fragments and hit ratio falls.
+</p>
+
+<h3 id="cacheable-responses">What should be cacheable?</h3>
+<ul>
+  <li>Cache immutable, content-addressed assets for a long time.</li>
+  <li>Cache public catalog responses under an explicit freshness and purge policy.</li>
+  <li>
+    Use private caching or no-store for personal financial, medical, or secret-bearing responses.
+  </li>
+  <li>Do not assume only status 200 is cacheable. Define negative caching deliberately.</li>
+  <li>Do not cache unsafe method responses as if they were reusable reads.</li>
+  <li>Do not share responses merely because an authentication header was stripped at the edge.</li>
+</ul>
+
+<h2 id="eviction"><span class="num">07.</span> Capacity and eviction algorithms</h2>
+<p class="lead">
+  Eviction decides which copy to sacrifice when limited memory cannot hold the working set.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Policy</th>
+        <th>Idea</th>
+        <th>Works well when</th>
+        <th>Weakness</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LRU</td>
+        <td>Evict least recently used</td>
+        <td>Recent use predicts near-future use</td>
+        <td>A large scan can evict a valuable working set</td>
+      </tr>
+      <tr>
+        <td>LFU</td>
+        <td>Evict least frequently used</td>
+        <td>Stable popularity matters</td>
+        <td>Old popularity needs decay to avoid permanent winners</td>
+      </tr>
+      <tr>
+        <td>FIFO</td>
+        <td>Evict oldest insertion</td>
+        <td>Low overhead matters more than precision</td>
+        <td>Ignores reuse</td>
+      </tr>
+      <tr>
+        <td>Random</td>
+        <td>Evict a random candidate</td>
+        <td>Access is uniform or metadata cost must be tiny</td>
+        <td>May discard a very hot entry</td>
+      </tr>
+      <tr>
+        <td>TTL-first</td>
+        <td>Prefer entries closest to expiry</td>
+        <td>Application expiry predicts value</td>
+        <td>Popularity is ignored</td>
+      </tr>
+      <tr>
+        <td>Size or cost aware</td>
+        <td>Balance bytes, recomputation cost, and reuse</td>
+        <td>Objects vary greatly in size or miss cost</td>
+        <td>Needs better metadata and tuning</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Production systems often approximate policies by sampling because exact global LRU or LFU metadata
+  is expensive. Measure evictions, rejected writes, memory fragmentation, object-size distribution,
+  and hit ratio by key family. Reserve headroom for metadata, replication buffers, network buffers,
+  and allocator fragmentation. A configured 10 GB data limit does not mean the process needs only 10
+  GB of memory.
+</p>
+
+<h3 id="admission">Admission is different from eviction</h3>
+<p>
+  Eviction chooses what leaves. Admission chooses whether a new object deserves space at all. A
+  single-use scan should often bypass a small cache, preserving frequently reused items. Size limits
+  prevent a single large object from evicting thousands of valuable small objects. Separate caches
+  or quotas can isolate workloads with different value and access patterns.
+</p>
+
+<h2 id="stampedes"><span class="num">08.</span> Stampedes, penetration, and hot keys</h2>
+
+<h3 id="stampede">Cache stampede</h3>
+<p>
+  A stampede occurs when many callers miss or observe expiry together and all perform the expensive
+  fill. The cache normally hides source capacity limits, so a cold cache can turn a healthy source
+  into an overloaded source.
+</p>
+
+<figure class="code">
+  <figcaption><b>Single-flight request coalescing</b></figcaption>
+  <pre><code>GET_OR_LOAD(key):
+  value = cache.get(key)
+  if fresh(value): return value
+
+  if this process owns refresh(key):
+    loaded = source.read(key, deadline)
+    cache.put(key, loaded, jittered_ttl)
+    publish result to waiters
+    return loaded
+
+  wait briefly for owner
+  if fresh value appears: return it
+  if eligible stale value exists: return stale
+  otherwise fail within caller deadline</code></pre>
+</figure>
+
+<p>
+  Single-flight or request coalescing allows one fill per key while other requests wait or receive
+  stale data. It must be bounded by deadlines. A failed leader cannot hold every waiter forever.
+  Distributed locks can coordinate across processes, but they add their own failure and fencing
+  problems. Often per-node coalescing plus source concurrency limits is simpler and sufficient.
+</p>
+
+<h3 id="early-refresh">Probabilistic early refresh</h3>
+<p>
+  Refreshing every entry at a fixed threshold still synchronizes clients. A probabilistic policy
+  raises the chance of refresh as expiry approaches. Popular keys receive more opportunities to
+  refresh early, while cold keys usually expire naturally. Only one winner should perform the
+  refresh.
+</p>
+
+<figure class="code">
+  <figcaption><b>Conceptual early-refresh rule</b></figcaption>
+  <pre><code>remaining = expires_at - now
+refresh_probability = clamp(refresh_window / max(remaining, 1), 0, 1)
+if random() &lt; refresh_probability and acquire_refresh_ownership(key):
+  refresh(key)</code></pre>
+</figure>
+
+<h3 id="penetration">Cache penetration</h3>
+<p>
+  Penetration is repeated access to keys that never become cache hits, often due to invalid input,
+  enumeration, or random identifiers. Validate syntax early, rate-limit abusive principals, use
+  short negative caching for authoritative absence, and consider probabilistic membership filters
+  where false positives are acceptable. Do not let a filter become the source of truth, because a
+  stale false negative could hide a real object.
+</p>
+
+<h3 id="hot-keys">Hot keys</h3>
+<p>
+  One extremely popular key can saturate a cache shard, network path, or serialization thread even
+  when overall capacity looks healthy. Replicate read-only hot values, use near-caches, split large
+  aggregates, cache pre-serialized forms, and apply per-key request coalescing. Detect hot keys by
+  sampled access counts and shard imbalance without logging sensitive raw keys.
+</p>
+
+<h2 id="large-objects"><span class="num">09.</span> Large objects and content delivery</h2>
+<p>
+  Large objects change the unit of value. Cache chunks or byte ranges when clients consume only
+  parts, support resumable transfer, and avoid buffering a complete object in application memory.
+  Compression saves bandwidth but costs CPU and can fragment variants. Precompress immutable assets
+  when practical and include content encoding in representation selection.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Decision</th>
+        <th>Trade-off</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Whole-object caching</td>
+        <td>Simple, but one large object can evict many smaller high-value entries</td>
+      </tr>
+      <tr>
+        <td>Chunk caching</td>
+        <td>Improves partial reads and retries, but increases key count and metadata</td>
+      </tr>
+      <tr>
+        <td>Edge delivery</td>
+        <td>Reduces distance and origin egress, but distributes invalidation globally</td>
+      </tr>
+      <tr>
+        <td>Signed URLs</td>
+        <td>Offloads delivery, but expiry, cache key, and authorization scope must align</td>
+      </tr>
+      <tr>
+        <td>Origin shield</td>
+        <td>Collapses regional misses, but becomes another dependency and concentration point</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="security"><span class="num">10.</span> Security, privacy, and tenant isolation</h2>
+<p class="lead">A shared cache amplifies both performance and mistakes.</p>
+
+<h3 id="poisoning">Cache poisoning and deception</h3>
+<p>
+  Cache poisoning stores an attacker-influenced response under a key later used by victims. Unkeyed
+  request headers, host manipulation, query normalization differences, response splitting, and
+  inconsistent proxy parsing are common ingredients. Cache deception tricks a cache into storing a
+  private dynamic response by making its path look static.
+</p>
+
+<ul>
+  <li>Canonicalize and validate scheme, host, path, query, and forwarding headers consistently.</li>
+  <li>Include every representation-changing input in the key, or reject it before caching.</li>
+  <li>Ignore attacker-controlled headers that should not influence origin output.</li>
+  <li>Do not cache authenticated responses by file extension or path shape alone.</li>
+  <li>Test duplicate headers, ambiguous paths, encoded separators, and parameter reordering.</li>
+  <li>Restrict purge permissions, log them, and protect them from replay.</li>
+</ul>
+
+<h3 id="tenant-isolation">Tenant and authorization boundaries</h3>
+<p>
+  Prefix application keys with stable tenant identity and object version, not a display name.
+  Authorize before returning a cached object unless the object is independently public. Do not put
+  raw bearer tokens in keys or logs. If role or policy affects the representation, encode a stable
+  authorization-policy version or keep the result private. Prevent one tenant from consuming all
+  memory through quotas, admission controls, and size limits.
+</p>
+
+<h3 id="sensitive-data">Sensitive data and retention</h3>
+<p>
+  Encryption in transit and at rest protects some threats but does not fix cross-user reuse.
+  Minimize personal data, align cache lifetime with deletion and residency obligations, and ensure
+  backups or persistent tiers do not silently extend retention. A purge API should cover every
+  relevant layer. For secrets, payment details, health records, and similarly sensitive views,
+  bypass shared caches unless a reviewed design proves safe.
+</p>
+
+<h2 id="fail-open-closed">
+  <span class="num">11.</span> Failure policy: fail open, fail closed, or bypass
+</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Domain</th>
+        <th>Cache failure response</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Public product description</td>
+        <td>Bounded stale response or source fallback</td>
+        <td>Availability usually outweighs brief staleness</td>
+      </tr>
+      <tr>
+        <td>Authorization revocation</td>
+        <td>Fail closed or validate against authority</td>
+        <td>Stale allow decisions can expose protected data</td>
+      </tr>
+      <tr>
+        <td>Rate-limit counter</td>
+        <td>Domain-specific conservative limit</td>
+        <td>Fail open invites abuse; fail closed can cause outage</td>
+      </tr>
+      <tr>
+        <td>Recommendation feed</td>
+        <td>Fallback to popular or older safe content</td>
+        <td>Degraded personalization is acceptable</td>
+      </tr>
+      <tr>
+        <td>Inventory availability</td>
+        <td>Use cache as hint, verify before commitment</td>
+        <td>Overselling has a business correctness cost</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Source fallback must be capacity-limited. If every cache client immediately bypasses a failed
+  cache, the source can fail next. Use concurrency limits, deadlines, load shedding, and a degraded
+  response. Cache errors should not be retried recursively through every layer.
+</p>
+
+<h2 id="architecture"><span class="num">12.</span> End-to-end cached catalog design</h2>
+<p class="lead">
+  Assume 50,000 product reads/s at peak, 100 product updates/s, a 300 ms acceptable public staleness
+  target for prices, and a requirement to verify inventory during checkout.
+</p>
+
+<figure class="code">
+  <figcaption><b>Read architecture and trust boundaries</b></figcaption>
+  <pre><code>Browser private cache
+        |
+        v
+CDN edge cache --&gt; regional shield
+        | miss
+        v
+Catalog API --&gt; process near-cache --&gt; distributed cache
+                                         | miss
+                                         v
+                                  authoritative database
+
+Checkout API always validates current price version and inventory before commitment.</code></pre>
+</figure>
+
+<h3 id="catalog-read">Read path</h3>
+<ol>
+  <li>
+    The public response key includes product ID, locale, currency, and representation version.
+  </li>
+  <li>The edge serves a fresh public response or revalidates through the shield.</li>
+  <li>The API checks a tiny process-local cache, then the distributed cache.</li>
+  <li>A miss is coalesced per product and loaded with a deadline from the database.</li>
+  <li>The value stores product version, source commit time, and cache creation time.</li>
+  <li>The API returns an ETag derived from the representation version.</li>
+</ol>
+
+<h3 id="catalog-write">Write and invalidation path</h3>
+<ol>
+  <li>An authorized command updates the product and increments its version transactionally.</li>
+  <li>The same transaction appends an invalidation event.</li>
+  <li>The writer performs a best-effort distributed-cache delete after commit.</li>
+  <li>The relay publishes the event, and consumers delete near-cache and edge entries by tag.</li>
+  <li>Consumers ignore older event versions and retry idempotently.</li>
+  <li>A short price TTL bounds any missed invalidation; descriptions may have a longer TTL.</li>
+</ol>
+
+<h3 id="catalog-capacity">Capacity estimate</h3>
+<p>
+  Suppose the active set is 2 million objects averaging 4 KB serialized. Raw values need about 8 GB.
+  Add key, metadata, allocator, replication, and growth overhead rather than sizing at exactly 8 GB.
+  With 95% application-cache hits, the database sees about 2,500 reads/s before edge hits. If the
+  cache empties, the potential source demand is 50,000 reads/s, so warm-up must be rate-limited and
+  the system must serve stale or shed load instead of assuming the database absorbs it.
+</p>
+
+<h2 id="observability"><span class="num">13.</span> Observability and troubleshooting</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>Why it matters</th>
+        <th>Useful breakdown</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Hit, miss, stale, bypass, and error rate</td>
+        <td>Separates successful reuse from all other outcomes</td>
+        <td>Layer, key family, region, tenant class</td>
+      </tr>
+      <tr>
+        <td>Hit and miss latency distributions</td>
+        <td>Shows whether the cache improves user experience</td>
+        <td>p50, p95, p99, p99.9</td>
+      </tr>
+      <tr>
+        <td>Source request and error rate</td>
+        <td>Measures actual offload and source protection</td>
+        <td>Cache outcome and caller</td>
+      </tr>
+      <tr>
+        <td>Evictions, expirations, and rejected writes</td>
+        <td>Reveals capacity or policy pressure</td>
+        <td>Shard and policy</td>
+      </tr>
+      <tr>
+        <td>Memory, fragmentation, CPU, network, connections</td>
+        <td>Finds cache-server saturation</td>
+        <td>Node and shard</td>
+      </tr>
+      <tr>
+        <td>Coalesced waiters and load duration</td>
+        <td>Detects stampedes and stuck leaders</td>
+        <td>Key hash or safe key family</td>
+      </tr>
+      <tr>
+        <td>Entry age and invalidation lag</td>
+        <td>Measures real freshness, not configured TTL</td>
+        <td>Data class and region</td>
+      </tr>
+      <tr>
+        <td>Byte hit ratio and origin egress</td>
+        <td>Measures content-delivery cost reduction</td>
+        <td>Object size, media type, point of presence</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Use correlation IDs across cache, source, and invalidation paths. Sample keys by a one-way digest
+  or family to avoid exposing personal data. HTTP's standardized <code>Cache-Status</code> field can
+  describe forwarding and hit behavior, but exposing detailed keys publicly can aid attackers, so
+  restrict sensitive diagnostics.
+</p>
+
+<h3 id="troubleshooting-playbook">Troubleshooting playbook</h3>
+<ol>
+  <li>Confirm whether users see wrong data, high latency, errors, or excess cost.</li>
+  <li>Identify the affected layer, key family, tenant, region, and deployment version.</li>
+  <li>
+    Compare hit ratio with source load. A miss spike plus source saturation suggests cold cache.
+  </li>
+  <li>Check evictions, memory, skew, hot keys, and expiry waves.</li>
+  <li>Inspect invalidation lag and compare cached version with source version.</li>
+  <li>Mitigate with bounded stale service, fill limits, selective bypass, or precise purge.</li>
+  <li>Avoid a global purge unless origin capacity has been modeled and protected.</li>
+  <li>After recovery, replay invalidations and reconcile sampled keys against the source.</li>
+</ol>
+
+<h2 id="production-practices"><span class="num">14.</span> Production and deployment practices</h2>
+<ul>
+  <li>Assign separate TTL and failure policies by data class, not one global default.</li>
+  <li>Use deterministic key schemas with explicit tenant, schema, and representation versions.</li>
+  <li>
+    Deploy key-schema changes with dual read or dual fill only for a bounded migration window.
+  </li>
+  <li>Canary cache-policy changes and watch source load, not only cache hit ratio.</li>
+  <li>Warm only the proven hot set at a controlled rate. Avoid replaying the entire database.</li>
+  <li>
+    Distribute replicas and shards across failure domains without assuming replicas add capacity.
+  </li>
+  <li>Set cache timeouts below caller deadlines and bound connection pools and waiting queues.</li>
+  <li>
+    Keep an emergency bypass and purge mechanism protected by authorization and audit logging.
+  </li>
+  <li>Practice cache loss, partial shard failure, stale invalidations, and origin slowdown.</li>
+  <li>
+    Track cost per million requests and per cached GB, including network and operational cost.
+  </li>
+</ul>
+
+<h2 id="mistakes"><span class="num">15.</span> Common mistakes and safer corrections</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Using only object ID as key</td>
+        <td>Tenant, locale, version, or authorization variants collide</td>
+        <td>Define and test complete representation identity</td>
+      </tr>
+      <tr>
+        <td>Very long TTL with no invalidation repair</td>
+        <td>Lost invalidation causes long stale exposure</td>
+        <td>Durable invalidation plus TTL as a bound</td>
+      </tr>
+      <tr>
+        <td>Deleting cache before committing source</td>
+        <td>A reader can refill old state before the write commits</td>
+        <td>Commit source first, then invalidate, with race protection</td>
+      </tr>
+      <tr>
+        <td>No stampede protection</td>
+        <td>Expiry converts one expensive read into thousands</td>
+        <td>Jitter, coalescing, early refresh, and source limits</td>
+      </tr>
+      <tr>
+        <td>Unlimited source fallback</td>
+        <td>Cache outage becomes database outage</td>
+        <td>Bound concurrency and serve safe degraded results</td>
+      </tr>
+      <tr>
+        <td>Global purge during peak</td>
+        <td>Every layer misses together</td>
+        <td>Version keys or staged targeted invalidation</td>
+      </tr>
+      <tr>
+        <td>Unbounded local map</td>
+        <td>Memory grows until process failure</td>
+        <td>Bound weight, lifetime, and admission</td>
+      </tr>
+      <tr>
+        <td>Caching errors as absence</td>
+        <td>Temporary failure becomes a believable not-found result</td>
+        <td>Classify errors and negative-cache only authoritative absence</td>
+      </tr>
+      <tr>
+        <td>One shared cache for unrelated workloads</td>
+        <td>A scan or tenant can evict critical data</td>
+        <td>Quotas, admission, or separate capacity pools</td>
+      </tr>
+      <tr>
+        <td>Reporting one global hit ratio</td>
+        <td>Hot endpoints hide broken or unsafe key families</td>
+        <td>Measure outcome by layer, family, size, and region</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="testing"><span class="num">16.</span> Testing strategy</h2>
+
+<h3 id="unit-tests">Unit and property tests</h3>
+<ul>
+  <li>
+    Prove key construction distinguishes tenants, locales, versions, permissions, and variants.
+  </li>
+  <li>Use a controllable clock to test fresh, stale, expired, and jitter boundaries.</li>
+  <li>Verify negative results use different types and lifetimes from source errors.</li>
+  <li>Property-test that canonical query inputs produce the intended key and no collisions.</li>
+  <li>Test serialization compatibility across rolling deployments.</li>
+</ul>
+
+<h3 id="integration-tests">Integration and concurrency tests</h3>
+<ul>
+  <li>
+    Run real cache and source services for TTL, eviction, reconnection, and atomic-operation tests.
+  </li>
+  <li>Race a cache miss against an update and verify old data cannot persist beyond policy.</li>
+  <li>Send 1,000 simultaneous misses for one key and verify source calls remain bounded.</li>
+  <li>Test duplicated, reordered, delayed, and lost invalidation events.</li>
+  <li>Verify HTTP validators, <code>Vary</code>, <code>Age</code>, and private/shared behavior.</li>
+  <li>Test cache poisoning inputs across application, proxy, and CDN parsing.</li>
+</ul>
+
+<h3 id="load-fault-recovery-tests">Load, fault, and recovery tests</h3>
+<ul>
+  <li>Measure warm and cold throughput, tail latency, byte hit ratio, and source offload.</li>
+  <li>Restart the cache at peak test load and confirm controlled warm-up.</li>
+  <li>
+    Fail one shard, add latency, exhaust connections, and corrupt selected serialized entries.
+  </li>
+  <li>Expire a large key cohort together to expose synchronized refresh.</li>
+  <li>Disable invalidation delivery, then restore it and verify replay and reconciliation.</li>
+  <li>Run restore or regional failover while measuring stale age and origin capacity.</li>
+</ul>
+
+<h2 id="exercises"><span class="num">17.</span> Hands-on exercises</h2>
+
+<h3>Exercise 1: Key design review</h3>
+<p>
+  Design keys for a product page varying by tenant, product, currency, locale, tax region, login
+  state, experiment, and schema version. Decide which dimensions truly change the response. Expected
+  reasoning: unnecessary dimensions reduce hit ratio, but omitting a real dimension causes
+  cross-context data leakage. Prefer public base content plus separately private personalization
+  when possible.
+</p>
+
+<h3>Exercise 2: Stampede simulator</h3>
+<p>
+  Build a small approved-language service with a 100 ms source loader. Fire 500 concurrent requests
+  after expiry. Compare no protection, one process-local single-flight, jitter, and bounded stale
+  service. Expected reasoning: compare source-call count and tail latency, not only client success.
+</p>
+
+<h3>Exercise 3: Invalidation failure timeline</h3>
+<p>
+  Write timelines for a writer crash before commit, after commit but before delete, and after delete
+  but before event acknowledgement. Expected reasoning: source commit defines truth, direct deletion
+  reduces normal latency, durable outbox retries repair crashes, and TTL bounds residual staleness.
+</p>
+
+<h3>Exercise 4: CDN policy</h3>
+<p>
+  Define policies for fingerprinted JavaScript, a public article, a personalized dashboard, and a
+  signed file download. Expected reasoning: use immutable versioned assets for long caching,
+  validators and bounded freshness for articles, private or no-store for sensitive dashboards, and
+  align signed authorization lifetime with edge behavior.
+</p>
+
+<h3>Exercise 5: Capacity during cache loss</h3>
+<p>
+  A service handles 80,000 reads/s at 98% hits while the database safely handles 4,000 reads/s.
+  Determine cache-loss behavior. Expected reasoning: normal source load is about 1,600 reads/s, but
+  complete loss exposes 80,000 reads/s. Reserve source headroom, limit fills, prioritize critical
+  reads, serve bounded stale data, and shed excess demand.
+</p>
+
+<h2 id="interview"><span class="num">18.</span> Interview questions and model answers</h2>
+
+<h3>1. Why is cache invalidation considered difficult?</h3>
+<p>
+  The authoritative update and removal of every distributed copy are usually separate operations.
+  Processes can crash between them, messages can be lost or reordered, readers can repopulate old
+  state, and different layers have different lifetimes. A strong answer names an allowed staleness
+  bound and combines ordering, durable invalidation, versions, and TTL rather than claiming one
+  delete is atomic with the database.
+</p>
+<p><strong>Follow-up:</strong> What if a price must never be stale at checkout?</p>
+<p>
+  Treat cached price as a browsing hint and validate current price and version inside the
+  authoritative checkout transaction before commitment.
+</p>
+
+<h3>2. Compare cache-aside and read-through.</h3>
+<p>
+  In cache-aside, application code performs get, source load, and put. It is explicit and flexible
+  but easily duplicated. In read-through, a cache abstraction loads automatically, centralizing
+  policy but hiding source behavior unless carefully designed. Both still need key correctness,
+  coalescing, deadlines, error classification, and invalidation.
+</p>
+
+<h3>3. How do you choose a TTL?</h3>
+<p>
+  Start from the maximum harmful staleness for the data class. Then consider update frequency, miss
+  cost, invalidation reliability, source capacity, and outage policy. Validate with measured hit
+  ratio and stale age. Add jitter. Different fields or endpoints may need different TTLs.
+</p>
+
+<h3>4. How do you prevent a cache stampede?</h3>
+<p>
+  Combine staggered expiry, single-flight request coalescing, refresh-ahead or probabilistic early
+  refresh for hot entries, safe stale serving, and hard source concurrency limits. Bound waiters by
+  their deadlines and handle a failed refresh owner.
+</p>
+<p><strong>Follow-up:</strong> Why is a distributed lock not automatically the best answer?</p>
+<p>
+  It adds coordination latency, availability dependence, expiry races, and ownership problems.
+  Per-node coalescing plus source limits may provide enough protection with fewer failure modes.
+</p>
+
+<h3>5. What is the difference between eviction and expiry?</h3>
+<p>
+  Expiry removes or marks an entry unusable because its policy lifetime ended. Eviction removes an
+  entry to reclaim capacity, potentially while it is fresh. A high eviction rate can reduce hit
+  ratio even when TTLs are long.
+</p>
+
+<h3>6. Explain LRU versus LFU.</h3>
+<p>
+  LRU favors recently used items and adapts quickly, but scans can displace the working set. LFU
+  favors frequently used items and protects stable hot keys, but needs frequency decay when
+  popularity changes. Real systems often approximate both for lower metadata cost.
+</p>
+
+<h3>7. What makes a cache key safe?</h3>
+<p>
+  It uniquely describes the representation and its security boundary. Include stable tenant, object,
+  schema, locale, content-negotiation, and policy dimensions that truly alter output. Canonicalize
+  inputs consistently. Exclude secrets and noisy dimensions that do not affect output. Test
+  collisions and cross-user behavior.
+</p>
+
+<h3>8. When should a service fail open or fail closed?</h3>
+<p>
+  Base the decision on harm. Public content can often use bounded stale data. Authorization commonly
+  fails closed because a stale allow is dangerous. Rate limiting needs a deliberate conservative
+  degraded mode because pure fail-open permits abuse and pure fail-closed causes an outage.
+</p>
+
+<h3>9. Why can a cache outage cause a database outage?</h3>
+<p>
+  The database is usually sized for misses, not total traffic. Removing a 98% hit cache can increase
+  database demand 50 times. Unbounded fallback, synchronized retries, and cold fills then amplify
+  queueing. Protect the source with limits, stale service, staged warm-up, and load shedding.
+</p>
+
+<h3>10. How does HTTP revalidation differ from fetching again?</h3>
+<p>
+  A client sends a validator such as an ETag. If the representation is unchanged, the origin returns
+  304 without the full body. It still requires a request and origin decision, but saves transfer and
+  possibly rendering work.
+</p>
+
+<h3>11. How would you cache multi-tenant data?</h3>
+<p>
+  Use stable tenant identity in keys, authenticate and authorize at the correct boundary, separate
+  public from private representations, apply tenant quotas, encrypt transport, redact diagnostics,
+  and test that one tenant cannot infer existence, values, timing, or key structure of another.
+</p>
+
+<h3>12. What metrics prove a cache helps?</h3>
+<p>
+  Hit and byte-hit ratios are only the start. Show reduced source requests, CPU, connections,
+  bandwidth, and cost, plus better user latency. Also show staleness, invalidation lag, cache
+  errors, evictions, hot-key skew, and behavior during cold start. A high hit ratio with wrong data
+  is a failure.
+</p>
+
+<h3>13. When is write-behind appropriate?</h3>
+<p>
+  When delayed persistence and reordering are acceptable or when the buffering layer is engineered
+  as a durable write system. It needs durable replication, idempotent replay, backpressure,
+  reconciliation, and explicit acknowledgement semantics. It is not appropriate merely because
+  synchronous writes seem slow.
+</p>
+
+<h3>14. How do versioned keys help?</h3>
+<p>
+  A new value receives a new identity, so old copies cannot masquerade as new. This allows long
+  lifetimes for immutable content and reduces purge dependence. The system still needs a way to
+  publish current references and garbage-collect old versions.
+</p>
+
+<h3>15. Design a cached content feed.</h3>
+<p>
+  Clarify personalization, freshness, fan-out, privacy, and update rate. Cache public ranking
+  candidates and per-user page IDs separately, fetch mutable item details by version, use short
+  negative caching for removed items, coalesce misses, and keep authorization outside unsafe shared
+  layers. Measure feed age and source offload. Use a safe older feed during a ranking outage.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">19.</span> Revision cheat sheet</h2>
+<ul>
+  <li>A cache is a limited, faster, disposable copy. The authority must be explicit.</li>
+  <li>Value comes from locality, reuse, high miss cost, and a manageable working set.</li>
+  <li>Measure request hits, byte hits, source offload, latency, cost, and correctness.</li>
+  <li>Cache layers include client, process, distributed, database, proxy, edge, and CDN.</li>
+  <li>
+    Cache-aside is explicit; read-through centralizes loading; memoization keys function inputs.
+  </li>
+  <li>Write-through persists synchronously; write-behind changes the durability boundary.</li>
+  <li>Commit authority first, invalidate after, repair durably, and bound with TTL.</li>
+  <li>TTL is allowed staleness. Add jitter and use different policies by data class.</li>
+  <li>Versioned keys avoid reuse across versions; tags enable grouped invalidation.</li>
+  <li>Coalesce concurrent misses and limit source load to stop stampedes.</li>
+  <li>LRU uses recency; LFU uses frequency; admission prevents low-value pollution.</li>
+  <li>Negative-cache only authoritative absence and usually use a short TTL.</li>
+  <li>Hot keys require replication, near-caches, coalescing, or data decomposition.</li>
+  <li>HTTP <code>no-cache</code> means validate; <code>no-store</code> means do not store.</li>
+  <li>A shared cache key is a security boundary. Test poisoning and tenant isolation.</li>
+  <li>Choose fail-open, fail-closed, stale, or bypass behavior from business harm.</li>
+  <li>Cold-start and purge capacity matter more than steady-state capacity.</li>
+</ul>
+
+<h2 id="references"><span class="num">20.</span> Primary official references</h2>
+<ul>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9111.html">IETF RFC 9111: HTTP Caching</a>
+    - freshness, validation, cacheability, shared and private caches, and security considerations.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9110.html">IETF RFC 9110: HTTP Semantics</a>
+    - methods, validators, representations, conditional requests, and field semantics.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc5861.html"
+      >RFC 5861: HTTP Cache-Control Extensions for Stale Content</a
+    >
+    - stale-while-revalidate and stale-if-error.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9211.html"
+      >IETF RFC 9211: The Cache-Status HTTP Response Header Field</a
+    >
+    - interoperable cache diagnostics and their security implications.
+  </li>
+  <li>
+    <a href="https://redis.io/docs/latest/develop/reference/eviction/"
+      >Redis official key eviction documentation</a
+    >
+    - bounded memory, approximate LRU, LFU, and eviction-policy behavior.
+  </li>
+  <li>
+    <a href="https://docs.cloud.google.com/cdn/docs/caching"
+      >Google Cloud CDN official caching overview</a
+    >
+    - request collapsing, validators, cacheability, and edge behavior.
+  </li>
+  <li>
+    <a href="https://developers.cloudflare.com/cache/how-to/tiered-cache/"
+      >Cloudflare official Tiered Cache documentation</a
+    >
+    - hierarchical edge caching and origin-load reduction.
+  </li>
+  <li>
+    <a href="https://owasp.org/www-community/attacks/Cache_Poisoning"
+      >OWASP Cache Poisoning guidance</a
+    >
+    - shared-cache attack impact and defensive testing context.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

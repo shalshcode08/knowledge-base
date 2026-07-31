@@ -114,6 +114,10 @@
           "path": "systemdesign/system-design-fundamentals-capacity-estimation"
         },
         {
+          "title": "Caching and Content Delivery",
+          "path": "systemdesign/caching-content-delivery"
+        },
+        {
           "title": "Networking, DNS, TCP, TLS, HTTP, REST, and RPC",
           "path": "systemdesign/networking-dns-tcp-tls-http-rpc"
         }
