@@ -1,0 +1,2501 @@
+<h1>Data Storage and Data-Model Selection - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to choosing data models and storage engines from access patterns,
+  correctness, scale, retention, recovery, security, operations, and cost instead of choosing from
+  product labels.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The storage-selection mental model</h2>
+<p class="lead">
+  A data store is a machine for preserving facts and answering specific questions under specific
+  failure, latency, and cost constraints.
+</p>
+
+<p>
+  Storage design begins with facts and access patterns. Facts describe what must remain true, such
+  as "an order has one immutable identifier" or "available inventory never becomes negative." Access
+  patterns describe the questions and changes the system must perform, including their filters, sort
+  order, result size, write rate, concurrency, and latency target. The data model is the shape used
+  to preserve those facts and serve those patterns. The storage engine is the machinery that places
+  bytes on memory and durable media.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a library, a warehouse, and a filing cabinet. All store things, but their useful
+    organization follows retrieval. A library catalog supports lookup by author and subject. A
+    warehouse assigns stable locations and optimizes movement of pallets. A filing cabinet makes a
+    small, bounded set of folders easy to inspect. Calling all three "storage" hides the decisions
+    that make each one useful.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>The decision chain</b></figcaption>
+  <pre><code>Business invariants and trust boundaries
+                |
+                v
+Reads, writes, scans, aggregates, traversals, and retention
+                |
+                v
+Consistency, durability, recovery, latency, and throughput targets
+                |
+                v
+Logical model, ownership boundary, keys, partitions, and indexes
+                |
+                v
+Store category and storage-engine behavior
+                |
+                v
+Measured production evidence and review triggers</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Core rule</strong>
+  <p>
+    Choose from the workload inward. A product category is not a requirement, and no data model is
+    universally scalable. State what the design makes cheap, what it makes expensive, and which
+    future access pattern would force a change.
+  </p>
+</div>
+
+<h2 id="terminology"><span class="num">01.</span> Precise terminology and prerequisites</h2>
+<p class="lead">
+  Logical models, physical layouts, consistency guarantees, and deployment topologies are separate
+  choices even when a product bundles them.
+</p>
+
+<dl>
+  <dt>Entity</dt>
+  <dd>A thing with identity, such as an order, tenant, user, file, or device.</dd>
+  <dt>Attribute</dt>
+  <dd>A named fact about an entity, such as order status or file media type.</dd>
+  <dt>Relationship</dt>
+  <dd>A fact connecting entities, such as a customer placing an order.</dd>
+  <dt>Record, row, or document</dt>
+  <dd>A stored grouping of values. Its atomic update boundary depends on the system.</dd>
+  <dt>Key</dt>
+  <dd>
+    A value used to identify, locate, group, order, or partition data. A primary key identifies the
+    authoritative record. A partition key decides placement. A sort key orders records within that
+    placement.
+  </dd>
+  <dt>Index</dt>
+  <dd>
+    An additional structure that maps searchable values to records. It trades storage and write work
+    for faster reads.
+  </dd>
+  <dt>Schema</dt>
+  <dd>
+    The contract for names, types, constraints, meanings, compatibility, and lifecycle. A store that
+    does not enforce a schema still has one in every writer and reader.
+  </dd>
+  <dt>Source of truth</dt>
+  <dd>The authoritative representation used to settle conflicts and rebuild derived copies.</dd>
+  <dt>Materialized view</dt>
+  <dd>
+    A stored result derived from source data for a particular read pattern. It needs a refresh or
+    incremental maintenance rule.
+  </dd>
+  <dt>Durability</dt>
+  <dd>
+    The promise that an acknowledged write survives the failures named by the system contract.
+  </dd>
+  <dt>Consistency</dt>
+  <dd>The rules governing which writes a read may observe and how concurrent operations appear.</dd>
+  <dt>Recovery point objective, or RPO</dt>
+  <dd>The maximum acceptable amount of data change lost after a disaster.</dd>
+  <dt>Recovery time objective, or RTO</dt>
+  <dd>The maximum acceptable time to restore the required service after a disaster.</dd>
+</dl>
+
+<p>
+  "NoSQL," "distributed," "serverless," and "managed" do not describe one data model or one
+  correctness contract. Ask which operations are atomic, what a successful acknowledgement means,
+  how replicas behave, and how backup recovery is demonstrated.
+</p>
+
+<h2 id="decision-inputs"><span class="num">02.</span> Gather decision inputs</h2>
+<p class="lead">
+  The best store is the simplest one that meets measured access, correctness, lifecycle, and
+  operational requirements with safe headroom.
+</p>
+
+<h3 id="access-pattern-card">Write an access-pattern card</h3>
+<p>Record every critical operation in a table before drawing the architecture.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Questions</th>
+        <th>Why it changes the choice</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Lookup shape</td>
+        <td>Exact key, range, filter, join, traversal, text, vector, or aggregate?</td>
+        <td>Determines model, indexes, and read amplification</td>
+      </tr>
+      <tr>
+        <td>Sort and pagination</td>
+        <td>Which ordering, tie-breaker, direction, and page size?</td>
+        <td>Determines compound keys and whether scans stay bounded</td>
+      </tr>
+      <tr>
+        <td>Write shape</td>
+        <td>Insert, update, append, delete, batch, or conditional mutation?</td>
+        <td>Determines contention, compaction, and transaction needs</td>
+      </tr>
+      <tr>
+        <td>Correctness</td>
+        <td>Which invariants span fields, records, partitions, or stores?</td>
+        <td>Determines atomicity and consistency boundary</td>
+      </tr>
+      <tr>
+        <td>Scale</td>
+        <td>Average, peak, growth, skew, object size, and cardinality?</td>
+        <td>Determines capacity, partitioning, and hotspots</td>
+      </tr>
+      <tr>
+        <td>Lifecycle</td>
+        <td>Retention, legal hold, deletion, archival, and restore window?</td>
+        <td>Determines tiers, backup policy, and erasure process</td>
+      </tr>
+      <tr>
+        <td>Locality</td>
+        <td>Which tenant, region, time range, or aggregate is read together?</td>
+        <td>Determines placement and cross-boundary traffic</td>
+      </tr>
+      <tr>
+        <td>Operations</td>
+        <td>Skills, tooling, on-call, migration, and compliance constraints?</td>
+        <td>A theoretically ideal store may be unsafe to operate</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Example access-pattern card: order history</b></figcaption>
+  <pre><code>Operation: list a customer's recent orders
+Filter: tenant_id = ? and customer_id = ?
+Order: created_at descending, then order_id descending
+Page: 50 items, cursor based
+Traffic: 2,000 average reads/s, 8,000 peak reads/s
+Freshness: committed orders visible immediately in the home region
+Latency: p99 under 200 ms
+Retention: seven years, last 18 months online
+Skew: largest tenant is 20% of traffic
+Failure rule: a stale page is acceptable for 30 seconds, missing an accepted order is not</code></pre>
+</figure>
+
+<h3 id="invariants">List invariants before tables</h3>
+<ul>
+  <li>An order total equals the recorded line totals, tax, shipping, and adjustments.</li>
+  <li>A payment provider reference is associated with at most one internal payment attempt.</li>
+  <li>A chat message identifier is unique within a conversation.</li>
+  <li>A file metadata record never points to an object that was never finalized.</li>
+  <li>A tenant cannot read, change, index, back up, or export another tenant's protected data.</li>
+</ul>
+
+<p>
+  Put invariants inside one atomic boundary when practical. If an invariant spans independently
+  committed stores, the application must manage intermediate states, retries, reconciliation, and
+  compensation. That complexity is a design cost, not free flexibility.
+</p>
+
+<h2 id="decision-matrix"><span class="num">03.</span> Store-category decision matrix</h2>
+<p class="lead">
+  Categories describe useful tendencies. Verify the actual product and configuration because many
+  systems support several models.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Natural strengths</th>
+        <th>Natural costs</th>
+        <th>Good first questions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Relational</td>
+        <td>Constraints, transactions, joins, flexible queries, mature planning</td>
+        <td>Cross-partition joins and global write scaling need care</td>
+        <td>Do invariants span entities? Are query shapes still evolving?</td>
+      </tr>
+      <tr>
+        <td>Key-value</td>
+        <td>Direct lookup, simple partitioning, predictable request path</td>
+        <td>Secondary access and relationships move into keys or derived views</td>
+        <td>Can every hot request name its key?</td>
+      </tr>
+      <tr>
+        <td>Document</td>
+        <td>Aggregate-shaped reads, nested values, local schema flexibility</td>
+        <td>Duplication, large-document updates, weak cross-document invariants</td>
+        <td>Is the document a true transactional and lifecycle boundary?</td>
+      </tr>
+      <tr>
+        <td>Wide-column</td>
+        <td>High write scale, partition-local ordered ranges, sparse attributes</td>
+        <td>Query-first duplication, partition sizing, limited ad hoc access</td>
+        <td>Can queries be answered within a known partition and sort order?</td>
+      </tr>
+      <tr>
+        <td>Graph</td>
+        <td>Variable-depth relationship traversal and path questions</td>
+        <td>Large supernodes, distributed traversals, different query skills</td>
+        <td>Is traversal itself the product, not just one known join?</td>
+      </tr>
+      <tr>
+        <td>Time-series</td>
+        <td>Time-window ingest, compression, retention, downsampling</td>
+        <td>High-cardinality labels, out-of-order writes, mutable history</td>
+        <td>Are most reads bounded by metric identity and time?</td>
+      </tr>
+      <tr>
+        <td>Search</td>
+        <td>Text relevance, inverted indexes, faceting, tolerant retrieval</td>
+        <td>Refresh lag, reindexing, duplicate source, costly updates</td>
+        <td>Does the user need relevance and linguistic analysis?</td>
+      </tr>
+      <tr>
+        <td>Object</td>
+        <td>Large immutable blobs, streaming, low-cost durable capacity</td>
+        <td>Limited transactional metadata queries and small random updates</td>
+        <td>Is the value a large blob addressed as a whole?</td>
+      </tr>
+      <tr>
+        <td>In-memory</td>
+        <td>Very low latency, counters, ephemeral coordination, cache data</td>
+        <td>Memory cost, eviction, restart semantics, durability trade-offs</td>
+        <td>Can the state be rebuilt, bounded, or independently persisted?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="weighted-score">Use a weighted decision, not a checkbox contest</h3>
+<figure class="code">
+  <figcaption><b>Language-neutral weighted score</b></figcaption>
+  <pre><code>for each candidate:
+  score = 0
+  for each requirement:
+    evidence = benchmark, documentation, prototype, or restore drill
+    rating = 0 if unmet, 1 if risky, 2 if adequate, 3 if strong
+    score += requirement.weight * rating
+
+reject candidate immediately if it fails:
+  a correctness invariant
+  required data residency
+  required RPO or RTO
+  sustainable peak write rate
+  supportable operational model</code></pre>
+</figure>
+
+<p>
+  A high total cannot compensate for a blocking correctness or compliance failure. Store the score,
+  assumptions, evidence, alternatives, and review triggers in an architecture decision record.
+</p>
+
+<h2 id="relational"><span class="num">04.</span> Relational model</h2>
+<p class="lead">
+  The relational model represents facts as relations with declared attributes and integrity
+  constraints, then derives results through relational operations.
+</p>
+
+<p>
+  Rows are not merely objects serialized into tables. A relation describes a set of facts. Primary
+  keys identify facts, foreign keys preserve references, unique constraints prevent duplicates,
+  check constraints restrict valid values, and transactions protect multi-step changes. A query can
+  select, project, join, group, and order without storing a copy for every access path.
+</p>
+
+<h3 id="normalization">Normalization</h3>
+<p>
+  Normalization separates independently changing facts so each is recorded in one authoritative
+  place. In practical terms:
+</p>
+
+<ul>
+  <li>Each field contains one value at the model's chosen granularity.</li>
+  <li>Non-key facts depend on the entity identified by the key.</li>
+  <li>Facts about another entity move to that entity's relation.</li>
+  <li>Many-to-many relationships use an explicit association relation.</li>
+</ul>
+
+<p>
+  Normalization reduces update anomalies. If a customer's current email is copied into ten thousand
+  order rows, changing the email risks mixed values. However, an order may intentionally snapshot
+  the billing address and product price because those are historical order facts, not references to
+  the customer's current profile or catalog price.
+</p>
+
+<h3 id="relational-fit">Choose relational storage when</h3>
+<ul>
+  <li>Constraints and transactions are central to correctness.</li>
+  <li>Entities have meaningful relationships and query shapes evolve.</li>
+  <li>Joins, aggregates, and administrative analysis are important.</li>
+  <li>The scale fits one system or has a clear partitioning strategy.</li>
+  <li>The team values mature query planning, migrations, and recovery tooling.</li>
+</ul>
+
+<div class="warn">
+  <strong>Do not reject relational storage because the data is large</strong>
+  <p>
+    Data size alone does not select a model. Consider working set, write rate, partitionability,
+    index size, query locality, retention, operational limits, and measured performance. Likewise,
+    using a relational store does not make an unbounded join or missing index safe.
+  </p>
+</div>
+
+<h2 id="key-document"><span class="num">05.</span> Key-value and document models</h2>
+
+<h3 id="key-value">Key-value</h3>
+<p>
+  A key-value store exposes a map from an opaque or structured key to a value. Its strongest path is
+  usually <code>get(key)</code>, <code>put(key, value)</code>, conditional update, and bounded range
+  scan when ordered keys are supported. The application encodes relationships and alternate access
+  paths.
+</p>
+
+<figure class="code">
+  <figcaption><b>Structured keyspace for chat</b></figcaption>
+  <pre><code>conversation/{conversation_id}/message/{time_bucket}/{message_id} -&gt; message
+user/{user_id}/conversation/{last_activity}/{conversation_id}     -&gt; summary
+message/{message_id}/dedup/{client_request_id}                     -&gt; accepted_id</code></pre>
+</figure>
+
+<p>
+  Lexicographically ordered keys can make adjacent business data adjacent on storage. The first
+  component often defines locality, so placing an ever-growing conversation under one key range can
+  create a hotspot. Add a stable time bucket or shard component only when measured traffic requires
+  it, and preserve a route that can read the buckets in order.
+</p>
+
+<h3 id="document">Document</h3>
+<p>
+  A document groups named and nested values around an aggregate. Reading an order with its shipping
+  address and line snapshot can take one fetch. The model is strongest when the embedded data is
+  normally read, written, retained, authorized, and versioned together.
+</p>
+
+<p>Embed when the child:</p>
+<ul>
+  <li>belongs to one parent and has no independent identity or write rate,</li>
+  <li>is bounded in count and document size,</li>
+  <li>is normally required with the parent, and</li>
+  <li>shares the parent's transaction and lifecycle.</li>
+</ul>
+
+<p>Reference when the child:</p>
+<ul>
+  <li>is shared, independently updated, high-cardinality, or unbounded,</li>
+  <li>has independent permissions or retention,</li>
+  <li>is queried without the parent, or</li>
+  <li>would make updates rewrite a large document.</li>
+</ul>
+
+<div class="note">
+  <strong>Schema-flexible is not schema-free</strong>
+  <p>
+    Writers still choose field meanings and readers still assume them. Validate documents at
+    ingress, version externally visible formats, reject ambiguous states, and monitor unknown or
+    missing fields. Flexibility is useful for controlled evolution, not for avoiding design.
+  </p>
+</div>
+
+<h2 id="wide-time"><span class="num">06.</span> Wide-column and time-series models</h2>
+
+<h3 id="wide-column">Wide-column</h3>
+<p>
+  A wide-column model commonly groups rows by partition key and orders them by clustering or sort
+  columns. A useful table is designed around one bounded query. Duplication across query tables is
+  deliberate, and each copy needs a reliable update and repair strategy.
+</p>
+
+<figure class="code">
+  <figcaption><b>Query-first model</b></figcaption>
+  <pre><code>Need: latest messages in one conversation before a cursor
+
+partition key = hash(conversation_id, month)
+sort key      = event_time descending, message_id descending
+value         = sender_id, body_ref, edit_version, deletion_state
+
+Query:
+  identify current and previous month buckets
+  scan each bounded range from cursor
+  merge by (event_time, message_id)
+  stop after page_size rows</code></pre>
+</figure>
+
+<p>
+  Partition size must be bounded in bytes and operations, not only row count. A popular
+  conversation, device, or tenant can overwhelm one partition even when the global average is small.
+  Bucketing spreads growth but increases read fan-out and lifecycle complexity.
+</p>
+
+<h3 id="time-series">Time-series</h3>
+<p>
+  Time-series data consists of observations associated with time and an identity such as metric name
+  plus labels. Stores can optimize ordered appends, timestamp compression, time-window scans,
+  retention, and downsampling. They are less natural for frequently mutating old observations or
+  rich cross-entity transactions.
+</p>
+
+<p>
+  Cardinality is the number of distinct series. A label such as <code>region</code> has bounded
+  cardinality. A label containing <code>request_id</code> creates a new series per request and can
+  dominate memory and index cost. Put high-cardinality details in logs or traces and connect them
+  through exemplars or correlation identifiers when supported.
+</p>
+
+<h2 id="graph-search"><span class="num">07.</span> Graph and search models</h2>
+
+<h3 id="graph">Graph</h3>
+<p>
+  A property graph represents nodes, relationships, labels, and properties. An RDF-style graph
+  represents subject-predicate-object statements. Both make connected facts first-class. Graph
+  storage is valuable when queries ask for variable-depth paths, neighborhoods, reachability, or
+  changing relationship patterns.
+</p>
+
+<figure class="code">
+  <figcaption><b>Traversal shape</b></figcaption>
+  <pre><code>START account A
+FOLLOW "controls" or "beneficiary_of" edges up to depth 4
+FILTER edges active at transaction_time
+STOP paths that revisit a node
+RETURN paths reaching any sanctioned entity</code></pre>
+</figure>
+
+<p>
+  A fixed one-hop relationship is often just a relational join or key lookup. A graph becomes
+  compelling when traversal is the primary question. Protect against supernodes, unbounded depth,
+  cycles, expensive fan-out, and authorization leaks across edges. Set path depth, visited-node,
+  time, and result limits.
+</p>
+
+<h3 id="search">Search</h3>
+<p>
+  Search systems transform source text through analysis and build an inverted index. Instead of
+  mapping each document to its words, the index maps a term to the documents and positions where it
+  occurs. Query-time scoring can combine term statistics, fields, filters, recency, and business
+  signals.
+</p>
+
+<figure class="code">
+  <figcaption><b>Indexing and query flow</b></figcaption>
+  <pre><code>Authoritative document
+  -&gt; normalize and validate
+  -&gt; tokenize and analyze fields
+  -&gt; write term postings and stored fields
+  -&gt; publish a searchable segment
+
+User query
+  -&gt; apply compatible analysis
+  -&gt; retrieve posting lists
+  -&gt; intersect filters
+  -&gt; score candidates
+  -&gt; return top K with a source version</code></pre>
+</figure>
+
+<p>
+  Search is normally a derived serving model, not the authority for orders or permissions. Refreshes
+  can lag. Deletes and permission changes need bounded propagation plus query-time enforcement where
+  exposure would be unsafe. Reindexing into a new versioned index allows analyzer and mapping
+  changes without editing every old segment in place.
+</p>
+
+<h2 id="object-memory"><span class="num">08.</span> Object and in-memory storage</h2>
+
+<h3 id="object-storage">Object storage</h3>
+<p>
+  Object storage keeps a blob under a key with limited metadata. It suits images, videos, documents,
+  exports, model artifacts, backups, and archives that are usually streamed as whole objects.
+  Application metadata, relationships, permissions, and workflows often belong in a separate
+  authoritative metadata store.
+</p>
+
+<p>
+  Treat upload as a state machine. Do not publish metadata before the blob is durable, and do not
+  leave completed blobs forever when metadata creation fails. Use checksums, immutable object
+  versions, size and type limits, malware scanning where required, short-lived upload capability,
+  and a reconciler for abandoned staging objects.
+</p>
+
+<h3 id="in-memory">In-memory storage</h3>
+<p>
+  Memory reduces device latency but does not eliminate serialization, networking, locks, garbage
+  collection, replication, or queueing. It is appropriate for caches, bounded session state,
+  counters, rate-control state, and derived indexes when the durability and eviction contract is
+  explicit.
+</p>
+
+<div class="warn">
+  <strong>Ask what happens at restart and eviction</strong>
+  <p>
+    If the answer is "the data is lost," prove that it can be rebuilt and that a cold start will not
+    overload its source. If persistence is enabled, test acknowledgement, replay time, replica loss,
+    and backup behavior instead of assuming memory implies ephemerality or durability.
+  </p>
+</div>
+
+<h2 id="storage-engines"><span class="num">09.</span> Storage-engine internals</h2>
+<p class="lead">
+  The logical model says what can be asked. The storage engine determines how bytes are written,
+  found, rewritten, cached, and recovered.
+</p>
+
+<h3 id="append-log">Append-only logs and write-ahead logging</h3>
+<p>
+  Sequential append is efficient and preserves an ordered history. A write-ahead log, or WAL,
+  records enough change information before modified data pages are considered durable. After a
+  crash, the engine replays committed log records and discards or rolls back incomplete work
+  according to its recovery protocol.
+</p>
+
+<figure class="code">
+  <figcaption><b>Simplified durable write</b></figcaption>
+  <pre><code>BEGIN transaction
+validate constraints and conflicts
+append change records to WAL
+flush required WAL bytes to durable media
+record commit
+ACKNOWLEDGE client
+
+later:
+write dirty pages, compact files, or checkpoint state
+
+after crash:
+load checkpoint
+replay durable committed changes after checkpoint
+restore a consistent state before serving traffic</code></pre>
+</figure>
+
+<p>
+  An acknowledgement can mean accepted into memory, written to one device, replicated to several
+  failure domains, or archived elsewhere. The application must know which. A filesystem call
+  returning does not necessarily prove stable media without the engine's required synchronization
+  protocol.
+</p>
+
+<h3 id="btree">B-trees</h3>
+<p>
+  A B-tree is a balanced, ordered search tree with nodes sized to storage pages. Internal nodes
+  guide searches through key ranges; leaves contain entries or references. High fan-out keeps the
+  tree shallow. Equality, prefix, ordered range, and sorted retrieval are natural operations.
+</p>
+
+<figure class="code">
+  <figcaption><b>Conceptual B-tree lookup</b></figcaption>
+  <pre><code>                 [ 40 | 80 ]
+                /     |      \
+          keys &lt; 40  40..79  keys &gt;= 80
+              |        |          |
+          leaf page  leaf page  leaf page</code></pre>
+</figure>
+
+<p>
+  Inserts may split full pages; deletes may leave reusable space or trigger rebalancing depending on
+  the engine. Random updates can cause scattered I/O and page churn. Cache hit rate, key width, fill
+  policy, page splits, and concurrency affect real performance.
+</p>
+
+<h3 id="lsm">Log-structured merge trees</h3>
+<p>
+  An LSM design commonly appends changes to a log and inserts them into an ordered memory table.
+  When the memory table fills, it becomes an immutable sorted file. Background compaction merges
+  sorted files, keeps newer versions, and eventually removes tombstones or expired data.
+</p>
+
+<figure class="code">
+  <figcaption><b>Simplified LSM lifecycle</b></figcaption>
+  <pre><code>write -&gt; WAL -&gt; mutable memory table
+                    |
+                    | full
+                    v
+              immutable table -&gt; sorted file in L0
+                                      |
+                                      | background compaction
+                                      v
+                           larger sorted files in lower levels
+
+read -&gt; memory tables -&gt; newest candidate files -&gt; older levels
+      use indexes and membership filters to skip impossible files</code></pre>
+</figure>
+
+<p>
+  LSM engines can turn random writes into sequential batches, but reads may inspect several
+  structures and compaction rewrites data. If incoming writes exceed flush and compaction capacity,
+  files accumulate, read cost rises, disk fills, and the engine may stall writers.
+</p>
+
+<h3 id="amplification">Amplification</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Measure</th>
+        <th>Conceptual formula</th>
+        <th>Why it matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Write amplification</td>
+        <td>physical bytes written / logical bytes written</td>
+        <td>Device bandwidth, endurance, compaction CPU, and cost</td>
+      </tr>
+      <tr>
+        <td>Read amplification</td>
+        <td>pages, files, or bytes examined / useful result</td>
+        <td>Latency, cache pressure, and read throughput</td>
+      </tr>
+      <tr>
+        <td>Space amplification</td>
+        <td>physical live footprint / logical live data</td>
+        <td>Capacity, temporary migration space, and failure risk</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  These measures move together. Aggressive compaction may improve reads and reclaim space while
+  increasing physical writes. Tiered compaction can reduce write work while keeping more overlapping
+  runs, increasing read and temporary space costs. Measure on the intended device, data
+  distribution, update rate, compression, and retention policy.
+</p>
+
+<h2 id="indexes"><span class="num">10.</span> Indexes and materialized views</h2>
+<p class="lead">
+  Every index is a maintained copy of selected information, optimized for an access pattern.
+</p>
+
+<h3 id="primary-secondary">Primary and secondary indexes</h3>
+<p>
+  A primary index follows the main record identity or physical ordering. A secondary index maps
+  another field or expression to primary records. In a partitioned system, a local secondary index
+  is colocated with one partition; a global secondary index spans partitions and therefore adds
+  routing, consistency, and recovery work.
+</p>
+
+<p>For each index, record:</p>
+<ul>
+  <li>the exact query it serves and expected selectivity,</li>
+  <li>column or field order and supported range direction,</li>
+  <li>whether it covers the returned fields or requires record lookups,</li>
+  <li>write, storage, cache, replication, and rebuild cost,</li>
+  <li>uniqueness or other correctness meaning, and</li>
+  <li>usage, size, fragmentation, and removal criteria.</li>
+</ul>
+
+<h3 id="compound-index">Compound index order</h3>
+<figure class="code">
+  <figcaption><b>Index derived from a query</b></figcaption>
+  <pre><code>Query:
+  WHERE tenant_id = ?
+    AND customer_id = ?
+    AND created_at &lt; ?
+  ORDER BY created_at DESC, order_id DESC
+  LIMIT 50
+
+Candidate ordered index:
+  (tenant_id, customer_id, created_at DESC, order_id DESC)
+
+Reasoning:
+  equality keys identify a narrow ordered range
+  created_at and order_id provide stable cursor order
+  LIMIT bounds work
+  tenant_id remains explicit for isolation and locality</code></pre>
+</figure>
+
+<p>
+  An index is not useful merely because it contains the filtered fields. Leading fields, predicate
+  type, collation, null handling, sort direction, data distribution, and optimizer statistics all
+  matter. An index on a low-selectivity status may cost more than a scan unless combined with other
+  keys or filtered to active rows.
+</p>
+
+<h3 id="inverted-index">Inverted indexes</h3>
+<p>
+  An inverted index maps terms or contained values to posting lists of matching records. It supports
+  full-text search, array membership, tags, and document-field containment. Posting lists may store
+  frequency, positions, payloads, or skip information. Updating one document can touch many term
+  entries.
+</p>
+
+<h3 id="materialized-views">Materialized views and denormalized projections</h3>
+<p>
+  A materialized view stores a derived result, such as daily tenant revenue, conversation summaries,
+  or search documents. Define:
+</p>
+
+<ul>
+  <li>source-of-truth records and source version,</li>
+  <li>full refresh or incremental update algorithm,</li>
+  <li>freshness and convergence objective,</li>
+  <li>ordering and duplicate behavior during replay,</li>
+  <li>rebuild and cutover procedure, and</li>
+  <li>how readers detect partial or stale results.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Idempotent projection updater</b></figcaption>
+  <pre><code>on event(entity_id, source_version, payload):
+  current = projection.get(entity_id)
+  if current exists and current.source_version &gt;= source_version:
+    acknowledge duplicate or old event
+    return
+
+  next = derive(payload)
+  projection.compare_and_set(
+    entity_id,
+    expected_version = current.source_version,
+    value = next with source_version
+  )</code></pre>
+</figure>
+
+<h2 id="schema-ownership">
+  <span class="num">11.</span> Schema design, denormalization, and ownership
+</h2>
+<p class="lead">
+  Model business facts once at the authority, then create explicit, rebuildable serving shapes for
+  access patterns that need them.
+</p>
+
+<h3 id="identity-keys">Identity and keys</h3>
+<ul>
+  <li>Use stable identifiers that do not embed mutable business facts.</li>
+  <li>Separate an opaque entity ID from a user-visible number when their lifecycles differ.</li>
+  <li>Include tenant identity in authorization and often in locality or uniqueness keys.</li>
+  <li>Use a deterministic tie-breaker with timestamps for stable pagination.</li>
+  <li>Avoid timestamps alone as unique keys because clocks collide and can move backward.</li>
+  <li>Do not place secrets or sensitive meaning in guessable identifiers.</li>
+</ul>
+
+<h3 id="denormalization">Denormalization</h3>
+<p>
+  Denormalization intentionally duplicates data to remove a join, avoid cross-partition work,
+  preserve a historical snapshot, or meet a latency target. It is safe only when ownership and
+  convergence are explicit.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Safe answer</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Which copy is authoritative?</td>
+        <td>Exactly one named source settles disagreement</td>
+      </tr>
+      <tr>
+        <td>How are copies updated?</td>
+        <td>Transactional maintenance or replayable idempotent projection</td>
+      </tr>
+      <tr>
+        <td>How stale may a copy be?</td>
+        <td>A measured bound tied to user and security impact</td>
+      </tr>
+      <tr>
+        <td>How is drift found?</td>
+        <td>Lag metrics, version comparison, and reconciliation scans</td>
+      </tr>
+      <tr>
+        <td>How is it rebuilt?</td>
+        <td>Versioned bulk build plus captured changes and atomic cutover</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="ownership">Data ownership</h3>
+<p>
+  One bounded component should own authoritative mutation rules for an entity. Other components use
+  an API, event, snapshot, or approved read model. A shared table written by several services hides
+  contracts, makes migrations unsafe, and allows one deployment to violate another component's
+  invariants.
+</p>
+
+<h3 id="polyglot">Polyglot persistence</h3>
+<p>
+  Polyglot persistence uses different models for genuinely different access patterns. For example,
+  orders remain authoritative in a transactional relational store, searchable descriptions are
+  projected to a search index, receipts live in object storage, and short-lived catalog results are
+  cached in memory.
+</p>
+
+<p>
+  Each additional store adds credentials, patching, drivers, capacity, backup, monitoring, incident
+  paths, data movement, reconciliation, privacy deletion, and expertise. Start with one capable
+  durable system and add another only when measured requirements justify the operational tax.
+</p>
+
+<h2 id="schema-evolution"><span class="num">12.</span> Schema evolution and online migrations</h2>
+<p class="lead">
+  A migration is a distributed protocol between old code, new code, existing data, replicas,
+  backups, background jobs, and operators.
+</p>
+
+<h3 id="compatibility">Compatibility rules</h3>
+<ul>
+  <li><strong>Backward-compatible reader:</strong> new code can read data written by old code.</li>
+  <li>
+    <strong>Forward-compatible reader:</strong> old code can tolerate data written by new code.
+  </li>
+  <li>
+    <strong>Full compatibility:</strong> both directions work for the supported version window.
+  </li>
+  <li>
+    <strong>Semantic compatibility:</strong> the same field still means the same thing, not merely
+    the same wire type.
+  </li>
+</ul>
+
+<p>
+  Be tolerant of unknown fields when the format contract allows it, but validate required
+  invariants. Never silently reinterpret a unit, time zone, currency, identifier namespace, null, or
+  default. A field rename is usually add, copy, switch, then remove, not an in-place rename across
+  independently deployed consumers.
+</p>
+
+<h3 id="expand-contract">Expand and contract</h3>
+<figure class="code">
+  <figcaption><b>Online change from full_name to structured name</b></figcaption>
+  <pre><code>1. EXPAND
+   add given_name and family_name as optional fields
+   deploy readers that understand old and new representations
+
+2. DUAL WRITE OR DERIVE
+   write new fields for new mutations
+   keep old field while old readers exist
+
+3. BACKFILL
+   process stable key ranges in small resumable batches
+   record progress, rate, errors, and source version
+   do not overwrite a newer concurrent update
+
+4. VERIFY
+   compare counts, samples, checksums, nulls, and business invariants
+
+5. SWITCH READS
+   gradually read new fields with rollback available
+
+6. CONTRACT
+   stop old writes
+   wait past rollback and retention window
+   remove old readers, index, and field in a later release</code></pre>
+</figure>
+
+<h3 id="backfill">Safe backfills</h3>
+<p>
+  A backfill competes with production traffic for I/O, CPU, locks, cache, log bandwidth, and replica
+  apply capacity. Use bounded batches, deterministic key-range checkpoints, rate limits, pause
+  controls, idempotency, retry classification, and lag-aware throttling. Avoid offset pagination on
+  a changing large table; resume from a stable key cursor.
+</p>
+
+<figure class="code">
+  <figcaption><b>Pseudocode: resumable version-aware backfill</b></figcaption>
+  <pre><code>cursor = load_checkpoint(job_id)
+
+while not finished:
+  rows = read_after(cursor, limit = 500)
+  if rows is empty:
+    mark_complete(job_id)
+    break
+
+  for row in rows:
+    derived = transform(row.old_value)
+    update row
+      set new_value = derived
+      where id = row.id
+        and version = row.version
+        and new_value is absent
+
+  cursor = rows.last.id
+  save_checkpoint(job_id, cursor)
+  throttle_using(primary_load, replica_lag, log_rate, error_rate)</code></pre>
+</figure>
+
+<h3 id="typescript-decoder">Small TypeScript boundary decoder</h3>
+<p>
+  The principle is language-neutral: decode untrusted stored or received data at a boundary and turn
+  it into one internal representation. TypeScript's static types alone do not validate runtime JSON.
+</p>
+
+<figure class="code">
+  <figcaption><b>TypeScript: explicit schema-version handling</b></figcaption>
+  <pre><code>type OrderName = { given: string; family: string };
+
+function decodeName(value: unknown): OrderName {
+  if (!value || typeof value !== "object") throw new Error("invalid record");
+  const record = value as Record&lt;string, unknown&gt;;
+
+  if (record.schemaVersion === 2) {
+    if (typeof record.given !== "string" || typeof record.family !== "string") {
+      throw new Error("invalid v2 name");
+    }
+    return { given: record.given, family: record.family };
+  }
+
+  if (record.schemaVersion === 1 &amp;&amp; typeof record.fullName === "string") {
+    const [given, ...rest] = record.fullName.trim().split(/\s+/);
+    return { given: given ?? "", family: rest.join(" ") };
+  }
+
+  throw new Error("unsupported schema version");
+}</code></pre>
+</figure>
+
+<p>
+  Real name parsing is domain-specific and cannot reliably infer family structure from one string.
+  This example demonstrates version control, not a universal human-name algorithm. Preserve original
+  values when a migration could lose meaning, and use domain-approved rules.
+</p>
+
+<h2 id="lifecycle"><span class="num">13.</span> Retention, deletion, archival, and legal hold</h2>
+<p class="lead">
+  Data lifecycle is part of the model. Keeping everything forever increases cost, breach impact,
+  restore time, and compliance risk.
+</p>
+
+<h3 id="classification">Classify data</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Class</th>
+        <th>Example</th>
+        <th>Lifecycle concern</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Authoritative business record</td>
+        <td>Order, payment ledger entry</td>
+        <td>Integrity, audit, statutory retention, restore</td>
+      </tr>
+      <tr>
+        <td>Personal data</td>
+        <td>Email, address, device identifier</td>
+        <td>Purpose limitation, access, erasure, residency</td>
+      </tr>
+      <tr>
+        <td>Derived serving data</td>
+        <td>Search index, recommendation feature</td>
+        <td>Rebuild, staleness, deletion propagation</td>
+      </tr>
+      <tr>
+        <td>Telemetry</td>
+        <td>Metrics, logs, traces</td>
+        <td>Cardinality, redaction, short retention</td>
+      </tr>
+      <tr>
+        <td>Ephemeral state</td>
+        <td>Cache entry, upload reservation</td>
+        <td>TTL, cleanup, restart behavior</td>
+      </tr>
+      <tr>
+        <td>Backup or archive</td>
+        <td>Snapshot, immutable export</td>
+        <td>Encryption, access, expiry, restoration, legal hold</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="delete-semantics">Deletion is a workflow</h3>
+<p>
+  A soft delete marks a record hidden and preserves recovery or audit history. A hard delete removes
+  it from active storage. Neither automatically removes replicas, indexes, caches, change logs,
+  object versions, analytics, exports, or backups.
+</p>
+
+<figure class="code">
+  <figcaption><b>Privacy erasure flow</b></figcaption>
+  <pre><code>authorized erasure request
+  -&gt; place subject on deletion ledger
+  -&gt; block new processing where required
+  -&gt; delete or irreversibly anonymize authoritative records
+  -&gt; publish idempotent deletion event
+  -&gt; purge indexes, caches, features, objects, and derived tables
+  -&gt; verify every registered data sink
+  -&gt; record completion evidence without retaining erased content
+
+backup policy:
+  expire backups on a documented schedule
+  prevent deleted data from returning to active use after restore
+  replay the deletion ledger before reopening restored service</code></pre>
+</figure>
+
+<p>
+  Legal hold can override ordinary expiry for a defined scope. It must be authorized, auditable,
+  reversible, and narrow. Avoid one global flag that silently retains unrelated tenants or data
+  classes.
+</p>
+
+<h3 id="archival">Archival</h3>
+<p>
+  Move cold data only after defining how it is found, authorized, restored, and deleted. Archive
+  formats should be self-describing, checksummed, versioned, encrypted, and independent enough to be
+  read after the serving schema changes. Maintain a small searchable catalog with object location,
+  time range, schema version, checksum, encryption key reference, and retention status.
+</p>
+
+<h2 id="durability-recovery">
+  <span class="num">14.</span> Durability, backup, restore, and disaster recovery
+</h2>
+<p class="lead">
+  Replication keeps service running through some failures. Backups recover earlier state after
+  corruption, deletion, ransomware, software defects, or correlated replica damage.
+</p>
+
+<h3 id="backup-types">Backup choices</h3>
+<ul>
+  <li>
+    <strong>Logical backup:</strong> exports records and schema in a portable logical form. It can
+    support selective restore but may be slower for very large systems.
+  </li>
+  <li>
+    <strong>Physical backup:</strong> copies engine files in a recovery-safe way. It is often faster
+    for full restore but tied to engine format and recovery protocol.
+  </li>
+  <li>
+    <strong>Snapshot:</strong> captures storage state at a point. Application consistency depends on
+    coordination with the engine and other stores.
+  </li>
+  <li>
+    <strong>Continuous log archive:</strong> retains change logs after a base backup, enabling
+    point-in-time recovery when the sequence is complete.
+  </li>
+</ul>
+
+<h3 id="backup-plan">A complete backup contract</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Required evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>What is protected?</td>
+        <td>Data, schema, configuration, keys, object manifests, and dependencies inventoried</td>
+      </tr>
+      <tr>
+        <td>How much may be lost?</td>
+        <td>RPO mapped to snapshot and log-archive cadence</td>
+      </tr>
+      <tr>
+        <td>How quickly must it return?</td>
+        <td>Timed restore meets RTO at production data size</td>
+      </tr>
+      <tr>
+        <td>Can an attacker erase it?</td>
+        <td>Separated credentials, immutability, deletion controls, and audit</td>
+      </tr>
+      <tr>
+        <td>Is it complete and readable?</td>
+        <td>Checksums, manifests, automated verification, and application queries</td>
+      </tr>
+      <tr>
+        <td>Can privacy expiry happen?</td>
+        <td>Documented expiration and post-restore deletion replay</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Restore drills must start from the same artifacts available during a real disaster. Build a new
+  isolated environment, retrieve keys through the recovery process, restore the data, replay logs to
+  a target, run integrity and business checks, measure time, and document every manual dependency. A
+  dashboard saying backups succeeded is not a restore test.
+</p>
+
+<h3 id="multi-store-recovery">Multi-store recovery</h3>
+<p>
+  If one workflow spans several stores, independent snapshots taken at different times can produce
+  an impossible combination. Prefer one authority plus rebuildable projections. Otherwise capture a
+  consistent logical recovery marker, retain replayable events, and define the order for restoring
+  and reconciling components.
+</p>
+
+<h2 id="security"><span class="num">15.</span> Security, privacy, multi-tenancy, and locality</h2>
+<p class="lead">
+  The storage boundary contains high-value state. Authentication is only the first control.
+</p>
+
+<h3 id="encryption">Encryption and key management</h3>
+<ul>
+  <li>
+    Use authenticated encryption for protected data at rest and authenticated transport in transit.
+  </li>
+  <li>Keep encryption keys separate from encrypted data and restrict key-use permissions.</li>
+  <li>Rotate keys through versioned key references and background re-encryption where required.</li>
+  <li>Back up key metadata and test recovery without exposing raw key material.</li>
+  <li>Do not log plaintext values, queries, bind parameters, or object keys containing secrets.</li>
+  <li>
+    Understand leakage that encryption does not hide, including size, timing, access frequency, and
+    some indexes.
+  </li>
+</ul>
+
+<h3 id="tenant-models">Multi-tenant placement models</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Benefits</th>
+        <th>Risks and controls</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Shared tables with tenant key</td>
+        <td>Efficient pooling, simple fleet</td>
+        <td>Missing predicate can leak data; enforce policy, compound keys, and tests</td>
+      </tr>
+      <tr>
+        <td>Schema or namespace per tenant</td>
+        <td>Stronger logical separation, tenant restore options</td>
+        <td>Migration fan-out and catalog scale</td>
+      </tr>
+      <tr>
+        <td>Database or cluster per tenant</td>
+        <td>Strong isolation, custom residency and lifecycle</td>
+        <td>Higher idle cost, fleet automation, connection and version sprawl</td>
+      </tr>
+      <tr>
+        <td>Hybrid tiers</td>
+        <td>Pool small tenants, isolate large or regulated tenants</td>
+        <td>Placement control plane and safe online tenant movement</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Carry tenant identity from authenticated principal to every query, key, index, cache, event, log,
+  export, and backup authorization decision. Prefer database-enforced row or namespace policies as
+  defense in depth, while testing privileged roles and administrative paths that may bypass them.
+  Rate and capacity controls must also be tenant-aware to prevent one noisy tenant from consuming
+  shared connections, I/O, memory, or compaction bandwidth.
+</p>
+
+<h3 id="locality">Data locality and residency</h3>
+<p>
+  Locality means placing data near the compute and other data used with it. Good locality reduces
+  latency and network cost. Residency is a policy constraint about where data may be stored or
+  processed. They overlap but are not identical.
+</p>
+
+<p>
+  Map authoritative records, replicas, logs, backups, indexes, support access, and analytics flows.
+  A record stored in the correct region can still violate policy if its search index, backup, or
+  telemetry leaves the boundary. Keep a placement registry and make movement an audited workflow
+  with source cleanup and rollback.
+</p>
+
+<h2 id="performance"><span class="num">16.</span> Performance, capacity, and cost</h2>
+<p class="lead">
+  Capacity planning includes logical data, physical amplification, working set, background work,
+  failure headroom, and recovery space.
+</p>
+
+<h3 id="capacity-formulas">Useful estimates</h3>
+<figure class="code">
+  <figcaption><b>Storage and I/O model</b></figcaption>
+  <pre><code>logical_data =
+  records * average_encoded_record_bytes
+
+live_primary_footprint =
+  logical_data
+  + primary_index_bytes
+  + secondary_index_bytes
+  + row_or_document_overhead
+
+steady_physical_footprint =
+  live_primary_footprint
+  * replica_count
+  * observed_space_amplification
+
+provisioned_capacity =
+  steady_physical_footprint
+  + retained_logs
+  + compaction_or_migration_temporary_space
+  + restore_workspace
+  + growth_and_failure_headroom
+
+physical_write_bandwidth =
+  logical_write_bandwidth
+  * observed_write_amplification
+  * replica_factor</code></pre>
+</figure>
+
+<p>
+  Backups are budgeted separately because retention can multiply storage. Cross-region replication,
+  egress, requests, provisioned IOPS, memory, licenses, and operator time can dominate raw capacity.
+  Estimate cost per useful unit such as one million writes, one retained tenant-month, one search
+  query, or one restored terabyte.
+</p>
+
+<h3 id="working-set">Working set and cache</h3>
+<p>
+  The working set is the data and index pages needed in the important time window. A 20 TB database
+  with a 50 GB hot set may perform well with 100 GB of cache, while a 500 GB database with uniform
+  random reads may be device-bound. Measure page-cache and block-cache hit rate, but also miss
+  latency and the cost of refilling after restart.
+</p>
+
+<h3 id="latency-budget">Latency budget</h3>
+<figure class="code">
+  <figcaption><b>Read-path budget</b></figcaption>
+  <pre><code>client to service network          20 ms
+queue and connection acquisition    8 ms
+storage network                     5 ms
+index traversal                    12 ms
+record fetch                       20 ms
+decode and authorization            5 ms
+service to client network          20 ms
+----------------------------------------
+planned p99 budget                 90 ms
+objective                         120 ms
+remaining uncertainty/headroom     30 ms</code></pre>
+</figure>
+
+<p>
+  Measure p50, p95, p99, and maximum over a stated window. Segment by operation, tenant class,
+  partition, cache state, object size, and result count. A good global p99 can hide one consistently
+  failing partition or tenant.
+</p>
+
+<h3 id="hotspots">Hotspots and skew</h3>
+<ul>
+  <li>Monotonically increasing leading keys can direct writes to one range.</li>
+  <li>A celebrity account, large tenant, or active conversation can dominate one partition.</li>
+  <li>Low-cardinality indexes can concentrate updates on a few pages or posting lists.</li>
+  <li>A scheduled expiry or backfill can create a synchronized deletion and compaction storm.</li>
+  <li>A popular large object can consume bandwidth even when request rate looks small.</li>
+</ul>
+
+<p>
+  Track the top partitions and tenants, not only averages. Mitigations include better key
+  distribution, bounded buckets, admission control, caching, precomputation, isolation, and
+  workload-specific placement. Every extra bucket adds fan-out and reassembly cost.
+</p>
+
+<h2 id="orders-design"><span class="num">17.</span> Domain design: orders</h2>
+<p class="lead">
+  Orders favor strong invariants and historical truth, with separate projections for search and
+  analytics.
+</p>
+
+<h3 id="orders-assumptions">Assumptions</h3>
+<ul>
+  <li>5,000 orders per second at peak and a ten-times larger read peak.</li>
+  <li>Order creation updates order header, lines, totals, and an idempotency record atomically.</li>
+  <li>Payment and inventory are separate domains with their own authoritative state.</li>
+  <li>Seven-year retention, immutable financial history, and tenant isolation are required.</li>
+  <li>
+    Customers list recent orders; support looks up by order number; analytics may lag minutes.
+  </li>
+</ul>
+
+<h3 id="orders-model">Authoritative relational model</h3>
+<figure class="code">
+  <figcaption><b>Core relations</b></figcaption>
+  <pre><code>orders(
+  tenant_id, order_id, display_number, customer_id,
+  status, currency, subtotal, tax, shipping, total,
+  shipping_address_snapshot, created_at, version
+)
+primary key (tenant_id, order_id)
+unique (tenant_id, display_number)
+
+order_lines(
+  tenant_id, order_id, line_number,
+  product_id, product_name_snapshot, unit_price_snapshot,
+  quantity, line_total
+)
+primary key (tenant_id, order_id, line_number)
+foreign key (tenant_id, order_id) references orders
+
+order_requests(
+  tenant_id, idempotency_key, request_hash, order_id, outcome
+)
+unique (tenant_id, idempotency_key)</code></pre>
+</figure>
+
+<p>
+  Product name and price are intentional snapshots because an accepted order must not change when
+  the catalog changes. Customer identity remains a reference because ownership persists. The
+  shipping address can be encrypted at field or record level according to classification and
+  retention policy.
+</p>
+
+<h3 id="orders-access">Indexes and flows</h3>
+<ul>
+  <li>Recent history: <code>(tenant_id, customer_id, created_at DESC, order_id DESC)</code>.</li>
+  <li>Support lookup: unique <code>(tenant_id, display_number)</code>.</li>
+  <li>
+    Fulfillment work: a narrow projection or filtered access path by fulfillment state and stable
+    claim cursor, not repeated scans of every order.
+  </li>
+  <li>
+    Analytics: replayable order events or change capture into a columnar or aggregate serving model.
+  </li>
+  <li>
+    Search: a derived index containing permitted order fields and the authoritative source version.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Order creation transaction</b></figcaption>
+  <pre><code>BEGIN
+  existing = find request by (tenant_id, idempotency_key)
+  if existing:
+    require existing.request_hash == hash(normalized_request)
+    return existing.outcome
+
+  validate money using exact decimal or integer minor units
+  calculate totals from accepted line snapshots
+  insert order and lines
+  insert idempotency record
+  append durable order-created record in the same atomic boundary
+COMMIT
+
+asynchronously:
+  publish durable record
+  update search, analytics, and customer-history projections idempotently</code></pre>
+</figure>
+
+<p>
+  If one relational deployment meets scale and failure requirements, it minimizes correctness and
+  operational risk. Partition later by tenant or stable order identity when measured contention,
+  capacity, or locality demands it. Cross-partition uniqueness for display numbers then needs a
+  tenant-local allocation rule.
+</p>
+
+<h2 id="chat-design"><span class="num">18.</span> Domain design: chat messages</h2>
+<p class="lead">
+  Chat favors append-heavy, conversation-local ordered reads, but edits, deletion, moderation, and
+  membership still need explicit models.
+</p>
+
+<h3 id="chat-assumptions">Assumptions</h3>
+<ul>
+  <li>100,000 messages per second at peak across many conversations.</li>
+  <li>Ordering is required within one conversation, not globally.</li>
+  <li>Most reads request the latest 50 messages or page backward from a cursor.</li>
+  <li>Messages are retained one year unless policy or legal hold changes the lifecycle.</li>
+  <li>Large attachments live in object storage; message rows hold verified references.</li>
+</ul>
+
+<h3 id="chat-model">Partition-local ordered model</h3>
+<figure class="code">
+  <figcaption><b>Message serving table</b></figcaption>
+  <pre><code>partition key:
+  (tenant_id, conversation_id, time_bucket)
+
+sort key:
+  (message_sequence_or_time, message_id)
+
+value:
+  sender_id
+  body_or_body_reference
+  created_at
+  edit_version
+  deleted_at
+  reply_to_message_id
+  moderation_state
+  schema_version</code></pre>
+</figure>
+
+<p>
+  A conversation sequencer can assign monotonic local sequence numbers, but it becomes part of the
+  write path and failure model. A time-sortable unique ID reduces coordination but gives only the
+  ordering promised by its generator and clock assumptions. The API should define a stable order and
+  tie-breaker rather than promise a universal notion of simultaneous message time.
+</p>
+
+<h3 id="chat-failures">Edits, duplicates, and deletion</h3>
+<ul>
+  <li>Client-generated request IDs deduplicate retries after ambiguous timeouts.</li>
+  <li>Edits use a version condition so concurrent updates do not silently overwrite each other.</li>
+  <li>
+    Deletion becomes a tombstone immediately in serving views, then physical cleanup follows policy.
+  </li>
+  <li>Membership and authorization are checked independently of message storage.</li>
+  <li>
+    A rebuilt conversation view replays immutable message events and latest edit or delete versions.
+  </li>
+  <li>
+    Time buckets prevent unbounded partitions; pagination merges only the few adjacent buckets
+    needed.
+  </li>
+</ul>
+
+<p>
+  Search is a derived index scoped by tenant and conversation access. Membership revocation should
+  not wait only for eventual index removal. Enforce current authorization at the query or result
+  boundary and measure revocation propagation.
+</p>
+
+<h2 id="search-design"><span class="num">19.</span> Domain design: searchable documents</h2>
+<p class="lead">
+  Search documents are versioned projections built for retrieval, ranking, filters, and safe
+  rebuilds.
+</p>
+
+<h3 id="search-assumptions">Assumptions</h3>
+<ul>
+  <li>
+    200 million content documents, 2,000 source updates per second, and 20,000 searches per second.
+  </li>
+  <li>Results filter by tenant, visibility, language, type, and publication state.</li>
+  <li>Text changes should become searchable within 30 seconds.</li>
+  <li>Permission revocation has a stricter exposure objective than ordinary content freshness.</li>
+  <li>
+    The authoritative content store remains the source for complete records and conflict decisions.
+  </li>
+</ul>
+
+<h3 id="search-document">Projection shape</h3>
+<figure class="code">
+  <figcaption><b>Search document</b></figcaption>
+  <pre><code>{
+  "tenantId": "...",
+  "documentId": "...",
+  "sourceVersion": 42,
+  "title": "...",
+  "body": "...",
+  "language": "en",
+  "contentType": "article",
+  "visibilityScopeIds": ["..."],
+  "publishedAt": "...",
+  "deleted": false
+}</code></pre>
+</figure>
+
+<p>
+  Analyze language-specific text fields separately. Keep exact filter fields un-analyzed. Treat
+  source version as a monotonic guard so replayed old updates cannot resurrect deleted or outdated
+  documents. Limit visibility lists or use another permission filter design when groups are
+  unbounded.
+</p>
+
+<h3 id="reindex">Zero-downtime reindex</h3>
+<figure class="code">
+  <figcaption><b>Versioned rebuild</b></figcaption>
+  <pre><code>create index_v2 with new mapping and analyzer
+record source change position P0
+bulk index a consistent source snapshot into index_v2
+replay source changes after P0 using source-version guards
+compare counts, samples, permissions, and representative queries
+dual query a small shadow sample and compare quality and latency
+atomically switch read alias from index_v1 to index_v2
+monitor and keep rollback window
+retire index_v1 after approval</code></pre>
+</figure>
+
+<p>
+  Search relevance tests need judged query-result pairs, not only latency. Operational tests must
+  also cover malformed documents, hot terms, large posting lists, segment merges, node loss, refresh
+  lag, and full rebuild time.
+</p>
+
+<h2 id="metrics-design"><span class="num">20.</span> Domain design: time-series metrics</h2>
+<p class="lead">
+  Metrics storage is optimized for append, time-window retrieval, aggregation, and expiration, with
+  strict controls on series cardinality.
+</p>
+
+<h3 id="metrics-assumptions">Assumptions</h3>
+<ul>
+  <li>Two million active series and 500,000 samples per second.</li>
+  <li>Raw samples stay online for 15 days; 5-minute aggregates stay 13 months.</li>
+  <li>
+    Most queries cover one hour to seven days and aggregate by service, region, or status class.
+  </li>
+  <li>Samples can arrive five minutes late; older corrections are exceptional.</li>
+  <li>
+    Monitoring data is operationally important but must not contain secrets or user identifiers.
+  </li>
+</ul>
+
+<h3 id="metrics-model">Series and chunks</h3>
+<figure class="code">
+  <figcaption><b>Logical series identity</b></figcaption>
+  <pre><code>series_id = canonical_hash(
+  metric_name,
+  sorted bounded labels:
+    service, region, environment, method, status_class
+)
+
+samples:
+  (series_id, timestamp, numeric_value)
+
+avoid labels:
+  request_id, session_id, raw_url, email, stack_trace, random_value</code></pre>
+</figure>
+
+<p>
+  Group consecutive samples into immutable or mostly immutable time chunks. Compress timestamps and
+  values, maintain a label-to-series index, and partition retention by time so expiration drops
+  whole chunks instead of deleting individual samples. Downsampling jobs write versioned aggregates
+  and track completeness per interval.
+</p>
+
+<h3 id="metrics-capacity">Capacity sketch</h3>
+<figure class="code">
+  <figcaption><b>Raw logical volume</b></figcaption>
+  <pre><code>500,000 samples/s * 86,400 s/day = 43.2 billion samples/day
+
+At an observed compressed 2 bytes/sample:
+86.4 GB/day of sample payload
+
+Add:
+series and label indexes
+chunk metadata
+replication
+write-ahead logs
+compaction and merge space
+downsampled series
+backup or recovery policy
+failure and growth headroom</code></pre>
+</figure>
+
+<p>
+  The two-byte number is an assumption that must be benchmarked with real series continuity and
+  values. Short-lived series, sparse samples, labels, and metadata can make actual bytes per sample
+  much larger.
+</p>
+
+<h2 id="file-design"><span class="num">21.</span> Domain design: file metadata and blobs</h2>
+<p class="lead">
+  Separate large immutable content from transactional metadata while joining them through a
+  checksummed state machine.
+</p>
+
+<h3 id="file-assumptions">Assumptions</h3>
+<ul>
+  <li>Files can be 1 KB to 20 GB and are uploaded directly to object storage.</li>
+  <li>Users list folders, inspect versions, share files, and delete or restore within 30 days.</li>
+  <li>Malware scanning must finish before a file becomes downloadable to others.</li>
+  <li>Metadata changes need strong tenant, parent-folder, quota, and permission checks.</li>
+  <li>Content retention, legal hold, and regional residency vary by tenant policy.</li>
+</ul>
+
+<h3 id="file-metadata-model">Metadata authority</h3>
+<figure class="code">
+  <figcaption><b>Core metadata</b></figcaption>
+  <pre><code>files(
+  tenant_id, file_id, parent_id, current_version_id,
+  name, normalized_name, owner_id, lifecycle_state,
+  created_at, deleted_at, version
+)
+
+file_versions(
+  tenant_id, file_id, version_id,
+  object_key, object_version, byte_size, content_type,
+  cryptographic_checksum, scan_state, encryption_key_ref,
+  created_by, created_at
+)
+
+upload_sessions(
+  tenant_id, upload_id, file_id, expected_size,
+  expected_checksum, expires_at, state
+)</code></pre>
+</figure>
+
+<h3 id="upload-flow">Upload state machine</h3>
+<figure class="code">
+  <figcaption><b>Safe publish flow</b></figcaption>
+  <pre><code>INITIATED
+  -&gt; client receives narrow, expiring upload capability
+UPLOADING
+  -&gt; object storage accepts bytes
+UPLOADED
+  -&gt; service verifies size, checksum, and object ownership
+SCANNING
+  -&gt; asynchronous security inspection
+READY
+  -&gt; metadata transaction points current_version_id at safe object
+
+Failure paths:
+  expired or invalid upload -&gt; ABANDONED -&gt; object cleanup
+  checksum mismatch         -&gt; REJECTED  -&gt; object quarantine or cleanup
+  malware detected          -&gt; QUARANTINED, never publicly downloadable</code></pre>
+</figure>
+
+<p>
+  The object key should be opaque and non-authorizing. Every download verifies current metadata and
+  permissions before issuing a short-lived, least-privilege retrieval capability. A background
+  reconciler compares upload sessions, metadata, and object inventory to find orphaned objects and
+  broken references. It uses age thresholds so it does not delete an upload still in progress.
+</p>
+
+<h2 id="production"><span class="num">22.</span> Production architecture and operations</h2>
+<p class="lead">
+  Operability is a storage requirement. A model that cannot be deployed, observed, repaired, and
+  restored safely is not production-ready.
+</p>
+
+<h3 id="deployment-shape">Deployment questions</h3>
+<ul>
+  <li>Which process, host, rack, zone, region, credential, and control plane can fail together?</li>
+  <li>Where do authoritative data, replicas, logs, backups, indexes, and encryption keys live?</li>
+  <li>Can remaining replicas carry peak traffic during maintenance or a failure?</li>
+  <li>How are schema and software changes kept compatible during a rolling deployment?</li>
+  <li>How are connections drained, writes fenced, and clients redirected during failover?</li>
+  <li>Which operation is automatic, and which requires an authorized human decision?</li>
+  <li>How long do restart, cache warming, replica catch-up, reindex, and full restore take?</li>
+</ul>
+
+<h3 id="storage-observability">Observability</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal group</th>
+        <th>Examples</th>
+        <th>Question answered</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Demand</td>
+        <td>Reads, writes, scans, result rows, bytes, batch size by operation</td>
+        <td>What useful work is requested?</td>
+      </tr>
+      <tr>
+        <td>Latency</td>
+        <td>p50/p95/p99 by operation, tenant tier, partition, and cache state</td>
+        <td>Which users and paths are slow?</td>
+      </tr>
+      <tr>
+        <td>Errors</td>
+        <td>Timeouts, conflicts, constraint failures, corruption, rejected writes</td>
+        <td>Is correctness or availability degrading?</td>
+      </tr>
+      <tr>
+        <td>Saturation</td>
+        <td>CPU, memory, IOPS, queue time, connections, locks, disk and network</td>
+        <td>Which constrained resource is near its useful limit?</td>
+      </tr>
+      <tr>
+        <td>Engine health</td>
+        <td>Cache hit, page reads, WAL rate, checkpoint time, compaction debt, stalls</td>
+        <td>Is background machinery keeping up?</td>
+      </tr>
+      <tr>
+        <td>Distribution</td>
+        <td>Largest partitions, top tenants, key skew, series cardinality</td>
+        <td>Do averages hide hotspots?</td>
+      </tr>
+      <tr>
+        <td>Replication</td>
+        <td>Lag in bytes and time, apply rate, quorum health, replica state</td>
+        <td>Can failover and read freshness meet the contract?</td>
+      </tr>
+      <tr>
+        <td>Lifecycle</td>
+        <td>Expired bytes, tombstones, archive lag, deletion backlog, legal holds</td>
+        <td>Is retention actually enforced?</td>
+      </tr>
+      <tr>
+        <td>Recovery</td>
+        <td>Backup age, missing log segments, restore duration, verification outcome</td>
+        <td>Can the system recover within RPO and RTO?</td>
+      </tr>
+      <tr>
+        <td>Derived views</td>
+        <td>Consumer lag, source-version gap, reconciliation mismatches</td>
+        <td>Are projections converging?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Avoid placing raw SQL, document bodies, personal identifiers, or secrets in telemetry. Prefer
+  normalized operation names, query fingerprints, bounded error codes, tenant tier, and hashed or
+  sampled diagnostic identifiers under controlled access.
+</p>
+
+<h3 id="alerting">Alert on user risk and exhausted margin</h3>
+<p>
+  High CPU by itself may be healthy utilization. Alert when latency or error objectives burn too
+  quickly, free space will cross a safety threshold before response time, compaction debt grows
+  without recovery, replication lag threatens failover or freshness, backup age exceeds RPO, or a
+  restore verification fails. Every page needs an owner, impact statement, dashboard, and runbook.
+</p>
+
+<h3 id="runbooks">Minimum runbooks</h3>
+<ul>
+  <li>Disk or object-capacity exhaustion and safe emergency reclamation.</li>
+  <li>Slow query, lock contention, hotspot, and connection-pool exhaustion.</li>
+  <li>Replica lag, failed replica, unsafe failover, and split-brain prevention.</li>
+  <li>Compaction backlog or write stall.</li>
+  <li>Corruption detection and isolation.</li>
+  <li>Expired credential or encryption-key access failure.</li>
+  <li>Bad schema migration and feature rollback.</li>
+  <li>Point-in-time restore and post-restore reconciliation.</li>
+  <li>Privacy deletion backlog and unauthorized-access investigation.</li>
+</ul>
+
+<h2 id="failures"><span class="num">23.</span> Failure mechanics, edge cases, and corrections</h2>
+<p class="lead">
+  Storage failures are often ambiguous: the client does not know whether a timed-out write
+  committed, and operators do not know whether a replica contains the latest safe state.
+</p>
+
+<h3 id="failure-matrix">Failure matrix</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Unsafe reaction</th>
+        <th>Safer design</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Write times out after send</td>
+        <td>Retry as a new mutation</td>
+        <td>Use idempotency key, read outcome, and preserve request hash</td>
+      </tr>
+      <tr>
+        <td>Replica is behind</td>
+        <td>Assume a missing read means no record exists</td>
+        <td>Route correctness-critical read to suitable consistency or primary path</td>
+      </tr>
+      <tr>
+        <td>Index update lags</td>
+        <td>Use search result as authorization truth</td>
+        <td>Recheck current permission and source state</td>
+      </tr>
+      <tr>
+        <td>Disk approaches full</td>
+        <td>Start a large compaction or rebuild blindly</td>
+        <td>Throttle writes, preserve emergency space, add capacity, follow tested runbook</td>
+      </tr>
+      <tr>
+        <td>Migration worker crashes</td>
+        <td>Restart from row zero</td>
+        <td>Resume stable cursor with idempotent version-aware writes</td>
+      </tr>
+      <tr>
+        <td>Backup succeeds but key is lost</td>
+        <td>Count backup as recoverable</td>
+        <td>Recover keys through separate tested control and perform restore drill</td>
+      </tr>
+      <tr>
+        <td>TTL expires data during legal hold</td>
+        <td>Rely on a generic per-record TTL</td>
+        <td>Resolve policy before expiry and make hold override explicit and audited</td>
+      </tr>
+      <tr>
+        <td>Object uploaded, metadata write fails</td>
+        <td>Ignore orphan forever</td>
+        <td>Reconcile staged objects after a safe grace period</td>
+      </tr>
+      <tr>
+        <td>Restore reintroduces deleted user</td>
+        <td>Open service immediately after data restore</td>
+        <td>Replay deletion ledger and verify privacy sinks first</td>
+      </tr>
+      <tr>
+        <td>One tenant becomes hot</td>
+        <td>Scale the entire fleet without diagnosis</td>
+        <td>Apply tenant-aware limits, isolate or repartition measured hotspot</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="common-mistakes">Common mistakes</h3>
+<ul>
+  <li>
+    <strong>Choose by category slogan.</strong> Correct by writing access-pattern cards, invariants,
+    failure promises, and benchmarks first.
+  </li>
+  <li>
+    <strong>Index every field.</strong> Correct by tying each index to a measured query and charging
+    its write, storage, cache, and rebuild cost.
+  </li>
+  <li>
+    <strong>Use a document as an unbounded container.</strong> Correct by moving independently
+    changing or unbounded children into separately keyed records.
+  </li>
+  <li>
+    <strong>Normalize or denormalize dogmatically.</strong> Correct by preserving authoritative
+    facts and adding deliberate serving projections with repair paths.
+  </li>
+  <li>
+    <strong>Treat a replica as a backup.</strong> Correct by keeping independently protected,
+    versioned backups and practicing restore.
+  </li>
+  <li>
+    <strong>Dual-write without a protocol.</strong> Correct by committing one authority and a
+    durable change record atomically, then updating projections idempotently.
+  </li>
+  <li>
+    <strong>Use offset pagination at large scale.</strong> Correct with stable keyset cursors that
+    match the ordered index and include a unique tie-breaker.
+  </li>
+  <li>
+    <strong>Assume a TTL is precise deletion.</strong> Correct by learning enforcement timing,
+    tombstone behavior, backup retention, and verification needs.
+  </li>
+  <li>
+    <strong>Hide tenant identity in application context only.</strong> Correct by including it in
+    keys, policies, queries, caches, observability, and defense-in-depth tests.
+  </li>
+  <li>
+    <strong>Run an unlimited backfill.</strong> Correct with bounded batches, checkpoints,
+    load-aware throttling, pause controls, and verification.
+  </li>
+</ul>
+
+<h3 id="troubleshooting-flow">Troubleshooting slow storage</h3>
+<figure class="code">
+  <figcaption><b>Evidence-first flow</b></figcaption>
+  <pre><code>Confirm user impact and affected operation
+  |
+  +-&gt; Did demand, payload, result size, or tenant skew change?
+  |
+  +-&gt; Is time spent waiting for pool, lock, queue, network, or storage?
+  |
+  +-&gt; Did the plan or access path change?
+  |      inspect query fingerprint, plan, statistics, and scanned/returned ratio
+  |
+  +-&gt; Is cache cold or memory pressured?
+  |
+  +-&gt; Is device, WAL, checkpoint, compaction, or replication saturated?
+  |
+  +-&gt; Did deployment, migration, backup, expiry, or reindex add background work?
+  |
+  v
+Mitigate the named bottleneck, preserve evidence, verify recovery,
+and add a prevention or earlier-detection action</code></pre>
+</figure>
+
+<h2 id="testing"><span class="num">24.</span> Testing strategy</h2>
+<p class="lead">
+  Tests should prove business invariants, access performance, failure behavior, compatibility,
+  lifecycle, and recovery at realistic scale.
+</p>
+
+<h3 id="unit-property">Unit and property tests</h3>
+<ul>
+  <li>Key encoding preserves uniqueness, ordering, escaping, and round-trip decoding.</li>
+  <li>Money, timestamps, nulls, defaults, and schema versions preserve domain meaning.</li>
+  <li>State machines reject invalid transitions and accept idempotent repeats.</li>
+  <li>Projection updates ignore old versions and converge under duplicates and reordering.</li>
+  <li>Retention and authorization policy produce the expected decision for generated cases.</li>
+</ul>
+
+<h3 id="integration-contract">Integration and contract tests</h3>
+<ul>
+  <li>Run against the real engine version and relevant durability configuration.</li>
+  <li>
+    Verify transactions, uniqueness, foreign references, conditional writes, and isolation
+    assumptions.
+  </li>
+  <li>
+    Explain and assert important query plans, scanned rows, and index use with representative
+    distributions.
+  </li>
+  <li>
+    Test old reader/new writer and new reader/old writer combinations across the rollout window.
+  </li>
+  <li>
+    Verify tenant isolation through ordinary, privileged, export, search, cache, and backup paths.
+  </li>
+</ul>
+
+<h3 id="load-test">Load, stress, and soak tests</h3>
+<p>
+  Generate the operation mix, payload sizes, hot-key skew, cardinality, retention churn, and
+  concurrency expected in production. Run cold-cache and warm-cache cases. Include replica traffic,
+  backups, compaction, backfill, expiry, and reindex work. A test that preloads uniform tiny records
+  and sends only point reads is not evidence for a skewed mixed workload.
+</p>
+
+<ul>
+  <li>
+    <strong>Load test:</strong> prove latency and throughput at planned normal and failure peaks.
+  </li>
+  <li>
+    <strong>Stress test:</strong> pass saturation and observe controlled rejection, recovery, and no
+    invariant loss.
+  </li>
+  <li>
+    <strong>Soak test:</strong> expose leaks, fragmentation, compaction debt, tombstone buildup, and
+    slow replication drift.
+  </li>
+  <li>
+    <strong>Capacity test:</strong> repeat with production-shaped data and index sizes, not an empty
+    store.
+  </li>
+</ul>
+
+<h3 id="fault-recovery-test">Fault and recovery tests</h3>
+<ul>
+  <li>Kill a process before and after commit acknowledgement and verify retry outcomes.</li>
+  <li>
+    Lose a replica, delay a network path, exhaust a connection pool, and inject device latency.
+  </li>
+  <li>Pause compaction or change consumption and observe bounded backlog plus recovery load.</li>
+  <li>Corrupt a test artifact and prove checksum detection, isolation, and recovery procedure.</li>
+  <li>Restore a production-sized backup to a new environment and measure application-ready RTO.</li>
+  <li>Recover to just before a destructive change and verify the achieved recovery point.</li>
+  <li>
+    Rebuild every derived view from source and compare versions, counts, samples, and permissions.
+  </li>
+</ul>
+
+<h3 id="migration-test">Migration tests</h3>
+<p>
+  Copy a recent sanitized schema and distribution into a safe environment. Rehearse expand,
+  backfill, verification, read switch, rollback, and contract. Measure locks, log generation,
+  replica lag, cache effects, and total temporary space. Test interruption at each phase and resume
+  from the durable checkpoint.
+</p>
+
+<h2 id="exercises"><span class="num">25.</span> Hands-on exercises</h2>
+
+<h3 id="exercise-orders">Exercise 1: choose the order authority</h3>
+<p>
+  An order platform expects 500 writes per second, needs unique per-tenant order numbers, changes
+  three related records atomically, and supports unpredictable support queries. Compare relational,
+  document, and key-value models.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> start with the invariant boundary and changing query set.
+  Relational storage is a strong default because constraints, transactions, joins, and mature
+  indexing directly serve the workload. A document could hold a bounded order aggregate but shared
+  idempotency and numbering still need atomic rules. Key-value storage adds manual access paths
+  without a demonstrated scale need.
+</p>
+
+<h3 id="exercise-chat">Exercise 2: repair a hot chat partition</h3>
+<p>
+  One live-event conversation receives 30% of all messages. The model partitions only by
+  conversation ID. Design a change without losing order or making every normal conversation
+  expensive.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> confirm the bottleneck and required ordering scope. Add
+  time-bucket or bounded shard placement only for oversized conversations, preserve a conversation
+  routing record, and merge bounded reads by stable sequence. If strict one-order append is
+  required, the sequencer remains a possible bottleneck. Test transition while both old and new
+  buckets are readable.
+</p>
+
+<h3 id="exercise-search">Exercise 3: change a search analyzer</h3>
+<p>
+  A new language analyzer changes tokenization for 200 million documents. Describe a safe rollout.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> create a versioned index, snapshot and capture source
+  changes, bulk build, replay with version guards, verify relevance and permissions, shadow traffic,
+  switch an alias, monitor, retain rollback, then remove the old index. In-place partial analysis
+  would mix incompatible terms.
+</p>
+
+<h3 id="exercise-metrics">Exercise 4: cardinality incident</h3>
+<p>
+  A deployment adds <code>user_id</code> to every request-latency metric and memory usage grows
+  rapidly. What should happen?
+</p>
+<p>
+  <strong>Expected reasoning:</strong> stop or drop the unbounded label at ingestion, roll back the
+  producer, preserve aggregate service metrics, and expire the accidental series. Identify the
+  responsible producer through bounded metadata. Add label allowlists, per-tenant series budgets,
+  cardinality dashboards, and pre-deployment tests.
+</p>
+
+<h3 id="exercise-restore">Exercise 5: design a restore drill</h3>
+<p>The order store promises a 15-minute RPO and 2-hour RTO. Write the acceptance test.</p>
+<p>
+  <strong>Expected reasoning:</strong> restore a base backup and continuous changes into an isolated
+  production-sized environment using disaster credentials, stop at a chosen target, apply schema and
+  deletion-ledger requirements, run integrity and business queries, rebuild or reconnect
+  projections, measure from declaration to safe traffic, and record achieved data point and time.
+</p>
+
+<h3 id="exercise-file">Exercise 6: find orphaned file objects</h3>
+<p>Direct uploads sometimes finish after the upload session expires. Design a safe cleanup job.</p>
+<p>
+  <strong>Expected reasoning:</strong> inventory staged objects by opaque upload ID, compare them
+  with metadata and session state, ignore objects inside a conservative age window, finalize only
+  after checksum and authorization checks, quarantine uncertain security cases, and delete confirmed
+  orphans idempotently. Track bytes, age, errors, and deletion evidence.
+</p>
+
+<h2 id="interview"><span class="num">26.</span> Interview questions and model answers</h2>
+
+<h3 id="qa-choose-store">1. How do you choose a database?</h3>
+<p>
+  Start with business invariants, critical reads and writes, query shape, consistency, durability,
+  RPO, RTO, scale, skew, retention, security, locality, operations, and cost. Derive keys, indexes,
+  and ownership. Compare the simplest credible candidates using documented guarantees, a
+  production-shaped benchmark, and a restore drill. Reject any candidate that fails a hard
+  correctness or policy constraint.
+</p>
+<p>
+  <strong>Follow-up:</strong> What would make you revisit the choice? A new invariant crossing the
+  store boundary, sustained load beyond measured headroom, unacceptable tail latency, residency
+  change, operational incidents, or a new dominant access pattern.
+</p>
+
+<h3 id="qa-relational-document">2. Relational or document storage for orders?</h3>
+<p>
+  Relational storage is usually the safer authority when order creation has multi-record invariants,
+  uniqueness, audit queries, and evolving relationships. A document can fit a bounded aggregate read
+  and preserve snapshots, but large or independently changing children should not be embedded. Scale
+  alone does not decide. Explain the atomic boundary, access patterns, and partition plan.
+</p>
+<p>
+  <strong>Follow-up:</strong> Is duplicating a product name wrong? Not when it is an intentional
+  historical snapshot of the accepted order. It would be wrong if treated as the current catalog
+  name without a convergence rule.
+</p>
+
+<h3 id="qa-normalization">3. What problem does normalization solve?</h3>
+<p>
+  It records independently changing facts once, reducing insert, update, and delete anomalies.
+  References and constraints preserve relationships. It does not mean every read must perform an
+  expensive join. Add explicit projections or snapshots when an access or historical requirement
+  justifies them.
+</p>
+<p>
+  <strong>Follow-up:</strong> When do you denormalize? When measured latency, locality, or scale
+  requires a serving copy and the design defines authority, update path, staleness, drift detection,
+  and rebuild.
+</p>
+
+<h3 id="qa-key">4. What makes a good key?</h3>
+<p>
+  It is stable, unambiguous, efficiently encoded, and compatible with identity, locality,
+  partitioning, ordering, and privacy needs. A primary ID should not change with mutable business
+  data. Ordered scans need a deterministic tie-breaker. A partition key must distribute load without
+  destroying the locality required by reads.
+</p>
+<p>
+  <strong>Follow-up:</strong> Why not use timestamp alone? Clocks can collide, have limited
+  resolution, and move. Pair time with a unique ID or use a generator whose exact ordering contract
+  is understood.
+</p>
+
+<h3 id="qa-btree-lsm">5. Compare a B-tree and an LSM tree.</h3>
+<p>
+  A B-tree maintains a balanced page-oriented ordered structure, naturally serving equality and
+  range reads with a shallow traversal. An LSM commonly buffers writes in memory, flushes sorted
+  files, and compacts them later, converting random writes into batched sequential work. LSM reads
+  may examine more structures and compaction adds write and space costs. Actual performance depends
+  on cache, workload, device, concurrency, and implementation.
+</p>
+<p>
+  <strong>Follow-up:</strong> Which is faster? The question is incomplete. Specify read/write mix,
+  range scans, update rate, key distribution, cache, durability, data size, and compaction state,
+  then benchmark.
+</p>
+
+<h3 id="qa-amplification">6. Explain write, read, and space amplification.</h3>
+<p>
+  Write amplification is physical bytes written per logical byte. Read amplification is physical
+  work examined per useful result. Space amplification is physical live footprint relative to
+  logical live data. Indexes, page updates, logs, replicas, versions, tombstones, and compaction
+  contribute. Optimizing one may worsen another.
+</p>
+<p>
+  <strong>Follow-up:</strong> Why can deleting data increase work? An engine may first write a
+  tombstone, then later compact or vacuum old versions before space is reusable.
+</p>
+
+<h3 id="qa-index">7. Why does an index speed reads but slow writes?</h3>
+<p>
+  It stores an alternate mapping so the reader can avoid scanning unrelated records. Every relevant
+  insert, update, or delete must maintain that mapping, write logs, use cache, replicate, and
+  eventually clean obsolete entries. Index selectivity, order, width, and covering fields determine
+  whether the read benefit justifies the cost.
+</p>
+<p>
+  <strong>Follow-up:</strong> Why might an index not be used? The query may not match its leading
+  fields or operators, selectivity may be poor, statistics may be stale, a cast may change the
+  expression, or a scan may genuinely cost less.
+</p>
+
+<h3 id="qa-secondary-distributed">8. Why are global secondary indexes difficult?</h3>
+<p>
+  The primary record and index entry may live on different partitions. An update then needs a
+  distributed atomic protocol or accepts temporary inconsistency and repair. Unique global indexes
+  add coordination. Rebuild, resharding, lag, and failure handling are also cross-partition
+  operations.
+</p>
+<p>
+  <strong>Follow-up:</strong> Alternative? Make the secondary access a derived projection with a
+  stated freshness bound, or choose a partition key that keeps the needed uniqueness and query
+  local.
+</p>
+
+<h3 id="qa-materialized">9. What is a materialized view?</h3>
+<p>
+  It is a stored query result or derived projection. It reduces read-time work by paying storage and
+  maintenance cost earlier. The design must define source, freshness, incremental or full refresh,
+  idempotency, version ordering, rebuild, and cutover.
+</p>
+<p>
+  <strong>Follow-up:</strong> Can it be the source of truth? Only if ownership is intentionally
+  transferred with new invariants and mutation rules. A normal projection remains rebuildable from
+  its authority.
+</p>
+
+<h3 id="qa-search-authority">10. Why is a search index usually not authoritative?</h3>
+<p>
+  Search indexing commonly refreshes asynchronously, transforms source fields, accepts partial
+  updates, and optimizes relevance rather than transactional invariants. Keep business truth in its
+  authority, carry a source version, and rebuild the index. Recheck current authorization where
+  stale permission data could expose content.
+</p>
+<p>
+  <strong>Follow-up:</strong> How do you change analyzers? Build and verify a versioned new index,
+  catch up changes, switch an alias, and retain rollback.
+</p>
+
+<h3 id="qa-polyglot">11. When is polyglot persistence justified?</h3>
+<p>
+  When one important access pattern has requirements that the existing store cannot meet safely or
+  economically, and a specialized derived or authoritative store has evidence of material benefit.
+  Charge the decision for operations, security, backups, schema evolution, data movement,
+  reconciliation, privacy, and expertise.
+</p>
+<p>
+  <strong>Follow-up:</strong> What is the default? One capable durable authority plus explicit
+  projections, adding systems only as requirements and measurements demand.
+</p>
+
+<h3 id="qa-schema-free">12. Is a document store schema-free?</h3>
+<p>
+  No. Field names, types, meanings, constraints, defaults, and compatibility still form a schema,
+  even if enforcement lives in application code. Validate at boundaries, version formats, monitor
+  unknown shapes, and migrate semantics deliberately.
+</p>
+<p>
+  <strong>Follow-up:</strong> Benefit of flexible enforcement? Different record versions can coexist
+  during controlled rollout and optional fields can evolve without an immediate full rewrite.
+</p>
+
+<h3 id="qa-migration">13. How do you change a large schema without downtime?</h3>
+<p>
+  Use expand and contract: add a compatible representation, deploy tolerant readers, start new
+  writes, backfill in bounded resumable batches, verify, gradually switch reads, stop old writes,
+  wait beyond rollback needs, then remove old data later. Throttle on primary load, replica lag,
+  logs, and errors.
+</p>
+<p>
+  <strong>Follow-up:</strong> How do you avoid overwriting concurrent writes? Compare the source
+  version read by the backfill and update only if it is unchanged and the new field is absent.
+</p>
+
+<h3 id="qa-replica-backup">14. Why is replication not backup?</h3>
+<p>
+  Replication rapidly copies desired writes but can also copy accidental deletion, corruption,
+  malicious changes, and bad migrations. Backups preserve recoverable historical states under
+  separated controls. Both require tests: failover for replication and restore for backup.
+</p>
+<p>
+  <strong>Follow-up:</strong> What makes a backup usable? Complete artifacts, keys, schema and
+  configuration, verified checksums, documented dependencies, and a timed application-level restore.
+</p>
+
+<h3 id="qa-rpo-rto">15. Explain RPO and RTO.</h3>
+<p>
+  RPO bounds acceptable data loss measured in time or business position. RTO bounds time from
+  disaster to required service restoration. Continuous logs may improve RPO, while automation,
+  bandwidth, restore parallelism, data size, validation, and dependency readiness determine RTO.
+</p>
+<p>
+  <strong>Follow-up:</strong> How do you prove them? Run a production-sized disaster drill, choose a
+  recovery target, restore from protected artifacts, validate, and record achieved point and time.
+</p>
+
+<h3 id="qa-ttl">16. What are the risks of TTL-based retention?</h3>
+<p>
+  Expiry may be asynchronous, create tombstones and compaction work, conflict with legal hold, leave
+  derived copies, and not remove backups immediately. A synchronized expiry wave can overload
+  storage. Define semantic expiration, physical cleanup, exceptions, propagation, and verification.
+</p>
+<p>
+  <strong>Follow-up:</strong> How do you handle a legal hold? An authorized, scoped policy prevents
+  ordinary expiry, is audited, and can later resume lifecycle without retaining unrelated data.
+</p>
+
+<h3 id="qa-multitenancy">17. Compare tenant isolation models.</h3>
+<p>
+  Shared tables pool resources efficiently but need tenant keys, enforced policies, and
+  noisy-neighbor controls. Per-namespace increases logical isolation but expands migration and
+  catalog work. Per-database or cluster improves isolation and custom recovery or residency but
+  costs more and requires fleet automation. A hybrid places tenants by risk and size.
+</p>
+<p>
+  <strong>Follow-up:</strong> Is row-level policy enough? No. Use it as defense in depth alongside
+  authenticated tenant context, compound keys, least privilege, cache and search isolation,
+  privileged-path tests, and audit.
+</p>
+
+<h3 id="qa-hot-partition">18. How do you diagnose a hot partition?</h3>
+<p>
+  Compare per-partition operations, bytes, latency, queueing, throttles, key distribution, and top
+  tenants against the global workload. Identify whether the cause is a monotonic key, celebrity
+  entity, large object, low-cardinality index, or scheduled job. Fix the access and placement model,
+  not just fleet size.
+</p>
+<p>
+  <strong>Follow-up:</strong> Why not always add random sharding? Reads must fan out, ordering and
+  uniqueness become harder, and small entities pay needless complexity. Apply bounded sharding to
+  measured hotspots with a routing rule.
+</p>
+
+<h3 id="qa-object-metadata">19. Why separate file blobs and metadata?</h3>
+<p>
+  Large immutable blobs need streaming durability and capacity, while folder listings, permissions,
+  versions, quotas, and lifecycle need transactional queries. The split uses each model for its
+  access pattern. A state machine, checksum, versioned object reference, and reconciler protect the
+  boundary.
+</p>
+<p>
+  <strong>Follow-up:</strong> What if upload succeeds but metadata fails? Keep the object staged and
+  use a grace-period reconciler to finalize valid sessions or delete confirmed orphans.
+</p>
+
+<h3 id="qa-observe">20. Which storage signals matter most?</h3>
+<p>
+  User-visible latency and errors by operation, demand and bytes, connection and lock wait, device
+  saturation, cache effectiveness, log rate, checkpoint or compaction debt, disk headroom,
+  replication lag, partition skew, derived-view lag, backup age, and verified restore time. Segment
+  by tenant and partition so aggregates do not hide harm.
+</p>
+<p>
+  <strong>Follow-up:</strong> When should on-call be paged? When user objectives burn rapidly or a
+  margin such as disk, replication, compaction, or backup age will soon violate a correctness or
+  recovery promise and requires immediate action.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">27.</span> Concise cheat sheet</h2>
+<ul>
+  <li>Start with facts, invariants, access patterns, lifecycle, and failure promises.</li>
+  <li>Logical model, storage engine, consistency, and deployment topology are separate choices.</li>
+  <li>Relational: constraints, transactions, joins, and evolving queries.</li>
+  <li>Key-value: predictable direct lookup when the request can name its key.</li>
+  <li>Document: bounded aggregate read and write boundary, not an unbounded container.</li>
+  <li>Wide-column: partition-local ordered queries designed in advance.</li>
+  <li>Graph: variable-depth relationship traversal is the primary question.</li>
+  <li>
+    Time-series: append, time windows, retention, downsampling, and bounded label cardinality.
+  </li>
+  <li>Search: inverted-index projection for relevance and filters, usually not authority.</li>
+  <li>Object: large whole blobs with transactional metadata stored separately.</li>
+  <li>In-memory: low latency with explicit eviction, restart, and rebuild semantics.</li>
+  <li>B-trees favor shallow ordered lookup and ranges.</li>
+  <li>LSM trees batch writes into sorted files and pay background compaction.</li>
+  <li>Measure write, read, and space amplification together.</li>
+  <li>Every index buys a read path with write, space, cache, and rebuild cost.</li>
+  <li>Normalize authoritative facts; denormalize deliberately with a repair path.</li>
+  <li>One authority settles conflicts; projections carry source versions and are rebuildable.</li>
+  <li>Use expand, backfill, verify, switch, and contract for online schema changes.</li>
+  <li>
+    Replication supports availability; independently protected backups support historical recovery.
+  </li>
+  <li>A backup is proven only by a timed, verified restore.</li>
+  <li>TTL, privacy erasure, archival, legal hold, and backup expiry are one lifecycle system.</li>
+  <li>
+    Carry tenant identity through keys, policies, indexes, caches, telemetry, exports, and backups.
+  </li>
+  <li>
+    Capacity includes indexes, logs, replicas, amplification, migration space, backups, and
+    headroom.
+  </li>
+  <li>Watch per-partition and per-tenant distributions, not only global averages.</li>
+  <li>
+    Benchmark the real data distribution, mixed workload, engine settings, failures, and recovery.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">28.</span> Current official references</h2>
+<ul>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/ddl-constraints.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: Constraints</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/indexes-types.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: Index Types</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/gin-intro.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: GIN Introduction</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/rules-materializedviews.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: Materialized Views</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: Row Security Policies</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/continuous-archiving.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: Continuous Archiving and Point-in-Time Recovery</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/backup.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL Documentation: Backup and Restore</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.foundationdb.org/files/fdb-paper.pdf"
+      target="_blank"
+      rel="noopener noreferrer"
+      >FoundationDB: A Distributed Unbundled Transactional Key Value Store</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://apple.github.io/foundationdb/data-modeling.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >FoundationDB Documentation: Data Modeling</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview"
+      target="_blank"
+      rel="noopener noreferrer"
+      >RocksDB Official Wiki: Storage Engine Overview</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://github.com/facebook/rocksdb/wiki/Compaction"
+      target="_blank"
+      rel="noopener noreferrer"
+      >RocksDB Official Wiki: Compaction</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://lucene.apache.org/core/9_12_3/core/org/apache/lucene/codecs/lucene912/package-summary.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Apache Lucene Documentation: Index File Formats</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://prometheus.io/docs/concepts/data_model/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Prometheus Documentation: Data Model</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://prometheus.io/docs/prometheus/latest/storage/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Prometheus Documentation: Storage</a
+    >
+  </li>
+  <li>
+    <a href="https://www.w3.org/TR/rdf12-concepts/" target="_blank" rel="noopener noreferrer"
+      >W3C RDF 1.2 Concepts and Abstract Syntax</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc3339" target="_blank" rel="noopener noreferrer"
+      >RFC 3339: Date and Time on the Internet</a
+    >
+  </li>
+  <li>
+    <a href="https://nodejs.org/api/crypto.html" target="_blank" rel="noopener noreferrer"
+      >Node.js Documentation: Crypto</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://cheatsheetseries.owasp.org/cheatsheets/Database_Security_Cheat_Sheet.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >OWASP Database Security Cheat Sheet</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final"
+      target="_blank"
+      rel="noopener noreferrer"
+      >NIST SP 800-57 Part 1 Revision 5: Key Management</a
+    >
+  </li>
+  <li>
+    <a href="https://csrc.nist.gov/pubs/sp/800/209/final" target="_blank" rel="noopener noreferrer"
+      >NIST SP 800-209: Security Guidelines for Storage Infrastructure</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

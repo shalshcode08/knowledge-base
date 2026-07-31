@@ -112,6 +112,10 @@
         {
           "title": "System Design Fundamentals and Capacity Estimation",
           "path": "systemdesign/system-design-fundamentals-capacity-estimation"
+        },
+        {
+          "title": "Data Storage and Data-Model Selection",
+          "path": "systemdesign/data-storage-data-model-selection"
         }
       ]
     }
