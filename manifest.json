@@ -120,6 +120,10 @@
         {
           "title": "Data Storage and Data-Model Selection",
           "path": "systemdesign/data-storage-data-model-selection"
+        },
+        {
+          "title": "Scalability, Load Balancing, Service Discovery, and Rate Control",
+          "path": "systemdesign/scalability-load-balancing-service-discovery-rate-control"
         }
       ]
     }
