@@ -1,0 +1,2341 @@
+<h1>Networking, DNS, TCP, TLS, HTTP, REST, and RPC - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to how a secure request moves from a name in a client to a backend
+  response, including protocol internals, failure behavior, API choices, production operations, and
+  interview reasoning.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The end-to-end mental model</h2>
+<p class="lead">
+  A network request is a sequence of agreements between layers, not one indivisible action.
+</p>
+
+<p>
+  An application starts with a logical destination such as
+  <code>https://api.example.com/orders/42</code>. DNS maps the host name to one or more addresses.
+  IP moves packets across networks. TCP or QUIC creates transport behavior between endpoints. TLS
+  authenticates a peer and protects bytes. HTTP gives those protected bytes request and response
+  meaning. REST or RPC then defines the application contract. A load balancer, proxy, firewall, NAT
+  device, or service mesh may participate at several points.
+</p>
+
+<figure class="code">
+  <figcaption><b>Encapsulation on a typical HTTPS request</b></figcaption>
+  <pre><code>Application:  GET /orders/42 plus headers
+HTTP:         request semantics and message framing
+TLS:          encrypted records with integrity protection
+TCP:          ordered byte stream split into segments
+IP:           packets addressed between hosts
+Link:         frames delivered over each local hop
+
+On receive, each layer removes and validates its own envelope.
+Routers normally inspect IP, not the HTTP order identifier.</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Three identities must not be confused</strong>
+  <p>
+    A DNS name identifies a name in a distributed database. An IP address identifies a routable
+    network interface or endpoint at a moment in time. An application identity, established through
+    a certificate or another credential, states who is trusted to act as the service. They often map
+    to one another, but they are not the same thing.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer or concern</th>
+        <th>Main unit</th>
+        <th>Main responsibility</th>
+        <th>Typical failure signal</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Application contract</td>
+        <td>Operation, resource, or message</td>
+        <td>Business meaning and compatibility</td>
+        <td>Domain error, invalid schema, incompatible version</td>
+      </tr>
+      <tr>
+        <td>HTTP</td>
+        <td>Request, response, frame</td>
+        <td>Methods, status, metadata, representation</td>
+        <td>Status code, malformed message, stream reset</td>
+      </tr>
+      <tr>
+        <td>TLS</td>
+        <td>Handshake message, record</td>
+        <td>Authentication, confidentiality, integrity</td>
+        <td>Certificate or handshake alert</td>
+      </tr>
+      <tr>
+        <td>TCP</td>
+        <td>Byte stream and segment</td>
+        <td>Reliable ordered transport with flow and congestion control</td>
+        <td>Timeout, reset, retransmission, zero receive window</td>
+      </tr>
+      <tr>
+        <td>QUIC</td>
+        <td>Packet, connection, stream</td>
+        <td>Secure multiplexed transport over UDP</td>
+        <td>Handshake failure, stream reset, path failure</td>
+      </tr>
+      <tr>
+        <td>IP</td>
+        <td>Packet</td>
+        <td>Best-effort addressing and routing across networks</td>
+        <td>Drop, unreachable route, TTL or hop-limit exceeded</td>
+      </tr>
+      <tr>
+        <td>Link</td>
+        <td>Frame</td>
+        <td>Delivery on one local network hop</td>
+        <td>Loss, corruption, interface down</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="network-foundations"><span class="num">01.</span> Network foundations</h2>
+<p class="lead">
+  Internet Protocol offers best-effort packet delivery. Reliability, security, and application
+  meaning are added by other layers.
+</p>
+
+<h3 id="packets-and-hops">Packets, routers, and hops</h3>
+<p>
+  A sender does not usually know the complete physical path. It selects a next hop using a routing
+  table. Each router examines the destination IP address, chooses another next hop, and decrements
+  the IPv4 TTL or IPv6 Hop Limit. The packet may be dropped, duplicated, delayed, or reordered. IP
+  itself does not promise delivery or ordering.
+</p>
+
+<p>
+  Routing control protocols build reachability information, while the data plane forwards actual
+  packets. A default route handles destinations without a more specific match. Longest-prefix match
+  selects the most specific matching route. Internet routes can change while a connection is alive,
+  so packets from one conversation need not take identical paths.
+</p>
+
+<h3 id="sockets-and-ports">Sockets, addresses, ports, and connection identity</h3>
+<p>
+  A socket is an operating-system communication endpoint exposed to a process. A server commonly
+  creates a socket, binds it to a local address and port, listens, and accepts connections. A client
+  creates a socket and connects to a remote address and port. A TCP connection is distinguished by
+  protocol plus source address, source port, destination address, and destination port.
+</p>
+
+<figure class="code">
+  <figcaption><b>One listening socket, many accepted connections</b></figcaption>
+  <pre><code>server listens on 203.0.113.10:443
+
+client A 192.0.2.20:53001 -&gt; 203.0.113.10:443
+client B 192.0.2.20:53002 -&gt; 203.0.113.10:443
+client C 198.51.100.7:41000 -&gt; 203.0.113.10:443
+
+The server port can be the same because each connection tuple is different.</code></pre>
+</figure>
+
+<p>
+  Client source ports are usually temporary, or ephemeral. They are finite. High connection churn,
+  long <code>TIME_WAIT</code> retention, a small NAT port pool, or too many destinations behind one
+  translated address can exhaust them. File descriptor limits, accept queues, connection tracking,
+  memory, and application worker limits can be exhausted before network bandwidth is full.
+</p>
+
+<h3 id="mtu">MTU, fragmentation, and path MTU</h3>
+<p>
+  A link maximum transmission unit, or MTU, limits the largest IP packet carried without
+  fragmentation on that link. The smallest supported size on an end-to-end path is the path MTU.
+  IPv4 routers may fragment when permitted. IPv6 routers do not fragment packets in transit, so an
+  IPv6 source uses fragmentation when necessary. Modern transports try to avoid IP fragmentation
+  because losing one fragment prevents reassembly of the whole original packet and middleboxes may
+  mishandle fragments.
+</p>
+
+<p>
+  Path MTU Discovery depends on receiving control messages that a packet is too large. Blocking all
+  ICMP can create a black hole: small packets work, while large requests or TLS records repeatedly
+  disappear. Datagram protocols also need application-level size discipline. For TCP, maximum
+  segment size negotiation and segmentation normally hide packet boundaries from the application.
+</p>
+
+<div class="warn">
+  <strong>A TCP write is not a network message</strong>
+  <p>
+    TCP is a byte stream. One write can be split across reads, and several writes can arrive in one
+    read. An application protocol must define framing through a length, delimiter, fixed size, or
+    self-describing format. Assuming one read equals one request causes truncation and request
+    smuggling bugs.
+  </p>
+</div>
+
+<h3 id="nat-firewalls-proxies">NAT, firewalls, and proxies</h3>
+<dl>
+  <dt>Network address translation, or NAT</dt>
+  <dd>
+    Rewrites addresses and often ports while keeping temporary mapping state. It conserves public
+    IPv4 addresses and creates an addressing boundary, but it is not the same as authorization.
+  </dd>
+  <dt>Stateful firewall</dt>
+  <dd>
+    Applies policy using addresses, ports, protocol, direction, and observed connection state. A
+    timeout can discard idle state even while endpoints believe a connection is open.
+  </dd>
+  <dt>Forward proxy</dt>
+  <dd>Acts for clients, commonly controlling or observing outbound access.</dd>
+  <dt>Reverse proxy</dt>
+  <dd>
+    Acts in front of servers, commonly terminating TLS, routing requests, enforcing limits, caching,
+    and hiding backend topology.
+  </dd>
+  <dt>Tunnel</dt>
+  <dd>
+    Carries bytes without interpreting the inner application protocol, although its setup may use
+    another protocol such as HTTP CONNECT.
+  </dd>
+</dl>
+
+<p>
+  Every stateful middlebox has capacity and timeouts. A keepalive interval longer than a NAT idle
+  timeout does not keep the mapping alive. A proxy may buffer a streaming response, change
+  connection reuse, normalize headers, or apply a smaller payload limit than the origin. Draw each
+  hop explicitly during diagnosis.
+</p>
+
+<h2 id="dns"><span class="num">02.</span> DNS resolution, caching, and operations</h2>
+<p class="lead">
+  DNS is a delegated, distributed, cached database that maps names to typed resource records.
+</p>
+
+<h3 id="dns-roles">Stub, recursive, root, TLD, and authoritative roles</h3>
+<p>
+  An application normally calls a local stub resolver. The stub asks a recursive resolver, which may
+  answer from cache. On a miss, the recursive resolver follows referrals, typically from a root
+  server to a top-level-domain server and then to an authoritative server for the zone. The
+  authoritative server answers from zone data. Iterative resolution means each server points the
+  resolver toward the next authority. Recursive service means the resolver performs that work for
+  the client.
+</p>
+
+<figure class="code">
+  <figcaption><b>Cold recursive lookup for api.shop.example A</b></figcaption>
+  <pre><code>client stub       recursive        root         .example TLD       authority
+    | query A         |              |                |                 |
+    |----------------&gt;|              |                |                 |
+    |                 | query        |                |                 |
+    |                 |-------------&gt;|                |                 |
+    |                 | referral to TLD               |                 |
+    |                 |&lt;-------------|                |                 |
+    |                 | query                         |                 |
+    |                 |------------------------------&gt;|                 |
+    |                 | referral to authority                           |
+    |                 |&lt;------------------------------|                 |
+    |                 | query A                                          |
+    |                 |------------------------------------------------&gt;|
+    |                 | A 203.0.113.10, TTL 60                           |
+    |                 |&lt;------------------------------------------------|
+    | answer + TTL     |                                                   |
+    |&lt;----------------|                                                   |
+
+Later clients may receive the cached answer until its remaining TTL expires.</code></pre>
+</figure>
+
+<h3 id="dns-records">Common resource records</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Record</th>
+        <th>Meaning</th>
+        <th>Operational note</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>A</td>
+        <td>Name to IPv4 address</td>
+        <td>Multiple values can distribute clients but do not guarantee equal live load</td>
+      </tr>
+      <tr>
+        <td>AAAA</td>
+        <td>Name to IPv6 address</td>
+        <td>Test dual-stack reachability and fallback behavior</td>
+      </tr>
+      <tr>
+        <td>CNAME</td>
+        <td>Owner name aliases another canonical name</td>
+        <td>Adds another lookup and has restrictions at the owner name</td>
+      </tr>
+      <tr>
+        <td>NS</td>
+        <td>Names authoritative servers for a zone</td>
+        <td>Delegation and glue records must be correct</td>
+      </tr>
+      <tr>
+        <td>SOA</td>
+        <td>Zone authority and maintenance metadata</td>
+        <td>Includes serial and values used by secondary servers and negative caching</td>
+      </tr>
+      <tr>
+        <td>MX</td>
+        <td>Mail exchange with preference</td>
+        <td>Lower preference value is tried first</td>
+      </tr>
+      <tr>
+        <td>TXT</td>
+        <td>Text data interpreted by a specific application</td>
+        <td>Common in domain verification and mail security policies</td>
+      </tr>
+      <tr>
+        <td>SRV</td>
+        <td>Service target and port with priority and weight</td>
+        <td>Useful only when the client protocol specifies SRV discovery</td>
+      </tr>
+      <tr>
+        <td>PTR</td>
+        <td>Reverse mapping from address namespace to name</td>
+        <td>Not proof that the forward name maps back to the same address</td>
+      </tr>
+      <tr>
+        <td>CAA</td>
+        <td>Which certificate authorities may issue for a domain</td>
+        <td>Controls issuance policy, not runtime certificate validation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="dns-ttl">TTL, caches, propagation, and negative answers</h3>
+<p>
+  Each resource record carries a TTL that tells caches how long the data may be reused. An update is
+  visible immediately at the updated authority, but resolvers holding an older answer can keep it
+  until their cached TTL expires. This behavior is often called propagation, although no global push
+  occurs. Lower the TTL before a planned migration, wait for the old TTL population to age out, make
+  the change, and keep the old destination serving long enough for stragglers.
+</p>
+
+<p>
+  Negative answers such as a proven nonexistent name can also be cached. Creating a record shortly
+  after clients received <code>NXDOMAIN</code> may therefore remain invisible to them temporarily.
+  TTL zero does not guarantee that every client immediately re-queries, because applications,
+  operating systems, libraries, proxies, and resolvers may add independent caching behavior.
+</p>
+
+<h3 id="dns-distribution">DNS traffic distribution</h3>
+<p>
+  Returning several addresses, weighted answers, geography-aware answers, or anycasted service
+  addresses can influence destination selection. DNS does not observe each final connection, and
+  recursive resolver caching can aggregate many clients behind one answer. A removed address may
+  still receive traffic until caches expire. DNS distribution therefore needs healthy overlapping
+  capacity and an application-level failover plan.
+</p>
+
+<h3 id="dns-failures">Common DNS failures and diagnosis</h3>
+<ul>
+  <li>
+    <strong>NXDOMAIN:</strong> the queried name does not exist, possibly due to a typo or stale
+    negative cache.
+  </li>
+  <li>
+    <strong>SERVFAIL:</strong> resolution failed, commonly because of unreachable authority,
+    validation failure, or delegation trouble.
+  </li>
+  <li>
+    <strong>Timeout:</strong> packets, responses, or TCP fallback were blocked or servers were
+    overloaded.
+  </li>
+  <li>
+    <strong>Lame delegation:</strong> parent delegation points to a server that is not
+    authoritative.
+  </li>
+  <li>
+    <strong>Missing glue:</strong> resolver cannot reach an in-bailiwick authoritative name without
+    address records from the parent.
+  </li>
+  <li>
+    <strong>Truncation failure:</strong> a large UDP response requests TCP retry, but TCP port 53 is
+    blocked.
+  </li>
+  <li>
+    <strong>Split-horizon mismatch:</strong> internal and external clients intentionally receive
+    different data, but query the wrong resolver.
+  </li>
+  <li>
+    <strong>DNSSEC validation failure:</strong> signatures, keys, delegation records, or time
+    validity do not form a valid chain.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>DNS troubleshooting order</b></figcaption>
+  <pre><code>1. Record the exact name, type, resolver, result code, answer, and TTL.
+2. Query the configured recursive resolver.
+3. Query a second known resolver to separate local cache from authority.
+4. Trace referrals from root to authority.
+5. Query each authoritative server directly.
+6. Compare serials, records, DNSSEC status, UDP and TCP behavior.
+7. Check application and operating-system caches.
+8. Correlate the answer with connection attempts and destination health.</code></pre>
+</figure>
+
+<h2 id="tcp"><span class="num">03.</span> TCP state, reliability, and limits</h2>
+<p class="lead">
+  TCP turns an unreliable packet path into a reliable, ordered, full-duplex byte stream between two
+  endpoints.
+</p>
+
+<h3 id="tcp-handshake">Three-way handshake and state</h3>
+<figure class="code">
+  <figcaption><b>Connection establishment</b></figcaption>
+  <pre><code>client                                      server
+CLOSED                                      LISTEN
+  |                                             |
+  | SYN, sequence x                             |
+  |--------------------------------------------&gt;| SYN-RECEIVED
+  | SYN + ACK, sequence y, acknowledge x + 1    |
+  |&lt;--------------------------------------------|
+  | ACK, acknowledge y + 1                      |
+  |--------------------------------------------&gt;| ESTABLISHED
+ESTABLISHED                                    |
+
+Sequence numbers identify byte positions. SYN consumes sequence space.</code></pre>
+</figure>
+
+<p>
+  The handshake proves two-way reachability, establishes initial sequence numbers, and negotiates
+  options. It costs a network round trip before normal application bytes, unless a higher-level
+  mechanism safely combines early data. A server protects its pending connection queue from
+  exhaustion through sizing, admission control, SYN cookies where appropriate, and upstream
+  filtering.
+</p>
+
+<h3 id="tcp-reliability">Acknowledgements, retransmission, ordering, and ambiguity</h3>
+<p>
+  TCP numbers bytes and acknowledges received sequence space. A sender retains unacknowledged data
+  and retransmits after loss is inferred through timers or acknowledgement patterns. The receiver
+  reorders segments and presents only an ordered stream to the application. Checksums detect common
+  corruption, but TLS or application integrity is still required against attackers.
+</p>
+
+<p>
+  An acknowledgement means bytes reached the peer TCP stack, not that the peer application committed
+  a payment. A client timeout after sending a request is ambiguous: the server may not have seen it,
+  may be processing it, may have committed it, or may have sent a response that was lost.
+  Application idempotency keys and status lookup solve this ambiguity. Transport reliability alone
+  cannot.
+</p>
+
+<h3 id="flow-congestion">Flow control versus congestion control</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mechanism</th>
+        <th>Protects</th>
+        <th>Main signal</th>
+        <th>If ignored or misread</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Receive flow control</td>
+        <td>The receiving endpoint's buffers and reader</td>
+        <td>Advertised receive window</td>
+        <td>Fast sender overwhelms a slow receiver</td>
+      </tr>
+      <tr>
+        <td>Congestion control</td>
+        <td>The shared network path</td>
+        <td>Loss, acknowledgements, delay, and congestion signals</td>
+        <td>Too much in-flight traffic creates collapse and unfairness</td>
+      </tr>
+      <tr>
+        <td>Application backpressure</td>
+        <td>Business workers and dependencies</td>
+        <td>Bounded concurrency, queue capacity, demand signals</td>
+        <td>Transport accepts work faster than the service can complete it</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The sender can have at most the smaller of the receive window and congestion window in flight,
+  subject to implementation details. A connection begins cautiously and increases sending as the
+  path demonstrates capacity. Long-distance high-bandwidth paths need enough window to fill their
+  bandwidth-delay product. A tiny application read buffer or stalled consumer can advertise a zero
+  window even when the network is healthy.
+</p>
+
+<h3 id="tcp-close">Close, reset, half-close, and TIME_WAIT</h3>
+<p>
+  TCP directions close independently with FIN. A graceful close allows already-sent bytes to be
+  consumed. A reset, or RST, aborts the connection and can discard unread data. The active closer
+  commonly enters <code>TIME_WAIT</code> so delayed old segments cannot be confused with a later
+  connection using the same tuple and so the final acknowledgement can be retransmitted.
+</p>
+
+<p>
+  A successful write followed by a later reset still does not reveal whether the remote application
+  acted. Do not map FIN, RST, timeout, or cancellation directly to a business outcome. Record the
+  request identity and make the operation safely repeatable or queryable.
+</p>
+
+<h3 id="keepalive-pooling">Keepalive and connection pooling</h3>
+<p>
+  TCP keepalive probes detect a dead peer after a configurable idle interval. They are different
+  from HTTP persistent connections and application heartbeats. Defaults are often too slow for
+  request deadlines and may be longer than middlebox idle timeouts.
+</p>
+
+<p>
+  A connection pool amortizes DNS, transport, and TLS setup, but must be bounded per destination and
+  globally. It needs connect, acquisition, idle, lifetime, and request deadlines. Pools should
+  retire connections before known infrastructure lifetime limits, validate stale connections, and
+  expose pending waiters. A pool with 100 connections does not imply 100 useful concurrent requests:
+  HTTP/2 and HTTP/3 multiplex streams, while a downstream database might permit only 20 operations.
+</p>
+
+<div class="warn">
+  <strong>Connection exhaustion often looks like latency</strong>
+  <p>
+    When every pooled connection is busy, new callers wait before sending. If only request execution
+    time is measured, this queue is invisible. Measure DNS, connect, TLS, pool acquisition,
+    time-to-first-byte, transfer, and total deadline separately.
+  </p>
+</div>
+
+<h2 id="udp-quic"><span class="num">04.</span> UDP and QUIC trade-offs</h2>
+<p class="lead">
+  UDP provides datagrams with minimal transport behavior. QUIC builds secure, reliable,
+  stream-oriented transport in user space over UDP.
+</p>
+
+<h3 id="udp">UDP</h3>
+<p>
+  UDP preserves datagram boundaries and adds ports and a checksum to IP delivery. It does not
+  establish a connection, retransmit, order datagrams, pace a sender, or provide application
+  backpressure. That simplicity fits DNS queries, telemetry where fresh samples replace old ones,
+  and applications that implement specialized real-time recovery. A responsible UDP application
+  still needs congestion control, amplification defenses, size limits, authentication when needed,
+  and explicit loss and reordering behavior.
+</p>
+
+<h3 id="quic">QUIC</h3>
+<p>
+  QUIC version 1 integrates TLS 1.3, reliable streams, stream and connection flow control, loss
+  recovery, and congestion control over UDP. Connection IDs allow a connection to survive some
+  address changes, such as a mobile client changing networks, after path validation. Most QUIC
+  protocol control information is encrypted, reducing interference from middleboxes and allowing
+  implementations to evolve in user space.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Strength</th>
+        <th>Important cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>TCP</td>
+        <td>Universal, mature ordered stream and broad tooling</td>
+        <td>One lost segment stalls delivery of later bytes for all multiplexed HTTP/2 streams</td>
+      </tr>
+      <tr>
+        <td>UDP</td>
+        <td>Minimal datagram transport with application-controlled timing</td>
+        <td>
+          Application owns reliability, congestion behavior, security, and fragmentation risks
+        </td>
+      </tr>
+      <tr>
+        <td>QUIC</td>
+        <td>Secure multiplexed streams, fast setup, connection migration</td>
+        <td>More CPU and implementation complexity, plus UDP may be blocked or rate-limited</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  QUIC removes cross-stream transport head-of-line blocking: loss affecting one stream does not stop
+  delivery on an unrelated stream. Ordered bytes within the affected stream still wait, and
+  connection-level congestion control still shares path capacity. HTTP/3 clients need a TCP-based
+  fallback where UDP connectivity fails.
+</p>
+
+<h2 id="tls"><span class="num">05.</span> TLS identity, encryption, and termination</h2>
+<p class="lead">
+  TLS protects a connection only after the client validates the intended peer and both sides derive
+  fresh traffic keys.
+</p>
+
+<h3 id="tls-handshake">TLS 1.3 handshake</h3>
+<figure class="code">
+  <figcaption>
+    <b>Simplified full TLS 1.3 handshake over an established TCP connection</b>
+  </figcaption>
+  <pre><code>client                                                    server
+  | ClientHello: versions, key share, SNI, ALPN              |
+  |---------------------------------------------------------&gt;|
+  | ServerHello: selected version and key share               |
+  | {EncryptedExtensions, Certificate, CertificateVerify,     |
+  |  Finished}                                                |
+  |&lt;---------------------------------------------------------|
+  | verify chain, hostname, signature, validity, policy        |
+  | {Finished}                                                |
+  |---------------------------------------------------------&gt;|
+  | encrypted application data                                |
+  |&lt;========================================================&gt;|
+
+Braces indicate messages protected with handshake keys.</code></pre>
+</figure>
+
+<p>
+  Ephemeral key agreement establishes a shared secret without sending the traffic keys. The
+  certificate binds a public key to names under a trust model. CertificateVerify proves possession
+  of the corresponding private key and binds the handshake transcript. Finished authenticates the
+  transcript under derived secrets. ALPN selects an application protocol such as HTTP/2, and SNI
+  tells a multi-tenant endpoint which server name the client seeks.
+</p>
+
+<h3 id="certificates">Certificates, trust chains, and hostname verification</h3>
+<p>
+  A client validates a path from the presented end-entity certificate through intermediate
+  certificate authorities to a configured trust anchor. It verifies signatures, validity times,
+  constraints, key usages, and local policy. It must separately match the reference host name from
+  the URI against permitted identifiers in the certificate. A cryptographically valid chain for the
+  wrong host is not sufficient.
+</p>
+
+<ul>
+  <li>
+    Send the required intermediate certificates, but normally not the client's root trust anchor.
+  </li>
+  <li>Monitor expiry from the real serving endpoint, not only a certificate inventory.</li>
+  <li>Automate renewal and test reload because issuance success does not mean serving success.</li>
+  <li>
+    Keep private keys in a narrowly authorized boundary and rotate after suspected compromise.
+  </li>
+  <li>Do not disable verification to repair a missing intermediate or name mismatch.</li>
+  <li>
+    Account for clock error because certificate validity and some revocation data are time-bound.
+  </li>
+</ul>
+
+<h3 id="tls-resumption">Session resumption and early data</h3>
+<p>
+  TLS 1.3 resumption uses a pre-shared key derived from an earlier authenticated connection,
+  reducing handshake work and latency. Session tickets require key lifecycle and rotation across
+  terminating instances. A resumption key exposed across a large fleet expands the impact of
+  compromise.
+</p>
+
+<p>
+  Zero round-trip-time early data can be replayed by an attacker even though its confidentiality is
+  protected. Accept it only for operations safe under replay, and use protocol and application
+  controls. A payment mutation or one-time token exchange should not rely on early-data delivery as
+  proof of uniqueness.
+</p>
+
+<h3 id="mtls">Mutual TLS</h3>
+<p>
+  With mTLS, both endpoints present credentials and prove key possession. It can establish workload
+  identity between services, but does not by itself decide authorization. Map the authenticated
+  identity to explicit policy, rotate client credentials, propagate end-user identity separately,
+  and log the identity used for a decision. Avoid treating every certificate from a broad internal
+  authority as permission to perform every operation.
+</p>
+
+<h3 id="tls-termination">TLS termination patterns</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Benefit</th>
+        <th>Trust boundary and risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Terminate at edge proxy</td>
+        <td>Central certificates, WAF, routing, and connection reuse</td>
+        <td>Backend hop is plaintext unless protected again</td>
+      </tr>
+      <tr>
+        <td>Terminate and re-encrypt</td>
+        <td>Edge inspection plus protected backend traffic</td>
+        <td>Proxy sees plaintext and backend verification must remain strict</td>
+      </tr>
+      <tr>
+        <td>TLS passthrough</td>
+        <td>End-to-end cryptographic endpoint remains backend</td>
+        <td>Edge has less Layer 7 routing and policy context</td>
+      </tr>
+      <tr>
+        <td>Service-to-service mTLS</td>
+        <td>Authenticated encrypted internal hops</td>
+        <td>
+          Identity issuance, rotation, authorization, and telemetry are operational dependencies
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="http-semantics"><span class="num">06.</span> HTTP semantics</h2>
+<p class="lead">
+  HTTP defines reusable semantics for requests and responses independently of whether messages use
+  HTTP/1.1 text framing, HTTP/2 frames, or HTTP/3 over QUIC.
+</p>
+
+<h3 id="http-message">Request target, method, fields, content, and response</h3>
+<figure class="code">
+  <figcaption><b>Conceptual HTTP exchange</b></figcaption>
+  <pre><code>POST /orders HTTP/1.1
+Host: api.shop.example
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: 8c44...
+Content-Length: 58
+
+{"sku":"A-17","quantity":2,"shippingAddressId":"addr-9"}
+
+HTTP/1.1 201 Created
+Location: /orders/ord-318
+Content-Type: application/json
+ETag: "order-v1"
+Cache-Control: no-store
+
+{"id":"ord-318","status":"accepted"}</code></pre>
+</figure>
+
+<p>
+  A field's meaning comes from its specification, not its spelling. Intermediaries may process and
+  transform messages subject to HTTP rules. End-to-end fields describe the selected representation
+  or resource semantics. Hop-by-hop behavior applies to one connection and must not be blindly
+  forwarded.
+</p>
+
+<h3 id="methods">Methods, safety, and idempotency</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Intended semantics</th>
+        <th>Safe</th>
+        <th>Idempotent</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>GET</td>
+        <td>Retrieve a current representation</td>
+        <td>Yes</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>HEAD</td>
+        <td>GET metadata without response content</td>
+        <td>Yes</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>POST</td>
+        <td>Process content according to resource-specific semantics</td>
+        <td>No</td>
+        <td>No by default</td>
+      </tr>
+      <tr>
+        <td>PUT</td>
+        <td>Create or replace state at the target URI</td>
+        <td>No</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>PATCH</td>
+        <td>Apply partial changes as defined by the patch media type</td>
+        <td>No</td>
+        <td>Not necessarily</td>
+      </tr>
+      <tr>
+        <td>DELETE</td>
+        <td>Remove the association between target URI and current functionality</td>
+        <td>No</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>OPTIONS</td>
+        <td>Describe communication options</td>
+        <td>Yes</td>
+        <td>Yes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Safe means the client did not request a state-changing effect. Logging and accounting may still
+  occur. Idempotent means multiple identical intended requests have the same intended effect as one,
+  not that every response is byte-identical. A DELETE retry may return 404 after the first request
+  succeeded and remain idempotent.
+</p>
+
+<p>
+  Business idempotency is explicit. For order creation, store an idempotency key with a normalized
+  request fingerprint and final outcome in the same correctness boundary as order creation. A
+  repeated key with the same request returns the saved outcome. The same key with different content
+  is rejected. Expiry must exceed the realistic retry and reconciliation window.
+</p>
+
+<h3 id="status-codes">Status codes by outcome</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Situation</th>
+        <th>Typical status</th>
+        <th>Important distinction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Successful retrieval or update</td>
+        <td>200</td>
+        <td>Representation describes successful outcome</td>
+      </tr>
+      <tr>
+        <td>Created resource</td>
+        <td>201</td>
+        <td>Location can identify the created resource</td>
+      </tr>
+      <tr>
+        <td>Accepted for later processing</td>
+        <td>202</td>
+        <td>Work has not necessarily completed; expose status</td>
+      </tr>
+      <tr>
+        <td>Success with no content</td>
+        <td>204</td>
+        <td>No response content follows</td>
+      </tr>
+      <tr>
+        <td>Permanent or temporary redirect</td>
+        <td>301, 302, 307, 308</td>
+        <td>307 and 308 preserve method semantics</td>
+      </tr>
+      <tr>
+        <td>Malformed syntax or validation failure</td>
+        <td>400 or 422</td>
+        <td>Document stable error details and field mapping</td>
+      </tr>
+      <tr>
+        <td>Missing or invalid authentication</td>
+        <td>401</td>
+        <td>Different from an authenticated caller lacking permission</td>
+      </tr>
+      <tr>
+        <td>Not authorized</td>
+        <td>403</td>
+        <td>May deliberately hide resource existence</td>
+      </tr>
+      <tr>
+        <td>Resource absent</td>
+        <td>404</td>
+        <td>Can also be used to avoid existence disclosure</td>
+      </tr>
+      <tr>
+        <td>State conflict</td>
+        <td>409</td>
+        <td>Caller may resolve conflict and retry</td>
+      </tr>
+      <tr>
+        <td>Precondition false</td>
+        <td>412</td>
+        <td>Often used with conditional mutation</td>
+      </tr>
+      <tr>
+        <td>Payload exceeds accepted limit</td>
+        <td>413</td>
+        <td>Reject early and consistently across every hop</td>
+      </tr>
+      <tr>
+        <td>Rate or quota limit</td>
+        <td>429</td>
+        <td>Retry guidance must not create synchronized retries</td>
+      </tr>
+      <tr>
+        <td>Unexpected server failure</td>
+        <td>500</td>
+        <td>Do not expose secrets or internal stack details</td>
+      </tr>
+      <tr>
+        <td>Gateway could not obtain valid upstream response</td>
+        <td>502</td>
+        <td>Often separates proxy health from origin health</td>
+      </tr>
+      <tr>
+        <td>Temporarily unavailable</td>
+        <td>503</td>
+        <td>May include retry guidance when safe</td>
+      </tr>
+      <tr>
+        <td>Gateway timed out waiting for upstream</td>
+        <td>504</td>
+        <td>Upstream outcome can still be ambiguous</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="headers">High-value headers and metadata</h3>
+<ul>
+  <li><code>Host</code> or <code>:authority</code> selects an origin on shared infrastructure.</li>
+  <li>
+    <code>Content-Type</code> describes sent content; <code>Accept</code> expresses acceptable
+    response types.
+  </li>
+  <li>
+    <code>Content-Length</code> declares content size where used; conflicting framing is dangerous.
+  </li>
+  <li><code>Authorization</code> carries credentials and must not be logged in plaintext.</li>
+  <li><code>Cache-Control</code>, validators, and <code>Vary</code> govern reusable responses.</li>
+  <li>
+    <code>Location</code> identifies a redirect target or newly created resource, depending on
+    status.
+  </li>
+  <li>
+    <code>Retry-After</code> can guide retry timing for specific statuses, but clients still need
+    bounds and jitter.
+  </li>
+  <li>
+    Trace context and correlation fields support diagnosis, but are not proof of caller identity.
+  </li>
+</ul>
+
+<h2 id="http-cache"><span class="num">07.</span> HTTP caching and conditional requests</h2>
+<p class="lead">
+  HTTP caching is a protocol-level reuse contract between origin, private caches, and shared caches.
+</p>
+
+<p>
+  Freshness determines whether a stored response can be reused without contacting the origin.
+  Validation asks the origin whether a stored response still represents the resource. A cache key
+  starts with the target URI and method, then may vary using selected request fields named by
+  <code>Vary</code>. Forgetting an authorization-relevant or representation-selecting dimension can
+  leak one user's content to another.
+</p>
+
+<dl>
+  <dt>Cache-Control: max-age=60</dt>
+  <dd>The response is fresh for 60 seconds relative to its calculated age.</dd>
+  <dt>Cache-Control: private</dt>
+  <dd>A private cache may store it; a shared cache should not.</dd>
+  <dt>Cache-Control: no-store</dt>
+  <dd>Caches must not store the request or response under the normal HTTP caching rules.</dd>
+  <dt>ETag</dt>
+  <dd>An opaque validator for the selected representation.</dd>
+  <dt>Last-Modified</dt>
+  <dd>A time validator, generally less precise than a strong entity tag.</dd>
+</dl>
+
+<figure class="code">
+  <figcaption><b>Conditional read</b></figcaption>
+  <pre><code>client/cache                              origin
+  | GET /catalog/A-17                       |
+  | If-None-Match: "catalog-v8"             |
+  |----------------------------------------&gt;|
+  | 304 Not Modified                        |
+  | ETag: "catalog-v8"                      |
+  |&lt;----------------------------------------|
+  | reuse stored representation             |
+
+304 transfers metadata, not the full representation.</code></pre>
+</figure>
+
+<p>
+  Conditional mutation prevents lost updates. A client reads <code>ETag: "order-v4"</code>, edits,
+  then sends <code>If-Match: "order-v4"</code>. If another writer created version 5, the server
+  rejects the stale mutation instead of silently overwriting it.
+</p>
+
+<h2 id="http-versions"><span class="num">08.</span> HTTP/1.1, HTTP/2, and HTTP/3</h2>
+<p class="lead">The versions share HTTP semantics but encode and transport messages differently.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>HTTP/1.1</th>
+        <th>HTTP/2</th>
+        <th>HTTP/3</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Transport</td>
+        <td>Usually TCP, often with TLS</td>
+        <td>TCP, commonly TLS in practice</td>
+        <td>QUIC over UDP with TLS 1.3 integrated</td>
+      </tr>
+      <tr>
+        <td>Message encoding</td>
+        <td>Text start line and fields with content framing</td>
+        <td>Binary frames</td>
+        <td>Binary frames on QUIC streams</td>
+      </tr>
+      <tr>
+        <td>Parallelism</td>
+        <td>Often several connections; pipelining has ordered responses</td>
+        <td>Multiplexed streams on one connection</td>
+        <td>Multiplexed QUIC streams</td>
+      </tr>
+      <tr>
+        <td>Header compression</td>
+        <td>None in protocol</td>
+        <td>HPACK</td>
+        <td>QPACK</td>
+      </tr>
+      <tr>
+        <td>Loss effect</td>
+        <td>Stalls later bytes on that TCP connection</td>
+        <td>TCP loss can stall all streams on the connection</td>
+        <td>Transport loss normally stalls only affected stream data</td>
+      </tr>
+      <tr>
+        <td>Connection migration</td>
+        <td>No</td>
+        <td>No</td>
+        <td>QUIC can validate a new network path</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  HTTP/1.1 requires unambiguous message framing. Conflicting
+  <code>Content-Length</code>/<code>Transfer-Encoding</code> interpretations across proxy and origin
+  can enable request smuggling. Normalize strictly, reject ambiguity, keep components patched, and
+  test multi-hop parsing.
+</p>
+
+<p>
+  HTTP/2 multiplexes many streams but needs limits for concurrent streams, header list size, frame
+  rate, and flow-control state. A single busy connection can create uneven load when a proxy chooses
+  a backend once per connection. Graceful shutdown uses protocol signaling so new streams move
+  elsewhere while accepted streams finish.
+</p>
+
+<p>
+  HTTP/3 maps one request-response exchange to a QUIC stream and uses QPACK for field compression.
+  QUIC connection and stream flow-control limits must be tuned. UDP reachability, CPU cost, load
+  balancer support, connection ID routing, and observability tooling belong in the rollout plan.
+</p>
+
+<h2 id="api-styles"><span class="num">09.</span> REST, JSON, Protobuf, and RPC</h2>
+<p class="lead">
+  REST and RPC are contract styles. JSON and Protocol Buffers are representation formats. HTTP is a
+  protocol. Choose each dimension independently from requirements.
+</p>
+
+<h3 id="rest">REST constraints and resource modeling</h3>
+<p>
+  REST is an architectural style defined by constraints including client-server separation,
+  stateless requests, cacheability, a uniform interface, a layered system, and optional downloaded
+  code. A RESTful HTTP API models addressable resources and uses standard HTTP semantics rather than
+  treating every request as an unrelated tunnel.
+</p>
+
+<figure class="code">
+  <figcaption><b>Resource-oriented order workflow</b></figcaption>
+  <pre><code>POST   /orders                 create order
+GET    /orders/ord-318         retrieve current order representation
+PUT    /orders/ord-318/address replace the shipping-address subresource
+DELETE /orders/ord-318/hold    release an existing hold
+GET    /orders?cursor=...      traverse a collection
+
+An exceptional domain action can still be modeled explicitly:
+POST /orders/ord-318/cancellation-requests</code></pre>
+</figure>
+
+<p>
+  Stateless means each request carries the information needed to understand it. It does not mean the
+  server stores no data. Pagination, filtering, error representation, idempotency, authorization,
+  and concurrency behavior are part of the contract. Hypermedia can advertise state-dependent next
+  actions, though many production APIs use documented URI conventions instead.
+</p>
+
+<h3 id="json-protobuf">JSON versus Protocol Buffers</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Concern</th>
+        <th>JSON</th>
+        <th>Protocol Buffers</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Readability and tools</td>
+        <td>Human-readable and widely supported</td>
+        <td>Schema and generated tooling improve machine contracts</td>
+      </tr>
+      <tr>
+        <td>Encoding</td>
+        <td>Text with names repeated</td>
+        <td>Binary wire fields identified by numbers</td>
+      </tr>
+      <tr>
+        <td>Schema</td>
+        <td>Optional external schema and runtime validation</td>
+        <td>Interface definition is central to code generation</td>
+      </tr>
+      <tr>
+        <td>Evolution risk</td>
+        <td>Clients may depend on undocumented shapes or number behavior</td>
+        <td>Reusing field numbers or changing incompatible types corrupts meaning</td>
+      </tr>
+      <tr>
+        <td>Typical fit</td>
+        <td>Public APIs, browsers, debugging, heterogeneous clients</td>
+        <td>Controlled service contracts, compact high-volume messages</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  In Protobuf, field numbers are the wire identity. Never reuse a removed number or name; reserve
+  them. Adding fields is generally compatible because receivers can ignore unknown fields, but
+  correctness still depends on semantics, default behavior, enum evolution, presence, and
+  validation. A schema-compatible change can still break a business invariant.
+</p>
+
+<h3 id="rpc-grpc">RPC and gRPC</h3>
+<p>
+  RPC presents communication as invoking an operation on another process. The local-call appearance
+  is useful but incomplete: remote calls have latency, partial failure, serialization, deadlines,
+  authentication, and uncertain outcomes. Interfaces should expose these realities.
+</p>
+
+<figure class="code">
+  <figcaption><b>Protocol Buffers service definition</b></figcaption>
+  <pre><code>syntax = "proto3";
+
+service Inventory {
+  rpc Reserve(ReserveRequest) returns (ReserveReply);
+  rpc WatchAvailability(WatchRequest) returns (stream Availability);
+}
+
+message ReserveRequest {
+  string request_id = 1;
+  string sku = 2;
+  int32 quantity = 3;
+  reserved 4;
+}
+
+message ReserveReply {
+  string reservation_id = 1;
+  string status = 2;
+}</code></pre>
+</figure>
+
+<p>
+  gRPC commonly uses HTTP/2 transport and Protocol Buffers contracts. It supports unary,
+  server-streaming, client-streaming, and bidirectional-streaming methods. Metadata carries
+  call-level information. Deadlines bound usefulness, cancellation signals abandoned work, and
+  status codes communicate RPC outcomes. Cancellation is cooperative and does not roll back a
+  completed side effect.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Style</th>
+        <th>Good fit</th>
+        <th>Main caution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Resource-oriented HTTP and JSON</td>
+        <td>Public or browser-facing APIs, cacheable reads, broad interoperability</td>
+        <td>Contract discipline and runtime validation are still required</td>
+      </tr>
+      <tr>
+        <td>gRPC and Protobuf</td>
+        <td>Typed internal APIs, streaming, polyglot generated clients, compact messages</td>
+        <td>Browser and intermediary support, schema governance, and operational tooling</td>
+      </tr>
+      <tr>
+        <td>Asynchronous message</td>
+        <td>Decoupled work, buffering, replay, fan-out</td>
+        <td>Duplicates, ordering scope, lag, and eventual outcome</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="realtime"><span class="num">10.</span> Streaming, WebSocket, and Server-Sent Events</h2>
+<p class="lead">
+  Real-time delivery is a lifecycle and backpressure problem, not only a choice of wire protocol.
+</p>
+
+<dl>
+  <dt>HTTP response streaming</dt>
+  <dd>
+    Sends a bounded or unbounded response incrementally. Useful for large exports and streamed
+    records. Proxies must not buffer unexpectedly.
+  </dd>
+  <dt>gRPC streaming</dt>
+  <dd>
+    Provides typed one-way or bidirectional message streams with transport flow control. The
+    application still needs bounded queues and slow-consumer policy.
+  </dd>
+  <dt>WebSocket</dt>
+  <dd>
+    Begins with an HTTP handshake and becomes a full-duplex framed connection. Good for interactive
+    chat or collaborative state where both sides send at arbitrary times.
+  </dd>
+  <dt>Server-Sent Events, or SSE</dt>
+  <dd>
+    Streams UTF-8 events from server to browser using <code>text/event-stream</code>. Built-in event
+    IDs and reconnection fit one-way notifications.
+  </dd>
+</dl>
+
+<p>
+  For every long-lived stream define authentication refresh, reconnect backoff, resume position,
+  duplicate handling, ordering scope, heartbeat behavior, maximum message size, idle timeout,
+  per-tenant connection quota, slow-consumer limits, deploy draining, and what happens when history
+  needed for resume has expired.
+</p>
+
+<figure class="code">
+  <figcaption><b>Resume-safe notification stream</b></figcaption>
+  <pre><code>server sends: id=1041, event=order-status, data=packed event
+connection breaks after client receives but before it renders
+client reconnects with last processed id=1040
+server replays 1041 and later
+client applies event only if event id is newer than stored processed position
+
+Transport reconnection can duplicate delivery. Application state makes replay safe.</code></pre>
+</figure>
+
+<h2 id="deadlines"><span class="num">11.</span> Deadlines, cancellation, retries, and limits</h2>
+<p class="lead">
+  A timeout limits one wait. A deadline states when the entire result stops being useful.
+</p>
+
+<p>
+  Propagate the remaining deadline across service hops, reserving time for response transfer and
+  cleanup. Each hop must stop queued and in-flight work when cancellation is observed. If a server
+  ignores cancellation, abandoned work continues consuming capacity and can amplify an outage.
+</p>
+
+<figure class="code">
+  <figcaption><b>Deadline budget across a request</b></figcaption>
+  <pre><code>client total budget:                         800 ms
+edge processing and network:                  80 ms
+orders service queue and work:               180 ms
+inventory call allocated from remaining:     250 ms
+database work:                               120 ms
+response and safety reserve:                 170 ms
+
+At every hop:
+remaining = original_deadline - monotonic_elapsed
+if remaining &lt; minimum useful work, reject before starting.</code></pre>
+</figure>
+
+<p>
+  Retry only when the failure is plausibly transient, the operation is safe to repeat, the remaining
+  deadline permits it, and a bounded retry budget protects the dependency. Use exponential backoff
+  with jitter. A transport error before receiving a response does not prove the server did nothing.
+  For mutations, combine an idempotency key with persisted outcome and reconciliation.
+</p>
+
+<h3 id="payload-limits">Payload and metadata limits</h3>
+<p>
+  Limit request line or pseudo-header size, total header bytes, field count, compressed and
+  decompressed content, individual message size, stream duration, and expansion ratio. Apply
+  compatible limits at CDN, load balancer, gateway, framework, parser, and business layer. Reject
+  oversized bodies before buffering them into memory, stop reading when a streaming limit is
+  reached, and return a stable error without reflecting sensitive content.
+</p>
+
+<h2 id="secure-trace"><span class="num">12.</span> Complete secure request trace</h2>
+<p class="lead">
+  Trace every boundary to understand latency, identity, connection reuse, and ambiguous failure.
+</p>
+
+<p>
+  Assume a mobile client sends <code>GET https://api.shop.example/orders/ord-318</code>. The edge
+  load balancer terminates public TLS, authenticates a token, and uses mTLS to an orders backend.
+</p>
+
+<ol>
+  <li>
+    The client parses the URI into scheme, host, default port 443, path, and query. It checks local
+    policy, proxy configuration, existing connections, and DNS caches.
+  </li>
+  <li>
+    The stub resolver asks its recursive resolver for A and AAAA records. The recursive resolver
+    returns a cached answer or follows delegations to the authoritative zone. Each answer has a
+    remaining TTL.
+  </li>
+  <li>
+    The client chooses a reachable address. Its operating system selects a source address and
+    ephemeral port, uses a route to a next hop, and resolves local link addressing as needed.
+  </li>
+  <li>
+    A stateful firewall and NAT may create connection state. For TCP, client and edge complete the
+    three-way handshake. For HTTP/3, QUIC performs transport and cryptographic setup over UDP.
+  </li>
+  <li>
+    The TLS ClientHello names <code>api.shop.example</code> using SNI and offers ALPN protocols. The
+    edge selects a protocol, presents a certificate chain, proves private-key possession, and both
+    sides derive traffic keys.
+  </li>
+  <li>
+    The client validates the certificate chain, validity, hostname, signatures, constraints, and
+    policy. Only then does it treat the connection as authoritative for the HTTPS origin.
+  </li>
+  <li>
+    The client sends the HTTP request on a persistent connection or new multiplexed stream with an
+    authorization credential, accepted representation, trace context, and deadline.
+  </li>
+  <li>
+    The edge enforces parser, header, payload, abuse, and authentication policy. It removes or
+    overwrites untrusted forwarding identity fields instead of blindly trusting client input.
+  </li>
+  <li>
+    The load balancer selects a healthy orders instance. It obtains or reuses a backend connection,
+    validates the backend certificate for the expected workload identity, and forwards a reduced
+    deadline and authenticated caller context.
+  </li>
+  <li>
+    The orders service authorizes access to <code>ord-318</code>, reads state, constructs the
+    representation, and returns status, fields, validator, and cache policy.
+  </li>
+  <li>
+    Each proxy records its own timings and forwards the response. TLS protects each configured hop.
+    TCP or QUIC performs retransmission and flow control. The client validates message framing and
+    content type, then presents the result.
+  </li>
+  <li>
+    Connections remain reusable until lifetime, idle, health, certificate, deploy-drain, or protocol
+    policy closes them. Request completion does not require connection closure.
+  </li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Latency decomposition for one observed request</b></figcaption>
+  <pre><code>DNS lookup or cache decision
++ pool acquisition
++ network connect
++ TLS or QUIC handshake
++ request upload
++ edge queue and policy
++ backend pool acquisition and network
++ backend queue and application work
++ response time to first byte
++ response transfer
+= end-to-end latency
+
+On reused connections, connect and handshake can be zero for that request.
+Their cost still appears during churn, deploys, expiry, and failure.</code></pre>
+</figure>
+
+<h2 id="production"><span class="num">13.</span> Production architecture and operations</h2>
+<p class="lead">Operate the request as a chain of independently bounded, observable hops.</p>
+
+<h3 id="connection-capacity">Capacity and connection budgets</h3>
+<figure class="code">
+  <figcaption><b>Little's Law applied to network concurrency</b></figcaption>
+  <pre><code>peak arrival rate = 8,000 requests/second
+mean time in service = 0.12 seconds
+mean in-flight requests = 8,000 * 0.12 = 960
+
+If dependency latency rises to 2 seconds:
+in-flight requests = 8,000 * 2 = 16,000
+
+Without bounded admission, memory, streams, workers, and connections grow
+before useful throughput improves.</code></pre>
+</figure>
+
+<p>
+  Budget accepted connections, active streams, file descriptors, ephemeral ports, NAT mappings, TLS
+  handshakes per second, connection memory, receive and send buffers, proxy queues, and backend pool
+  size. Keep failure headroom. A zone loss sends more connections and handshakes to surviving zones
+  exactly when their caches and pools may be cold.
+</p>
+
+<h3 id="deployment-draining">Deployment and draining</h3>
+<ul>
+  <li>Fail readiness before stopping so no new work is assigned.</li>
+  <li>
+    Stop accepting new connections or streams while allowing bounded in-flight work to finish.
+  </li>
+  <li>
+    Use protocol-specific graceful signals such as connection close policy or GOAWAY where
+    applicable.
+  </li>
+  <li>Keep the grace period within caller deadlines and orchestration termination limits.</li>
+  <li>
+    Cancel remaining work safely, close listeners, and preserve idempotency for retried mutations.
+  </li>
+  <li>Stagger restarts to avoid simultaneous DNS, TLS, and connection storms.</li>
+</ul>
+
+<h3 id="observability">Layered observability</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Useful signals</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DNS</td>
+        <td>
+          Lookup latency, cache hit, result code, answer family, resolver, authoritative health
+        </td>
+      </tr>
+      <tr>
+        <td>IP and path</td>
+        <td>Reachability, packet loss, route change, MTU errors, round-trip time</td>
+      </tr>
+      <tr>
+        <td>TCP or QUIC</td>
+        <td>
+          Connect latency, retransmissions, resets, handshake failure, congestion, flow-control
+          stalls
+        </td>
+      </tr>
+      <tr>
+        <td>TLS</td>
+        <td>
+          Version, cipher, ALPN, handshake latency, resumption, validation alerts, certificate
+          expiry
+        </td>
+      </tr>
+      <tr>
+        <td>HTTP or RPC</td>
+        <td>
+          Method, route template, status, gRPC status, stream resets, payload size, time to first
+          byte
+        </td>
+      </tr>
+      <tr>
+        <td>Pool and queue</td>
+        <td>Open, active, idle, pending, acquisition latency, max age, rejection</td>
+      </tr>
+      <tr>
+        <td>Business outcome</td>
+        <td>Order result, idempotency reuse, authorization decision, duplicate suppression</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Use route templates such as <code>/orders/{id}</code>, not raw identifiers, as metric labels.
+  Redact credentials, cookies, query secrets, personal data, certificate subject details when
+  sensitive, and payloads by default. Correlation identifiers connect hops but must be validated for
+  size and syntax and must not grant trust.
+</p>
+
+<h3 id="troubleshooting">Troubleshooting by first failing layer</h3>
+<figure class="code">
+  <figcaption><b>Diagnostic decision sequence</b></figcaption>
+  <pre><code>Can the exact name and record type resolve?
+  no  - inspect resolver, delegation, authority, TTL, DNSSEC
+  yes - record every returned address
+
+Can transport connect to an address and port?
+  no  - inspect route, firewall, NAT, listener, backlog, packet loss
+  yes - measure connect latency and selected address family
+
+Can TLS authenticate and negotiate?
+  no  - inspect time, SNI, chain, hostname, trust, ALPN, versions
+  yes - record certificate fingerprint and negotiated protocol
+
+Does HTTP/RPC produce a valid response?
+  no  - inspect framing, proxy, timeout, reset, limits, status
+  yes - inspect authorization and domain correctness
+
+Is the result consistently correct?
+  no  - compare destination instance, cache, version, tenant, retry history</code></pre>
+</figure>
+
+<h2 id="security"><span class="num">14.</span> Security, privacy, and abuse</h2>
+<p class="lead">
+  Every resolver, proxy, parser, credential boundary, and backend connection is a trust boundary.
+</p>
+
+<ul>
+  <li>
+    <strong>Name resolution:</strong> use DNSSEC where its authenticity guarantee is required,
+    secure registrar and DNS control-plane accounts, restrict zone transfers, and monitor
+    unauthorized changes.
+  </li>
+  <li>
+    <strong>TLS:</strong> require supported protocol versions, validate names and chains, automate
+    rotation, protect keys, and do not use encryption as a substitute for authorization.
+  </li>
+  <li>
+    <strong>Proxy identity:</strong> strip client-supplied forwarding and identity headers at the
+    first trusted boundary, then add authenticated internal context.
+  </li>
+  <li>
+    <strong>Parser differentials:</strong> reject ambiguous HTTP framing, duplicate security fields,
+    invalid field syntax, and inconsistent URL normalization across gateway and application.
+  </li>
+  <li>
+    <strong>SSRF:</strong> validate allowed destinations after parsing and resolution, block private
+    and metadata networks as policy requires, control redirects, and defend against DNS rebinding.
+  </li>
+  <li>
+    <strong>Amplification:</strong> validate reachability before large UDP responses, rate-limit
+    unauthenticated work, and avoid response sizes far larger than requests.
+  </li>
+  <li>
+    <strong>Resource abuse:</strong> bound headers, bodies, decompression, streams, connections,
+    handshake CPU, request rates, concurrent work, and idle time.
+  </li>
+  <li>
+    <strong>Privacy:</strong> minimize IP, hostname, query, SNI, certificate, and payload logging.
+    Encrypt sensitive hops and define retention, access, and deletion.
+  </li>
+</ul>
+
+<div class="note">
+  <strong>TLS does not hide all metadata</strong>
+  <p>
+    Network observers can still learn addresses, timing, sizes, and other transport metadata.
+    Depending on protocol and deployment, DNS queries and server-name information may also be
+    visible. State the privacy goal precisely instead of saying traffic is invisible because content
+    is encrypted.
+  </p>
+</div>
+
+<h2 id="performance"><span class="num">15.</span> Performance, scalability, and cost</h2>
+<p class="lead">
+  Optimize round trips, reusable state, bytes, and queueing only after measuring the end-to-end
+  critical path.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>Benefit</th>
+        <th>Trade-off or limit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DNS caching</td>
+        <td>Removes lookup latency and authority load</td>
+        <td>Slower change visibility and coarse traffic movement</td>
+      </tr>
+      <tr>
+        <td>Connection pooling</td>
+        <td>Amortizes connect and TLS cost</td>
+        <td>Stale state, uneven load, finite ports and descriptors</td>
+      </tr>
+      <tr>
+        <td>TLS resumption</td>
+        <td>Reduces handshake computation and latency</td>
+        <td>Ticket-key scope, replay concern for early data</td>
+      </tr>
+      <tr>
+        <td>HTTP multiplexing</td>
+        <td>Fewer connections and concurrent streams</td>
+        <td>Connection-level failure, flow-control tuning, load concentration</td>
+      </tr>
+      <tr>
+        <td>Compression</td>
+        <td>Fewer network bytes</td>
+        <td>CPU, latency, secret leakage patterns, decompression bombs</td>
+      </tr>
+      <tr>
+        <td>Binary schema</td>
+        <td>Compact messages and generated contracts</td>
+        <td>Schema governance and less direct readability</td>
+      </tr>
+      <tr>
+        <td>Regional edge termination</td>
+        <td>Shorter client handshake and policy path</td>
+        <td>More certificates, trust boundaries, and cross-region backend cost</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A rough transfer lower bound is payload bytes divided by available throughput, but latency also
+  includes propagation, handshakes, congestion windows, queueing, serialization, and application
+  time. Small requests are often round-trip bound. Large transfers are often throughput and
+  congestion bound. Tail latency worsens under packet loss and saturation.
+</p>
+
+<p>
+  Count egress charges, cross-zone or cross-region traffic, load balancer processing, public address
+  use, certificate and key operations, DNS queries, logging volume, and idle connection memory.
+  Compression can trade compute cost for egress savings. A chat system with millions of mostly idle
+  connections needs connection capacity and heartbeat efficiency even at low message throughput.
+</p>
+
+<h2 id="failures"><span class="num">16.</span> Failure scenarios and safer corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>Misleading conclusion</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DNS returns an address</td>
+        <td>The service is healthy</td>
+        <td>Test transport, TLS, HTTP, and domain behavior for each address</td>
+      </tr>
+      <tr>
+        <td>TCP connect succeeds</td>
+        <td>The application is ready</td>
+        <td>Use readiness that checks required serving state without overloading dependencies</td>
+      </tr>
+      <tr>
+        <td>Client timed out</td>
+        <td>The mutation failed</td>
+        <td>Treat outcome as unknown; query by idempotency key or operation ID</td>
+      </tr>
+      <tr>
+        <td>Certificate is unexpired</td>
+        <td>TLS identity is valid</td>
+        <td>Validate name, chain, constraints, signature, time, and policy</td>
+      </tr>
+      <tr>
+        <td>Traffic is internal</td>
+        <td>Plaintext and broad trust are safe</td>
+        <td>Authenticate workloads, authorize narrowly, encrypt sensitive hops</td>
+      </tr>
+      <tr>
+        <td>HTTP/2 uses one connection</td>
+        <td>One connection scales without limits</td>
+        <td>Bound streams, monitor flow control, and preserve backend load distribution</td>
+      </tr>
+      <tr>
+        <td>UDP has no connection</td>
+        <td>UDP is free of state</td>
+        <td>Account for NAT, firewall, QUIC, and application session state</td>
+      </tr>
+      <tr>
+        <td>DELETE is idempotent</td>
+        <td>Every repeat returns the same status</td>
+        <td>Reason about intended effect, not identical response bytes</td>
+      </tr>
+      <tr>
+        <td>mTLS authenticated a service</td>
+        <td>Every request from it is authorized</td>
+        <td>Apply resource and action policy after authentication</td>
+      </tr>
+      <tr>
+        <td>Retry fixed one request</td>
+        <td>More retries improve reliability</td>
+        <td>Use bounded, budgeted, jittered retries only for eligible operations</td>
+      </tr>
+      <tr>
+        <td>Low average latency</td>
+        <td>Network path is healthy</td>
+        <td>Measure tail latency, loss, retransmission, pool wait, and destination split</td>
+      </tr>
+      <tr>
+        <td>Increasing payload limit helps a client</td>
+        <td>Only memory changes</td>
+        <td>Review every proxy, timeout, abuse, decompression, and buffering boundary</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="testing"><span class="num">17.</span> Testing strategy</h2>
+<p class="lead">
+  Test contracts, wire behavior, capacity limits, failures, and recovery at the boundaries where
+  production can disagree.
+</p>
+
+<h3 id="unit-contract-tests">Unit and contract tests</h3>
+<ul>
+  <li>URI parsing, canonicalization, status mapping, content negotiation, and cache policy.</li>
+  <li>
+    JSON and Protobuf validation, unknown fields, missing presence, enum evolution, and reserved
+    fields.
+  </li>
+  <li>
+    Idempotency-key fingerprinting, replayed outcomes, key collision, expiry, and mismatched
+    payload.
+  </li>
+  <li>Deadline arithmetic using a monotonic clock and cancellation propagation.</li>
+  <li>Certificate name and identity mapping policy with valid and invalid fixtures.</li>
+</ul>
+
+<h3 id="integration-tests">Integration and interoperability tests</h3>
+<ul>
+  <li>Resolve against authoritative and recursive test DNS, including NXDOMAIN and TTL expiry.</li>
+  <li>
+    Exercise IPv4, IPv6, TCP, QUIC fallback, proxies, NAT-like idle expiry, and path MTU
+    constraints.
+  </li>
+  <li>
+    Test TLS with missing intermediate, wrong name, expired certificate, rotated trust, ALPN
+    mismatch, and mTLS denial.
+  </li>
+  <li>
+    Run HTTP/1.1, HTTP/2, and HTTP/3 clients against the real proxy chain and reject ambiguous
+    framing.
+  </li>
+  <li>Verify REST and gRPC compatibility with older and newer generated clients.</li>
+  <li>
+    Test WebSocket, SSE, and RPC streams through production-equivalent proxy buffering and timeouts.
+  </li>
+</ul>
+
+<h3 id="load-fault-recovery">Load, fault, and recovery tests</h3>
+<ul>
+  <li>Measure cold and warm DNS, full and resumed TLS, new and reused connections separately.</li>
+  <li>
+    Find sustainable requests, streams, connections, handshakes, bytes, and messages per second.
+  </li>
+  <li>Inject delay, loss, reordering, reset, half-close, blackholed packets, and blocked UDP.</li>
+  <li>
+    Exhaust pool, file descriptor, ephemeral port, NAT mapping, stream, header, and body limits
+    safely.
+  </li>
+  <li>Rotate certificates and DNS answers during traffic, then drain and restart every hop.</li>
+  <li>
+    Cancel clients after request upload and confirm abandoned backend work stops or reconciles.
+  </li>
+  <li>
+    Soak long-lived connections through key rotation, deploys, network change, and idle periods.
+  </li>
+  <li>
+    Verify dashboards and alerts identify the first failing layer rather than only reporting 5xx.
+  </li>
+</ul>
+
+<h2 id="examples"><span class="num">18.</span> Focused implementation examples</h2>
+<p class="lead">
+  Language APIs expose protocol controls, but the correctness principle remains independent of the
+  library.
+</p>
+
+<h3 id="go-client">Go: one bounded HTTP client</h3>
+<figure class="code">
+  <figcaption><b>Propagate one request deadline and reuse the client</b></figcaption>
+  <pre><code>var client = &amp;http.Client{
+    Timeout: 800 * time.Millisecond,
+}
+
+func fetchOrder(parent context.Context, id string) (*http.Response, error) {
+    ctx, cancel := context.WithTimeout(parent, 750*time.Millisecond)
+    defer cancel()
+
+    url := "https://api.shop.example/orders/" + url.PathEscape(id)
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Accept", "application/json")
+    return client.Do(req)
+}</code></pre>
+</figure>
+
+<p>
+  Reusing the Go client allows its transport to pool connections. Context cancellation bounds the
+  request lifecycle. Production code still needs response body closure, size-limited decoding,
+  stable error handling, TLS policy, observability, and carefully scoped retry behavior.
+</p>
+
+<h3 id="node-stream">Node.js: consume a response with a byte limit</h3>
+<figure class="code">
+  <figcaption><b>Abort before an unexpected payload consumes unbounded memory</b></figcaption>
+  <pre><code>async function readLimited(response, maximumBytes) {
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received &gt; maximumBytes) {
+      await reader.cancel("response too large");
+      throw new Error("response exceeds configured limit");
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks.map((chunk) =&gt; Buffer.from(chunk)));
+}</code></pre>
+</figure>
+
+<p>
+  A declared Content-Length can support early rejection but must not be the only control. Streaming
+  and compressed content can exceed expectations, so enforce the actual decoded and encoded limits
+  required by the trust model.
+</p>
+
+<h3 id="java-socket">Java: explicit socket phases</h3>
+<figure class="code">
+  <figcaption><b>Separate connect timeout from read timeout</b></figcaption>
+  <pre><code>try (Socket socket = new Socket()) {
+    socket.connect(
+        new InetSocketAddress("inventory.internal.example", 7443),
+        300);
+    socket.setSoTimeout(500);
+
+    // Application framing and TLS are still required for a real protocol.
+    // A successful connect proves only that the transport endpoint accepted.
+}</code></pre>
+</figure>
+
+<p>
+  A socket read timeout bounds blocked reads, not the complete operation. Higher-level code should
+  carry one end-to-end deadline, secure the channel, define message framing, and cancel useful work
+  when that deadline expires.
+</p>
+
+<h2 id="design-scenario">
+  <span class="num">19.</span> Design scenario: order API and live status
+</h2>
+<p class="lead">
+  Choose protocol behavior from workload assumptions instead of declaring one API style universally
+  best.
+</p>
+
+<h3 id="scenario-assumptions">Assumptions</h3>
+<ul>
+  <li>Public mobile and web clients create and read orders using HTTPS.</li>
+  <li>Peak traffic is 12,000 reads and 2,000 creates per second across three zones.</li>
+  <li>Order creation must not duplicate an order after an ambiguous retry.</li>
+  <li>Public p99 target is 400 ms for reads and 800 ms for accepted creation.</li>
+  <li>Clients may receive order-status updates within five seconds, with reconnect support.</li>
+  <li>Internal inventory calls need typed contracts and a 250 ms deadline.</li>
+</ul>
+
+<h3 id="scenario-decisions">First-pass decisions</h3>
+<ol>
+  <li>
+    Publish a resource-oriented JSON API for broad client compatibility. Use POST with an
+    idempotency key for creation, GET with ETag for reads, and stable problem details for errors.
+  </li>
+  <li>
+    Return 201 when the order and initial state are durably created. If processing becomes
+    asynchronous, return 202 with a status resource and state that acceptance is not completion.
+  </li>
+  <li>
+    Use SSE for one-way status delivery because browsers need server-to-client updates but do not
+    send interactive messages on the same channel. Carry event IDs for resume and deduplicate.
+  </li>
+  <li>
+    Use unary gRPC for the controlled inventory boundary, with Protobuf evolution rules, mTLS
+    workload identity, explicit authorization, propagated deadline, and request ID.
+  </li>
+  <li>
+    Terminate public TLS at a multi-zone edge and re-encrypt to backends. Strip untrusted forwarding
+    headers. Limit requests and streams per caller before costly authentication and decoding.
+  </li>
+  <li>
+    Keep bounded per-destination connection pools. Size them from measured concurrency and surviving
+    zone capacity, not from traffic averages.
+  </li>
+</ol>
+
+<h3 id="scenario-failure-review">Failure review</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Expected behavior</th>
+        <th>Evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One DNS answer points to failed edge</td>
+        <td>Client tries another address; unhealthy address is removed but kept drained</td>
+        <td>Per-address connect errors, DNS TTL, edge health</td>
+      </tr>
+      <tr>
+        <td>Create response lost after commit</td>
+        <td>Retry with same key returns original order</td>
+        <td>Idempotency record and order audit</td>
+      </tr>
+      <tr>
+        <td>Inventory exceeds deadline</td>
+        <td>Cancel call, preserve known order state, expose retryable processing state</td>
+        <td>Remaining deadline, gRPC status, cancelled backend work</td>
+      </tr>
+      <tr>
+        <td>SSE client is slow</td>
+        <td>Bound queue, disconnect, and resume from last processed event</td>
+        <td>Queue depth, disconnect reason, replay lag</td>
+      </tr>
+      <tr>
+        <td>Certificate rotation serves wrong chain</td>
+        <td>Canary fails, rollout stops, prior certificate remains available</td>
+        <td>External handshake probes and certificate fingerprint</td>
+      </tr>
+      <tr>
+        <td>One zone lost at peak</td>
+        <td>Remaining zones admit within tested capacity and shed excess safely</td>
+        <td>Connections, streams, handshakes, saturation, success SLI</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="exercises"><span class="num">20.</span> Hands-on exercises</h2>
+<ol>
+  <li>
+    Trace one HTTPS request with a cold DNS cache and no connection. Count network round trips for
+    DNS, TCP, TLS 1.3, and the first response byte under a simplified one-RTT-per-stage assumption.
+    Repeat with cached DNS and a reusable connection.
+  </li>
+  <li>
+    Design a DNS migration from address A to B when the current TTL is one hour. Include lowering
+    TTL, waiting, overlap, rollback, monitoring, and final cleanup.
+  </li>
+  <li>
+    A proxy has 20,000 active HTTP/2 streams on 200 backend connections. Explain why connection
+    count alone misses load and propose stream, pool-wait, and destination metrics.
+  </li>
+  <li>
+    Model a payment POST whose response is lost. Write pseudocode for an idempotency record,
+    fingerprint check, atomic business effect, saved outcome, retry, and reconciliation.
+  </li>
+  <li>
+    Compare REST plus JSON, gRPC plus Protobuf, WebSocket, SSE, and asynchronous messaging for order
+    creation, inventory lookup, chat, live notifications, and analytics ingestion.
+  </li>
+  <li>
+    Create a certificate failure lab with wrong hostname, expired leaf, missing intermediate,
+    untrusted root, invalid client identity, and ALPN mismatch. Predict each observable failure.
+  </li>
+  <li>
+    Inject a path MTU black hole. Explain why a handshake or small request might work while a large
+    response stalls, then list transport and packet evidence.
+  </li>
+  <li>
+    Calculate average in-flight requests at 5,000 RPS and 80 ms. Recalculate at 1.2 seconds and
+    design bounded admission for the overload case.
+  </li>
+  <li>
+    Design a resume protocol for a notification stream. State ordering scope, event retention,
+    duplicate handling, slow-consumer policy, and behavior when the cursor is too old.
+  </li>
+  <li>
+    Threat-model an image-fetch URL API for SSRF, DNS rebinding, redirect escape, large content,
+    decompression, private-address access, and credential forwarding.
+  </li>
+</ol>
+
+<h2 id="interview"><span class="num">21.</span> Interview questions and model answers</h2>
+
+<h3 id="qa-stack">1. What happens after entering an HTTPS URL?</h3>
+<p>
+  Parse the URI, check caches and policy, resolve the name, choose an address and route, establish
+  TCP or QUIC, negotiate TLS and validate identity, send HTTP, traverse proxies, authorize and
+  process at the backend, then return the response. Mention connection reuse because cached DNS and
+  an existing secure connection can skip setup.
+</p>
+<p>
+  <strong>Follow-up:</strong> Which stages can be cached or reused, and which trust checks remain?
+</p>
+
+<h3 id="qa-dns">2. Recursive versus authoritative DNS?</h3>
+<p>
+  A recursive resolver performs resolution for clients and caches results. An authoritative server
+  serves original data for a zone. A resolver may answer from cache without contacting the
+  authority. An authoritative server does not generally walk the global tree for the client.
+</p>
+<p><strong>Follow-up:</strong> Why can an updated record remain unseen until TTL expiry?</p>
+
+<h3 id="qa-dns-lb">3. Why is DNS not a precise request load balancer?</h3>
+<p>
+  Answers are cached by recursive resolvers and applications, many clients can share one cache,
+  clients choose among addresses differently, and DNS does not observe every request or live
+  connection. Use it for coarse distribution and combine it with healthy capacity and Layer 4 or
+  Layer 7 balancing.
+</p>
+<p><strong>Follow-up:</strong> How would you safely remove one destination?</p>
+
+<h3 id="qa-tcp">4. What does TCP guarantee?</h3>
+<p>
+  TCP gives an ordered, reliable byte stream with duplicate suppression, retransmission, flow
+  control, and congestion control while the connection operates. It does not preserve application
+  message boundaries, encrypt content, or prove that acknowledged bytes produced a business commit.
+</p>
+<p><strong>Follow-up:</strong> Why can a client timeout leave a payment outcome unknown?</p>
+
+<h3 id="qa-flow">5. Flow control versus congestion control?</h3>
+<p>
+  Flow control prevents a sender from overrunning the receiver's buffer. Congestion control limits
+  traffic to what the network path can sustain. Application backpressure is a third layer that
+  protects workers and dependencies even when transport buffers have space.
+</p>
+<p><strong>Follow-up:</strong> What signals show each kind of pressure?</p>
+
+<h3 id="qa-hol">6. What is head-of-line blocking?</h3>
+<p>
+  Ordered delivery means later data waits for missing earlier data. HTTP/1.1 pipelined responses
+  wait in response order. HTTP/2 multiplexes frames, but all streams share TCP ordered delivery, so
+  packet loss can stall them. QUIC provides independent ordered streams, so loss normally blocks
+  only affected stream data.
+</p>
+<p><strong>Follow-up:</strong> Does QUIC eliminate every kind of head-of-line blocking?</p>
+
+<h3 id="qa-tls">7. What does a TLS client verify?</h3>
+<p>
+  It validates a certificate path to a trusted anchor, signatures, time validity, constraints, key
+  use, local policy, and that an allowed certificate identifier matches the intended host or service
+  identity. It also verifies handshake proofs. Encryption without peer verification is vulnerable to
+  interception.
+</p>
+<p><strong>Follow-up:</strong> Why is an unexpired certificate still possibly invalid?</p>
+
+<h3 id="qa-mtls">8. Is mTLS authorization?</h3>
+<p>
+  No. mTLS authenticates the peer identity under a certificate trust model and protects the channel.
+  Authorization separately decides whether that identity can perform an action on a resource. Broad
+  certificate trust without narrow policy can create excessive privilege.
+</p>
+<p><strong>Follow-up:</strong> How do you rotate client identities without downtime?</p>
+
+<h3 id="qa-http-methods">9. Safe versus idempotent HTTP methods?</h3>
+<p>
+  Safe methods request read-only semantics. Idempotent methods have the same intended effect when
+  repeated as when performed once. GET is both. PUT and DELETE are idempotent but not safe. POST is
+  neither by default, though an application can make a POST operation replay-safe with an
+  idempotency contract.
+</p>
+<p><strong>Follow-up:</strong> Can an idempotent retry return a different response?</p>
+
+<h3 id="qa-cache">10. Freshness versus validation?</h3>
+<p>
+  A fresh cached response can be reused without contacting the origin. A stale stored response can
+  be conditionally validated with ETag or Last-Modified. A 304 response confirms reuse while
+  avoiding the full representation transfer.
+</p>
+<p><strong>Follow-up:</strong> How can a wrong Vary policy leak tenant data?</p>
+
+<h3 id="qa-rest-rpc">11. REST versus RPC?</h3>
+<p>
+  REST applies architectural constraints and a uniform resource interface. RPC exposes named remote
+  operations. REST over HTTP often fits public, cache-aware interoperability. Typed RPC often fits
+  controlled internal contracts and streaming. Neither removes the need for deadlines,
+  compatibility, authentication, idempotency, and failure semantics.
+</p>
+<p>
+  <strong>Follow-up:</strong> Which would you use for browser clients and internal inventory, and
+  why?
+</p>
+
+<h3 id="qa-protobuf">12. How do Protobuf schemas evolve safely?</h3>
+<p>
+  Add fields with new numbers, tolerate unknown fields, preserve the semantics of existing fields,
+  and reserve removed numbers and names. Review presence, defaults, enum evolution, validation, and
+  old-client behavior. Wire compatibility alone does not guarantee business compatibility.
+</p>
+<p><strong>Follow-up:</strong> Why must a removed field number never be reused?</p>
+
+<h3 id="qa-deadline">13. Timeout versus deadline?</h3>
+<p>
+  A timeout bounds one duration, such as connect or read wait. A deadline is an absolute end for the
+  complete operation and should propagate as remaining budget. Without propagation, each service can
+  spend the full timeout and continue work after the caller has abandoned it.
+</p>
+<p>
+  <strong>Follow-up:</strong> Why should downstream timeouts be smaller than remaining client
+  budget?
+</p>
+
+<h3 id="qa-streaming">14. WebSocket versus SSE?</h3>
+<p>
+  WebSocket is full-duplex framed communication and fits interactive two-way traffic. SSE is a
+  server-to-client event stream with browser reconnection behavior and event IDs, fitting
+  notifications. The real design also depends on proxies, authentication refresh, resume, slow
+  consumers, limits, and expected connection scale.
+</p>
+<p><strong>Follow-up:</strong> How do you deploy without dropping every stream at once?</p>
+
+<h3 id="qa-pooling">15. How can connection pooling fail?</h3>
+<p>
+  Pools can exhaust, queue callers invisibly, retain stale or imbalanced connections, exceed NAT or
+  server capacity, and create reconnect storms. Bound them, set acquisition and lifecycle limits,
+  align with downstream capacity, drain gracefully, and measure active, idle, pending, age, and
+  destination distribution.
+</p>
+<p><strong>Follow-up:</strong> How does HTTP/2 change pool sizing?</p>
+
+<h3 id="qa-504">16. What does a 504 prove?</h3>
+<p>
+  It proves a gateway did not receive a timely upstream response under its policy. It does not prove
+  the upstream performed no side effect. For a mutation, the business outcome may be unknown and
+  requires an idempotency key, operation status, or reconciliation.
+</p>
+<p><strong>Follow-up:</strong> When is an automatic retry safe?</p>
+
+<h3 id="qa-mtu">17. Why might small requests work but large ones hang?</h3>
+<p>
+  A path MTU problem can drop packets above a threshold while smaller packets pass. If required ICMP
+  feedback is blocked, the sender may not adapt. Also check proxy body limits, flow control,
+  decompression, and application buffering because similar symptoms can occur above IP.
+</p>
+<p>
+  <strong>Follow-up:</strong> What packet-level evidence separates MTU trouble from application
+  limits?
+</p>
+
+<h3 id="qa-observe">18. How do you debug network latency?</h3>
+<p>
+  Decompose DNS, pool wait, connect, TLS, upload, proxy queue, backend queue, application work,
+  time-to-first-byte, and transfer. Split by address family, destination, protocol, reuse, status,
+  and region. Correlate retransmissions, flow-control stalls, saturation, and business outcome.
+</p>
+<p><strong>Follow-up:</strong> Why is average end-to-end latency insufficient?</p>
+
+<h3 id="qa-termination">19. Where should TLS terminate?</h3>
+<p>
+  Choose from the trust and operation model. Edge termination centralizes routing and security
+  controls. Re-encryption protects backend hops. Passthrough preserves the backend as the public
+  cryptographic endpoint but limits Layer 7 inspection. State who can see plaintext and how every
+  backend identity is verified.
+</p>
+<p><strong>Follow-up:</strong> What changes when regulated data crosses the edge-to-backend hop?</p>
+
+<h3 id="qa-version">20. Does HTTP/3 always beat HTTP/2?</h3>
+<p>
+  No. HTTP/3 can reduce setup latency, avoid cross-stream TCP loss blocking, and support migration,
+  but performance depends on loss, round trips, CPU, implementation, UDP reachability, connection
+  reuse, and workload. Measure production-shaped clients and retain fallback.
+</p>
+<p><strong>Follow-up:</strong> Which metrics would justify or stop an HTTP/3 rollout?</p>
+
+<h2 id="cheat-sheet"><span class="num">22.</span> Concise cheat sheet</h2>
+<ul>
+  <li>DNS names, IP addresses, and authenticated service identities are different.</li>
+  <li>IP is best effort; transports and applications add stronger behavior.</li>
+  <li>A TCP connection uses protocol plus source and destination addresses and ports.</li>
+  <li>TCP is an ordered byte stream, not a message protocol.</li>
+  <li>Flow control protects the receiver; congestion control protects the network path.</li>
+  <li>Transport acknowledgement does not prove business commit.</li>
+  <li>Pool acquisition, ports, descriptors, NAT state, and streams are finite resources.</li>
+  <li>DNS TTL controls cache reuse, so changes need overlapping destinations and time.</li>
+  <li>Authoritative servers own zone data; recursive resolvers find and cache answers.</li>
+  <li>QUIC integrates TLS 1.3 and independent streams over UDP.</li>
+  <li>TLS needs chain and hostname or service-identity verification.</li>
+  <li>mTLS authenticates a peer; authorization still decides permission.</li>
+  <li>HTTP semantics remain consistent across HTTP/1.1, HTTP/2, and HTTP/3.</li>
+  <li>Safe describes requested semantics; idempotent describes repeated intended effect.</li>
+  <li>ETag supports cache validation and conditional mutation.</li>
+  <li>REST is an architectural style; RPC is an operation-oriented interaction style.</li>
+  <li>JSON is readable; Protobuf is compact and schema-driven.</li>
+  <li>Reserve removed Protobuf field numbers and preserve business semantics.</li>
+  <li>WebSocket is full duplex; SSE is a server-to-client event stream.</li>
+  <li>Propagate a deadline, cooperate with cancellation, and bound retries.</li>
+  <li>Limit headers, payloads, decoded size, streams, connections, and work.</li>
+  <li>A timeout during mutation creates an unknown outcome, not proof of failure.</li>
+  <li>Measure every network phase and diagnose from the first failing layer.</li>
+</ul>
+
+<h2 id="references"><span class="num">23.</span> Official references and standards</h2>
+<ul>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc8200" target="_blank" rel="noopener noreferrer"
+      >RFC 8200: Internet Protocol, Version 6 Specification</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9293" target="_blank" rel="noopener noreferrer"
+      >RFC 9293: Transmission Control Protocol</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc5681" target="_blank" rel="noopener noreferrer"
+      >RFC 5681: TCP Congestion Control</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc768" target="_blank" rel="noopener noreferrer"
+      >RFC 768: User Datagram Protocol</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9000" target="_blank" rel="noopener noreferrer"
+      >RFC 9000: QUIC, A UDP-Based Multiplexed and Secure Transport</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9002" target="_blank" rel="noopener noreferrer"
+      >RFC 9002: QUIC Loss Detection and Congestion Control</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc1034" target="_blank" rel="noopener noreferrer"
+      >RFC 1034: Domain Names - Concepts and Facilities</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc1035" target="_blank" rel="noopener noreferrer"
+      >RFC 1035: Domain Names - Implementation and Specification</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc2308" target="_blank" rel="noopener noreferrer"
+      >RFC 2308: Negative Caching of DNS Queries</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc7766" target="_blank" rel="noopener noreferrer"
+      >RFC 7766: DNS Transport over TCP</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc4033" target="_blank" rel="noopener noreferrer"
+      >RFC 4033: DNS Security Introduction and Requirements</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc8446" target="_blank" rel="noopener noreferrer"
+      >RFC 8446: The Transport Layer Security Protocol Version 1.3</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc5280" target="_blank" rel="noopener noreferrer"
+      >RFC 5280: Internet X.509 Public Key Infrastructure Certificate Profile</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9525" target="_blank" rel="noopener noreferrer"
+      >RFC 9525: Service Identity in TLS</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9110" target="_blank" rel="noopener noreferrer"
+      >RFC 9110: HTTP Semantics</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9111" target="_blank" rel="noopener noreferrer"
+      >RFC 9111: HTTP Caching</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9112" target="_blank" rel="noopener noreferrer"
+      >RFC 9112: HTTP/1.1</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9113" target="_blank" rel="noopener noreferrer"
+      >RFC 9113: HTTP/2</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9114" target="_blank" rel="noopener noreferrer"
+      >RFC 9114: HTTP/3</a
+    >
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc6455" target="_blank" rel="noopener noreferrer"
+      >RFC 6455: The WebSocket Protocol</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://html.spec.whatwg.org/multipage/server-sent-events.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >WHATWG HTML: Server-Sent Events</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.ics.uci.edu/~fielding/pubs/dissertation/rest_arch_style.htm"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Roy Fielding: Representational State Transfer architectural style</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://protobuf.dev/programming-guides/proto3/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Protocol Buffers: Language Guide</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://protobuf.dev/programming-guides/encoding/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Protocol Buffers: Encoding</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://grpc.io/docs/what-is-grpc/core-concepts/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >gRPC: Core concepts, architecture, and lifecycle</a
+    >
+  </li>
+  <li>
+    <a href="https://grpc.io/docs/guides/deadlines/" target="_blank" rel="noopener noreferrer"
+      >gRPC: Deadlines</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/Socket.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Java SE 21: Socket API</a
+    >
+  </li>
+  <li>
+    <a href="https://pkg.go.dev/net/http" target="_blank" rel="noopener noreferrer"
+      >Go standard library: net/http</a
+    >
+  </li>
+  <li>
+    <a href="https://nodejs.org/api/http.html" target="_blank" rel="noopener noreferrer"
+      >Node.js: HTTP API</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

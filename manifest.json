@@ -122,6 +122,10 @@
           "path": "systemdesign/data-storage-data-model-selection"
         },
         {
+          "title": "Networking, DNS, TCP, TLS, HTTP, REST, and RPC",
+          "path": "systemdesign/networking-dns-tcp-tls-http-rpc"
+        },
+        {
           "title": "Scalability, Load Balancing, Service Discovery, and Rate Control",
           "path": "systemdesign/scalability-load-balancing-service-discovery-rate-control"
         }
