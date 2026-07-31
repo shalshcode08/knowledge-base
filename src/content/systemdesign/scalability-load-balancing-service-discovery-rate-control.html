@@ -1,0 +1,2051 @@
+<h1>Scalability, Load Balancing, Service Discovery, and Rate Control - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to growing a service safely, spreading work across changing instances,
+  finding healthy destinations, and controlling demand before overload becomes a cascading failure.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> One capacity-control loop</h2>
+<p class="lead">
+  Scaling supplies capacity, discovery publishes capacity, load balancing places work on capacity,
+  and rate control keeps admitted work within capacity.
+</p>
+
+<p>
+  Treat these as one feedback system, not four unrelated features. A new instance is useful only
+  after it starts, warms, becomes ready, appears in discovery, and receives an appropriate share of
+  traffic. A terminating instance is safe only after it stops receiving new work, finishes or
+  transfers existing work, disappears from discovery, and shuts down. Rate control protects this
+  loop when demand changes faster than capacity can change.
+</p>
+
+<figure class="code">
+  <figcaption><b>The serving loop</b></figcaption>
+  <pre><code>observed demand and saturation
+            |
+            v
+  capacity controller ---- creates or removes instances
+            |                         |
+            |                         v
+            |             starting - warming - ready - draining - stopped
+            |                         |
+            v                         v
+  admission and rate control -&gt; discovery -&gt; load balancer -&gt; ready instance
+            ^                                               |
+            |                                               v
+            +------ latency, errors, queue depth, load ------+</code></pre>
+</figure>
+
+<div class="key">
+  <strong>The governing invariant</strong>
+  <p>
+    The rate of admitted work must remain below the sustainable useful-work capacity of the healthy
+    fleet and every required dependency. If demand exceeds that boundary, queue, degrade, defer, or
+    reject work deliberately. Letting every request enter does not create capacity.
+  </p>
+</div>
+
+<dl>
+  <dt>Scalability</dt>
+  <dd>
+    The ability to handle a larger workload by adding resources without unacceptable loss of
+    efficiency, correctness, reliability, or cost control.
+  </dd>
+  <dt>Elasticity</dt>
+  <dd>
+    The ability to add and remove capacity in response to changing demand. Scalability says growth
+    is possible. Elasticity says the system adjusts over time.
+  </dd>
+  <dt>Load balancing</dt>
+  <dd>Choosing a healthy destination for each connection, request, stream, job, or partition.</dd>
+  <dt>Service discovery</dt>
+  <dd>
+    Mapping a stable service identity to its current reachable endpoints and relevant metadata.
+  </dd>
+  <dt>Rate limiting</dt>
+  <dd>Enforcing a policy on work accepted per identity, operation, resource, or time interval.</dd>
+  <dt>Admission control</dt>
+  <dd>Deciding whether the system has enough budget to start a particular unit of work now.</dd>
+  <dt>Backpressure</dt>
+  <dd>
+    A signal from a constrained consumer that causes upstream producers to slow, wait, or stop.
+  </dd>
+  <dt>Load shedding</dt>
+  <dd>
+    Rejecting or dropping selected work to preserve useful service when the system is near or beyond
+    sustainable capacity.
+  </dd>
+</dl>
+
+<h2 id="scaling-models"><span class="num">01.</span> Vertical and horizontal scaling</h2>
+<p class="lead">
+  Vertical scaling makes one resource larger. Horizontal scaling adds independently schedulable
+  resources.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Vertical scaling</th>
+        <th>Horizontal scaling</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Action</td>
+        <td>Add CPU, memory, storage, IOPS, or network capacity to one node</td>
+        <td>Add service instances, partitions, replicas, workers, or nodes</td>
+      </tr>
+      <tr>
+        <td>First benefit</td>
+        <td>Simple, often needs few application changes</td>
+        <td>Can increase capacity and reduce one-node failure exposure</td>
+      </tr>
+      <tr>
+        <td>Limit</td>
+        <td>Hardware ceiling, larger failure unit, and sometimes restart or migration</td>
+        <td>Coordination, partitioning, balancing, consistency, and operational complexity</td>
+      </tr>
+      <tr>
+        <td>Efficiency risk</td>
+        <td>Large machines may be underused or have worse price-performance</td>
+        <td>Overhead, skew, cross-node communication, and shared bottlenecks</td>
+      </tr>
+      <tr>
+        <td>Good fit</td>
+        <td>Early systems, indivisible state, or a temporary ceiling increase</td>
+        <td>Stateless serving, parallel jobs, partitionable state, and fault isolation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Real designs combine both. A database may scale vertically until partitioning is justified while
+  stateless API servers scale horizontally from the beginning. Horizontal scaling is not automatic
+  linear speedup. If ten instances share one saturated database, lock, queue partition, network
+  link, or global counter, the shared bottleneck still sets total throughput.
+</p>
+
+<h3 id="scalability-versus-performance">Scalability is not single-request performance</h3>
+<p>
+  Performance describes behavior at a particular resource level and workload. Scalability describes
+  how behavior changes as workload and resources change. An implementation can answer one request
+  very quickly but scale poorly because all requests acquire a global lock. Another can have modest
+  per-request latency yet scale well across many independent workers.
+</p>
+
+<figure class="code">
+  <figcaption><b>Useful scaling efficiency</b></figcaption>
+  <pre><code>scaling efficiency =
+  throughput with N resources
+  -----------------------------------
+  N * throughput with one resource
+
+Example:
+  1 instance  = 1,000 successful requests/second
+  8 instances = 6,400 successful requests/second
+  efficiency  = 6,400 / (8 * 1,000) = 80%</code></pre>
+</figure>
+
+<p>
+  Measure successful useful work at the required latency and error target. Counting accepted
+  requests, queued jobs, or failed attempts can make a collapsing system look productive.
+</p>
+
+<h2 id="state-and-partitionability">
+  <span class="num">02.</span> Stateless, stateful, and shared-nothing services
+</h2>
+<p class="lead">
+  Compute scales most easily when any ready instance can handle the next request and durable state
+  has an explicit owner.
+</p>
+
+<p>
+  A <strong>stateless service instance</strong> does not require its own process memory or local
+  disk from an earlier request to handle the next request. It may still use durable databases,
+  caches, object stores, and queues. Stateless refers to the replaceability of the serving instance,
+  not the absence of application data.
+</p>
+
+<p>
+  A <strong>stateful instance</strong> owns or temporarily holds information that affects routing or
+  correctness, such as a game session, WebSocket connection, in-memory workflow, partition leader,
+  local index shard, or unreplicated write buffer. It can scale horizontally, but placement,
+  replication, ownership transfer, and recovery must be designed.
+</p>
+
+<p>
+  <strong>Shared-nothing</strong> means each worker owns independent CPU, memory, and a partition of
+  data or work, with no shared memory or disk on the critical path. It reduces coordination and can
+  scale well, but requests spanning partitions require fan-out or coordination. Shared-nothing does
+  not mean no communication, no replication, or no shared control plane.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Hidden local state</th>
+        <th>Failure after scaling</th>
+        <th>Safer design</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Login session in one process</td>
+        <td>Another instance cannot authenticate the next request</td>
+        <td>Signed bounded token or shared session store with explicit expiry</td>
+      </tr>
+      <tr>
+        <td>Uploaded file on local disk</td>
+        <td>Later request or replacement instance cannot find it</td>
+        <td>Durable object store or replicated volume before acknowledging completion</td>
+      </tr>
+      <tr>
+        <td>Scheduled job in every replica</td>
+        <td>Scaling from one to ten executes the job ten times</td>
+        <td>Idempotent job plus elected scheduler, partitioned queue, or durable claim</td>
+      </tr>
+      <tr>
+        <td>In-memory per-client limiter only</td>
+        <td>Effective quota multiplies with instances and routing changes</td>
+        <td>Partitioned ownership, shared counter, or conservative local leases</td>
+      </tr>
+      <tr>
+        <td>Long-lived connection</td>
+        <td>Scale-in disconnects clients and rebalances unevenly</td>
+        <td>Drain, reconnect protocol, resumable state, and connection-aware balancing</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="elasticity"><span class="num">03.</span> Elasticity and autoscaling as control theory</h2>
+<p class="lead">
+  An autoscaler observes a delayed signal, calculates a desired capacity, performs a delayed action,
+  and repeats. Poor signals or timing make it oscillate or react too late.
+</p>
+
+<figure class="code">
+  <figcaption><b>Generic replica controller</b></figcaption>
+  <pre><code>every evaluation interval:
+  observed = stable_measurement_window(metric)
+  ratio = observed / target
+  desired = ceil(current_ready_capacity * ratio)
+  desired = clamp(desired, minimum, maximum)
+  desired = apply_scale_rate_limits(desired)
+  desired = apply_stabilization_history(desired)
+  request_capacity(desired)</code></pre>
+</figure>
+
+<p>
+  This ratio form is used by common orchestration controllers, but the important design is
+  platform-neutral. A controller needs a metric causally related to load, a safe target below the
+  performance cliff, bounds, cooldown or stabilization, and separate scale-up and scale-down
+  behavior.
+</p>
+
+<h3 id="autoscaling-signals">Choose a signal that predicts required work</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>Strength</th>
+        <th>Failure mode</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CPU utilization</td>
+        <td>Simple for CPU-bound, evenly loaded services</td>
+        <td>Weak for I/O waits, mixed request costs, or throttled CPU</td>
+      </tr>
+      <tr>
+        <td>Memory</td>
+        <td>Useful for memory-bound workers</td>
+        <td>Often changes slowly and scale-in may not release memory</td>
+      </tr>
+      <tr>
+        <td>Requests per ready instance</td>
+        <td>Direct for requests with stable cost</td>
+        <td>Ignores cost skew and failed or retried work</td>
+      </tr>
+      <tr>
+        <td>In-flight work or concurrency</td>
+        <td>Tracks occupancy and dependency pressure</td>
+        <td>Must separate healthy work from stuck requests</td>
+      </tr>
+      <tr>
+        <td>Queue age or backlog</td>
+        <td>Good for asynchronous workers and deadline objectives</td>
+        <td>Backlog can grow faster than new workers start</td>
+      </tr>
+      <tr>
+        <td>Tail latency</td>
+        <td>Close to user experience</td>
+        <td>Late signal and may reflect a dependency that more callers will overload</td>
+      </tr>
+      <tr>
+        <td>Scheduled or forecast demand</td>
+        <td>Adds capacity before a known event</td>
+        <td>Forecast error and surprise traffic still need reactive protection</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Prefer demand or concurrency signals when they lead saturation. Never blindly scale a caller on
+  dependency latency. If the database is slow, adding API instances can increase database
+  concurrency and worsen the incident. Cap fleet concurrency at the dependency's tested capacity.
+</p>
+
+<h3 id="warm-up-and-cold-start">Warm-up, cold starts, and reaction time</h3>
+<p>
+  Capacity is not available when an instance object is created. Provisioning a machine, pulling an
+  image, starting a runtime, compiling hot code, creating connection pools, loading models, fetching
+  configuration, and warming caches all add delay. Measure time from the scaling decision until the
+  endpoint serves production-shaped traffic within its SLO.
+</p>
+
+<figure class="code">
+  <figcaption><b>Can reactive scaling catch the burst?</b></figcaption>
+  <pre><code>reaction time =
+  metric collection delay
+  + evaluation delay
+  + scheduler and provisioning delay
+  + application startup
+  + readiness confirmation
+  + discovery propagation
+  + traffic warm-up
+
+If burst rise time &lt; reaction time:
+  pre-provision, schedule capacity, queue bounded work, or shed load.</code></pre>
+</figure>
+
+<p>
+  Keep a minimum warm fleet for latency-sensitive traffic. Scale up faster than scale down. Use a
+  stabilization window so one quiet interval does not remove capacity that will soon be needed.
+  During a large rollout, autoscaling must account for old and new capacity, readiness, and
+  deployment surge.
+</p>
+
+<h3 id="failure-capacity">Scale for failure, not only normal traffic</h3>
+<p>
+  In a three-zone design that must survive one zone loss, each zone cannot normally run at full
+  utilization. If traffic is balanced equally, two remaining zones must absorb the third zone's
+  share. Also reserve capacity for uneven distribution, deployments, recovery work, and growth.
+</p>
+
+<figure class="code">
+  <figcaption><b>Failure-capacity check</b></figcaption>
+  <pre><code>peak demand                       = 24,000 requests/second
+tested safe capacity per instance = 1,500 requests/second
+instances per zone                = 6
+zones                             = 3
+
+normal total capacity             = 27,000 requests/second
+after one-zone loss               = 18,000 requests/second  FAIL
+
+Use 9 instances per zone:
+after one-zone loss               = 18 * 1,500 = 27,000 requests/second
+failure headroom                  = 3,000 requests/second</code></pre>
+</figure>
+
+<h2 id="load-balancer-layers"><span class="num">04.</span> Layer 4 and Layer 7 load balancing</h2>
+<p class="lead">
+  A Layer 4 balancer understands connections and transport addresses. A Layer 7 balancer understands
+  an application protocol such as HTTP.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Layer 4</th>
+        <th>Layer 7</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Typical routing key</td>
+        <td>Source and destination address, port, and protocol</td>
+        <td>Host, path, method, header, cookie, identity, or content metadata</td>
+      </tr>
+      <tr>
+        <td>Unit commonly placed</td>
+        <td>TCP or UDP flow</td>
+        <td>HTTP request, RPC, or stream</td>
+      </tr>
+      <tr>
+        <td>Protocol visibility</td>
+        <td>Low, can pass encrypted bytes unchanged</td>
+        <td>High, usually terminates or understands the application protocol</td>
+      </tr>
+      <tr>
+        <td>Capabilities</td>
+        <td>Fast forwarding, source preservation, broad protocol support</td>
+        <td>Routing rules, authentication, payload limits, retries, rate policy, observability</td>
+      </tr>
+      <tr>
+        <td>Primary cost</td>
+        <td>Cannot balance individual requests inside a reused connection</td>
+        <td>More CPU, memory, configuration, trust, and protocol failure modes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Layer names describe responsibility, not a guarantee about implementation. A flow-hash Layer 4
+  balancer keeps all packets in one transport flow on one destination. HTTP/2 or a multiplexed RPC
+  connection may carry many concurrent requests, so a few long-lived connections can produce uneven
+  backend request load. A Layer 7 proxy can place requests individually, but only if it terminates
+  or participates in the connection.
+</p>
+
+<h3 id="client-server-balancing">Client-side and server-side balancing</h3>
+<dl>
+  <dt>Server-side balancing</dt>
+  <dd>
+    Clients call one stable virtual address or proxy. The proxy discovers endpoints and selects one.
+    This centralizes policy and simplifies clients, but adds a hop and requires the proxy tier to be
+    highly available and scalable.
+  </dd>
+  <dt>Client-side balancing</dt>
+  <dd>
+    Each client receives an endpoint set and selects directly. It can remove a hop, react to
+    per-request state, and spread control, but every client library must handle discovery,
+    connection pools, health, security, policy updates, and stale membership correctly.
+  </dd>
+</dl>
+
+<p>
+  A sidecar or node-local proxy is a hybrid. The application sees a simple local endpoint while the
+  proxy performs client-side discovery and balancing. It standardizes behavior but adds another
+  process, resource cost, configuration plane, and failure boundary.
+</p>
+
+<h2 id="algorithms"><span class="num">05.</span> Placement algorithms and their assumptions</h2>
+<p class="lead">
+  A load-balancing algorithm observes an imperfect view of work. Choose the cheapest signal that
+  correlates with the resource you need to equalize.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Algorithm</th>
+        <th>Decision</th>
+        <th>Good fit</th>
+        <th>Important weakness</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Round robin</td>
+        <td>Next ready endpoint in sequence</td>
+        <td>Similar endpoints and similar request cost</td>
+        <td>Equal request count is not equal work</td>
+      </tr>
+      <tr>
+        <td>Weighted round robin</td>
+        <td>Frequency proportional to configured weight</td>
+        <td>Known capacity differences or controlled rollout</td>
+        <td>Static weights become stale and can hide degradation</td>
+      </tr>
+      <tr>
+        <td>Random</td>
+        <td>Uniform or weighted random endpoint</td>
+        <td>Simple distributed selection at large fleet size</td>
+        <td>Variance matters in small fleets or low traffic</td>
+      </tr>
+      <tr>
+        <td>Least connections or requests</td>
+        <td>Endpoint with fewest active units</td>
+        <td>Variable duration and comparable endpoints</td>
+        <td>One stuck request is counted like one cheap request</td>
+      </tr>
+      <tr>
+        <td>Power of two choices</td>
+        <td>Sample two endpoints, choose the less loaded</td>
+        <td>Large fleets with cheap approximate load</td>
+        <td>Quality depends on fresh comparable load signal</td>
+      </tr>
+      <tr>
+        <td>Consistent or rendezvous hashing</td>
+        <td>Map a stable key to an endpoint with limited remapping</td>
+        <td>Affinity, local caches, or partition ownership</td>
+        <td>Hot keys and churn can create skew</td>
+      </tr>
+      <tr>
+        <td>Locality-aware</td>
+        <td>Prefer nearby zone or region, spill over by policy</td>
+        <td>Latency and cross-zone or cross-region cost control</td>
+        <td>Locality may lack failure capacity and failover can cascade</td>
+      </tr>
+      <tr>
+        <td>Observed utilization</td>
+        <td>Use endpoint-reported or client-observed cost</td>
+        <td>Heterogeneous instances and workloads</td>
+        <td>Feedback delay, metric gaming, oscillation, and complexity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="power-of-two">Why two random choices help</h3>
+<p>
+  Pure random placement can accidentally add work to an already busy server. Sampling two servers
+  and choosing the lower-load one sharply reduces the chance of building a very long tail while
+  avoiding a global search for the absolute least-loaded server.
+</p>
+
+<figure class="code">
+  <figcaption><b>Power of two choices</b></figcaption>
+  <pre><code>function choose(endpoints):
+  a = random_ready_endpoint(endpoints)
+  b = random_ready_endpoint_excluding(endpoints, a)
+  if normalized_load(a) &lt;= normalized_load(b):
+    return a
+  return b
+
+normalized_load may be:
+  active_requests / endpoint_capacity_weight</code></pre>
+</figure>
+
+<p>
+  Do not use a metric that arrives slower than the requests it controls without smoothing.
+  Independent balancers can all observe the same "least loaded" endpoint and stampede it. Random
+  sampling and per-balancer views reduce synchronized choice.
+</p>
+
+<h3 id="hashing">Hashing and bounded disruption</h3>
+<p>
+  A simple <code>hash(key) mod N</code> remaps most keys when <code>N</code> changes. Consistent
+  hash rings, rendezvous hashing, and Maglev-style lookup tables aim to keep most mappings stable as
+  endpoints join or leave. Virtual nodes or weights help represent unequal capacity.
+</p>
+
+<p>
+  Hashing is affinity, not health. The selection procedure still needs a policy when the preferred
+  endpoint is unavailable. Replicated ownership, bounded fallback, and hot-key detection are
+  essential. A single celebrity account can exceed one instance's capacity even when the average
+  hash distribution is perfect.
+</p>
+
+<h2 id="health-lifecycle">
+  <span class="num">06.</span> Health, readiness, draining, and slow start
+</h2>
+<p class="lead">
+  "The process exists," "the endpoint can serve," and "the endpoint should receive new traffic" are
+  different states.
+</p>
+
+<figure class="code">
+  <figcaption><b>Endpoint serving state machine</b></figcaption>
+  <pre><code>created
+   |
+   v
+starting -- startup failed --&gt; restart or terminal failure
+   |
+   v
+warming -- not ready --&gt; excluded from normal traffic
+   |
+   v
+ready -- temporary dependency pressure --&gt; not ready
+   |  ^                                  |
+   |  +---------- recovered -------------+
+   |
+scale-in, rollout, or shutdown
+   v
+draining -- deadline reached --&gt; cancel or transfer remaining work
+   |
+   v
+stopped</code></pre>
+</figure>
+
+<dl>
+  <dt>Liveness</dt>
+  <dd>
+    Can the process make progress, or should the supervisor restart it? A liveness check should not
+    fail merely because an optional dependency is slow.
+  </dd>
+  <dt>Readiness</dt>
+  <dd>
+    Should this endpoint receive new normal traffic now? It may include local initialization and
+    ability to reach critical resources, but must avoid synchronized fleet-wide failure.
+  </dd>
+  <dt>Startup</dt>
+  <dd>
+    Has slow initialization completed enough for liveness and readiness evaluation to become
+    meaningful?
+  </dd>
+  <dt>Passive health</dt>
+  <dd>
+    The balancer infers health from real connection failures, response codes, latency, or timeouts.
+  </dd>
+  <dt>Active health</dt>
+  <dd>A checker sends synthetic probes at intervals and applies success and failure thresholds.</dd>
+</dl>
+
+<p>
+  Health checks are sampled and delayed. With a 10-second interval and three failed probes required,
+  traffic may continue for roughly 20 to 30 seconds after failure, plus propagation time. Aggressive
+  checks consume capacity and can eject healthy-but-busy instances, shifting more traffic to the
+  remainder. Use hysteresis: multiple failures to eject, multiple successes to restore, and jittered
+  probe timing.
+</p>
+
+<h3 id="draining">Graceful drain sequence</h3>
+<ol>
+  <li>Mark the endpoint not ready or draining in the authoritative control plane.</li>
+  <li>Wait for load balancers and discovery consumers to stop selecting it.</li>
+  <li>Stop accepting new requests or connections at the application boundary.</li>
+  <li>Finish work that can complete before the termination deadline.</li>
+  <li>Signal clients to reconnect, checkpoint streams, or transfer partition ownership.</li>
+  <li>Cancel remaining work safely, close pools, flush bounded telemetry, then exit.</li>
+</ol>
+
+<p>
+  The sequence must match connection behavior. Removing an endpoint from DNS does not close existing
+  TCP connections. A reverse proxy may keep an upstream pool open. HTTP/2 and WebSocket connections
+  may last far longer than the DNS TTL. Use protocol-specific drain signals and a maximum connection
+  age where appropriate.
+</p>
+
+<h3 id="slow-start">Slow start after readiness</h3>
+<p>
+  Readiness is often binary while capacity ramps gradually. A newly ready endpoint can have empty
+  caches, cold runtime optimization, and new connection pools. Slow start gives it a small initial
+  weight and raises the weight over a measured warm-up window. If every endpoint starts together,
+  slow start cannot create a warm destination, so rolling deployment and minimum warm capacity still
+  matter.
+</p>
+
+<h2 id="connections-and-affinity">
+  <span class="num">07.</span> Connection reuse, sticky sessions, and uneven load
+</h2>
+<p class="lead">
+  The balancer may distribute connections evenly while requests, bytes, CPU, or user impact remain
+  badly skewed.
+</p>
+
+<p>
+  Connection pooling reduces handshake cost and latency but creates persistence. If each client
+  opens only a few connections, a recently added endpoint receives little traffic until pools turn
+  over. If one HTTP/2 connection carries thousands of requests, Layer 4 balancing sees one flow.
+  Bound connection lifetime, refresh endpoint sets, and measure request-level load per endpoint.
+</p>
+
+<p>
+  <strong>Sticky sessions</strong> route an identity repeatedly to one endpoint, often using a
+  cookie, source address, or hash. They can preserve a local cache or unavoidable in-memory session,
+  but they reduce balancing freedom, complicate failover, and can concentrate heavy tenants. Client
+  IP affinity is unreliable behind NAT, carrier networks, and forward proxies.
+</p>
+
+<div class="note">
+  <strong>Prefer correctness independent of stickiness</strong>
+  <p>
+    Use affinity as a performance optimization. Keep session state durable or reconstructable, and
+    define behavior when the selected endpoint disappears. If loss of stickiness breaks correctness,
+    deployment, failover, and scaling are unsafe.
+  </p>
+</div>
+
+<h2 id="service-discovery"><span class="num">08.</span> Service discovery and membership</h2>
+<p class="lead">
+  Discovery answers, "What endpoints currently represent this logical service?" It does not prove
+  that an endpoint will still be healthy when the next packet arrives.
+</p>
+
+<h3 id="registry-discovery">Registry-based discovery</h3>
+<figure class="code">
+  <figcaption><b>Registry control flow</b></figcaption>
+  <pre><code>instance starts
+  -&gt; authenticates to registry
+  -&gt; registers identity, address, port, locality, version, and health metadata
+  -&gt; renews lease or heartbeat
+
+client or proxy
+  -&gt; watches or polls service membership
+  -&gt; validates revision
+  -&gt; filters ready endpoints
+  -&gt; balances requests
+
+instance drains or lease expires
+  -&gt; registry publishes removal
+  -&gt; consumers update local endpoint sets</code></pre>
+</figure>
+
+<p>
+  A lease bounds stale membership after a crashed instance, but short leases increase control-plane
+  load and false expiration during pauses or partitions. Long leases leave dead endpoints visible
+  longer. Watches reduce polling delay but need reconnect, revision, compaction, and full-resync
+  behavior. The data plane should continue using a last-known-good set during a brief registry
+  outage, with an age limit and alert, instead of making every request depend synchronously on the
+  registry.
+</p>
+
+<h3 id="dns-discovery">DNS-based discovery</h3>
+<p>
+  DNS can map a service name to virtual addresses, endpoint addresses, or SRV records containing
+  target host, port, priority, and weight. It is broadly compatible and naturally cached. However,
+  effective caching occurs in authoritative servers, recursive resolvers, operating systems,
+  runtimes, applications, and connection pools. The configured TTL is not an instant failover
+  guarantee.
+</p>
+
+<ul>
+  <li>Use multiple records and assume clients implement selection differently.</li>
+  <li>Keep old endpoints alive through the expected cache and connection drain interval.</li>
+  <li>Distinguish negative caching from an empty healthy endpoint set.</li>
+  <li>Refresh before cached data expires, and define last-known-good behavior.</li>
+  <li>Do not publish endpoints before readiness or remove capacity faster than caches converge.</li>
+  <li>Secure update authority and validate names to prevent traffic redirection.</li>
+</ul>
+
+<h3 id="discovery-consistency">Discovery failure matrix</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Risk</th>
+        <th>Safer behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Registry unavailable</td>
+        <td>Clients lose all destinations if discovery is on the request path</td>
+        <td>Use bounded last-known-good endpoints and alarm on age</td>
+      </tr>
+      <tr>
+        <td>Stale endpoint remains</td>
+        <td>Connection errors and timeout cost</td>
+        <td>Passive ejection, bounded retries, lease expiry, and graceful old endpoint overlap</td>
+      </tr>
+      <tr>
+        <td>New endpoint missing</td>
+        <td>Underuse and overload of the old fleet</td>
+        <td>Watch revisions, resync, and compare registered versus observed endpoints</td>
+      </tr>
+      <tr>
+        <td>Empty endpoint update</td>
+        <td>Fleet-wide outage from bad control-plane state</td>
+        <td>Validate updates, keep last-known-good briefly, and support emergency freeze</td>
+      </tr>
+      <tr>
+        <td>Partitioned membership views</td>
+        <td>Different clients overload different subsets</td>
+        <td>Expose revision and age; reconcile after recovery</td>
+      </tr>
+      <tr>
+        <td>Forged registration</td>
+        <td>Traffic interception or data exposure</td>
+        <td>Workload identity, authorization, encryption, and audit logs</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="traffic-components">
+  <span class="num">09.</span> Reverse proxies, API gateways, and global traffic
+</h2>
+<p class="lead">
+  These components may all forward traffic, but their policy scope and trust boundaries differ.
+</p>
+
+<dl>
+  <dt>Reverse proxy</dt>
+  <dd>
+    Accepts traffic for one or more upstream applications, terminates or passes protocols, selects
+    backends, and may add caching, compression, TLS, and observability.
+  </dd>
+  <dt>API gateway</dt>
+  <dd>
+    A policy-focused application entry point that may authenticate users, authorize routes, enforce
+    quotas, transform versions, validate payload limits, and aggregate APIs. Business authorization
+    still belongs near the owning service.
+  </dd>
+  <dt>Global traffic manager</dt>
+  <dd>
+    Chooses a region or site using DNS, anycast, global proxies, latency, health, residency, and
+    capacity policy.
+  </dd>
+</dl>
+
+<figure class="code">
+  <figcaption><b>Multi-level placement</b></figcaption>
+  <pre><code>client
+  -&gt; global policy: region with residency, health, and spare capacity
+  -&gt; regional edge: authentication, coarse quota, route and payload policy
+  -&gt; zone-aware balancer: prefer local healthy capacity
+  -&gt; service endpoint: concurrency admission and fine-grained tenant limit
+  -&gt; dependency: its own admission limit and isolation</code></pre>
+</figure>
+
+<p>
+  Locality-aware routing reduces latency and network cost, but local preference must respect
+  capacity. Spillover should be gradual and bounded. A zone outage that instantly transfers all
+  traffic can overload the surviving zones. Global failover must consider data availability,
+  consistency, residency, dependency health, and failure capacity, not only whether an HTTP probe
+  returns success.
+</p>
+
+<p>
+  Gateways are high-value attack targets and potential common failure points. Run multiple
+  instances, minimize request-path dependencies, use bounded configuration rollout, preserve the
+  original authenticated identity securely, remove untrusted forwarding headers, and avoid unbounded
+  body buffering.
+</p>
+
+<h2 id="rate-control-model"><span class="num">10.</span> Rate limits, quotas, and admission</h2>
+<p class="lead">
+  Rate is speed, quota is allocation over an interval, and concurrency is work already occupying
+  capacity. A robust service often needs all three.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Control</th>
+        <th>Question answered</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Rate limit</td>
+        <td>How fast may this identity start work?</td>
+        <td>100 search requests per second with a 20-request burst</td>
+      </tr>
+      <tr>
+        <td>Quota</td>
+        <td>How much may it consume in a larger accounting period?</td>
+        <td>1 million exports per tenant per month</td>
+      </tr>
+      <tr>
+        <td>Concurrency limit</td>
+        <td>How much work may be in flight now?</td>
+        <td>At most 10 expensive exports per tenant</td>
+      </tr>
+      <tr>
+        <td>Admission control</td>
+        <td>Is there budget and a useful completion chance for this request?</td>
+        <td>Reject if queue wait would consume its deadline</td>
+      </tr>
+      <tr>
+        <td>Load shedding</td>
+        <td>Which work should be dropped under system pressure?</td>
+        <td>Drop speculative feed prefetch before interactive reads</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Choose a key aligned with the protected resource and fairness goal: authenticated account, tenant,
+  API key, user, destination, operation, IP prefix, or a combination. IP alone can punish thousands
+  of users behind one NAT and is easy for a distributed attacker to rotate. Authentication alone
+  does not protect unauthenticated endpoints.
+</p>
+
+<p>
+  Apply cheap coarse controls at the edge and authoritative fine-grained controls near the resource.
+  Edge limits reduce attack traffic and bandwidth. Service-local concurrency limits protect actual
+  database pools, CPU, and downstream capacity even if traffic bypasses or is unevenly distributed
+  across edge nodes.
+</p>
+
+<h2 id="rate-algorithms"><span class="num">11.</span> Rate-control algorithms</h2>
+<p class="lead">
+  Algorithms differ in burst behavior, memory, precision, distribution cost, and boundary effects.
+</p>
+
+<h3 id="token-bucket">Token bucket</h3>
+<p>
+  Tokens arrive at rate <code>r</code> up to capacity <code>b</code>. A request costing
+  <code>c</code> tokens is admitted only when enough tokens exist. The long-term rate is
+  approximately <code>r</code>, while an idle client may burst up to <code>b</code>. Weighted costs
+  can represent expensive operations.
+</p>
+
+<figure class="code">
+  <figcaption><b>Lazy-refill token bucket</b></figcaption>
+  <pre><code>function allow(bucket, now, cost):
+  elapsed = max(0, now - bucket.last_refill)
+  bucket.tokens = min(bucket.capacity,
+                      bucket.tokens + elapsed * bucket.refill_per_second)
+  bucket.last_refill = now
+
+  if bucket.tokens &lt; cost:
+    return REJECT
+
+  bucket.tokens = bucket.tokens - cost
+  return ALLOW</code></pre>
+</figure>
+
+<p>
+  Use a monotonic clock within one process. In a distributed implementation, do not trust client
+  clocks. Keep atomic update semantics per key. Bucket capacity is an explicit burst promise, not an
+  implementation detail.
+</p>
+
+<h3 id="leaky-bucket">Leaky bucket and paced queues</h3>
+<p>
+  A leaky bucket drains at a fixed rate. It can mean a meter mathematically similar to token bucket,
+  or a bounded queue that releases work at a steady pace. The queued form smooths bursts but adds
+  latency and memory. Reject when the queue is full or when predicted wait exceeds the request
+  deadline. Never create an unbounded queue to avoid saying no.
+</p>
+
+<h3 id="fixed-window">Fixed window counter</h3>
+<p>
+  Count requests in aligned windows such as each minute. It is simple and storage-efficient, but a
+  client can send a full minute's allowance at 12:00:59 and another at 12:01:00, producing nearly
+  twice the intended load near the boundary.
+</p>
+
+<figure class="code">
+  <figcaption><b>Fixed window key</b></figcaption>
+  <pre><code>window = floor(server_time / window_size)
+key = (identity, operation, window)
+count = atomic_increment(key, expiry = window_size + safety_margin)
+allow if count &lt;= limit</code></pre>
+</figure>
+
+<h3 id="sliding-window">Sliding log and sliding counter</h3>
+<p>
+  A sliding log stores timestamps and counts only events in
+  <code>(now - window, now]</code>. It is accurate but costs memory and cleanup proportional to
+  traffic. A sliding counter approximates the result using the current and previous fixed windows:
+</p>
+
+<figure class="code">
+  <figcaption><b>Two-window interpolation</b></figcaption>
+  <pre><code>fraction_remaining_in_previous = 1 - elapsed_in_current / window_size
+estimated =
+  current_window_count
+  + previous_window_count * fraction_remaining_in_previous
+
+allow if estimated + request_cost &lt;= limit</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Algorithm</th>
+        <th>Burst behavior</th>
+        <th>State per key</th>
+        <th>Typical choice</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Token bucket</td>
+        <td>Explicit burst up to capacity</td>
+        <td>Tokens and refill time</td>
+        <td>General API shaping with controlled bursts</td>
+      </tr>
+      <tr>
+        <td>Leaky queue</td>
+        <td>Smoothed at drain rate</td>
+        <td>Bounded queued work</td>
+        <td>Jobs that can tolerate bounded delay</td>
+      </tr>
+      <tr>
+        <td>Fixed window</td>
+        <td>Boundary spike possible</td>
+        <td>One counter per active window</td>
+        <td>Coarse quotas and low-cost enforcement</td>
+      </tr>
+      <tr>
+        <td>Sliding log</td>
+        <td>Exact rolling interval</td>
+        <td>Timestamp per counted event</td>
+        <td>Low-volume limits requiring precision</td>
+      </tr>
+      <tr>
+        <td>Sliding counter</td>
+        <td>Approximate rolling interval</td>
+        <td>Two counters and timing</td>
+        <td>Balanced precision and storage</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="distributed-limits">
+  <span class="num">12.</span> Distributed counters, fairness, and availability
+</h2>
+<p class="lead">
+  A global limit is a distributed coordination problem. Exactness, latency, cost, and availability
+  cannot all be maximized.
+</p>
+
+<h3 id="limiter-patterns">Implementation patterns</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Benefit</th>
+        <th>Trade-off</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Per-instance local limit</td>
+        <td>Fast and available</td>
+        <td>Global allowance changes with fleet size and traffic skew</td>
+      </tr>
+      <tr>
+        <td>Shared atomic counter by key</td>
+        <td>Stronger global enforcement</td>
+        <td>Network hop, hot keys, storage dependency, and regional latency</td>
+      </tr>
+      <tr>
+        <td>Key ownership by shard</td>
+        <td>All decisions for a key are serialized at one owner</td>
+        <td>Rebalancing, owner failure, and hotspot management</td>
+      </tr>
+      <tr>
+        <td>Leased local token batches</td>
+        <td>Most requests are decided locally</td>
+        <td>Unused leases and crash loss make utilization approximate</td>
+      </tr>
+      <tr>
+        <td>Hierarchical buckets</td>
+        <td>Enforce global, tenant, user, and operation budgets together</td>
+        <td>More state and atomic multi-bucket decision complexity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Suppose the global rate is 10,000 requests per second across 100 gateways. Giving each gateway 100
+  requests per second is safe only when traffic is even. One gateway receiving a large customer's
+  traffic will reject while others waste budget. A central counter improves utilization but may
+  become the new bottleneck. Leasing batches gives gateways temporary rights and amortizes
+  coordination. Use small leases for precision and larger leases for efficiency.
+</p>
+
+<h3 id="fairness">Fairness and cost</h3>
+<p>
+  Equal request counts are not fair when costs differ. A file export and metadata lookup may differ
+  by thousands of CPU milliseconds and bytes. Use weighted units, separate pools, or concurrency
+  budgets for expensive work. In multi-tenant services, combine:
+</p>
+
+<ul>
+  <li>A global emergency ceiling that protects the service.</li>
+  <li>A tenant rate and concurrency limit that prevents noisy-neighbor harm.</li>
+  <li>A reserved or minimum share for critical tenants or operations.</li>
+  <li>A borrowable shared pool for unused capacity, reclaimed when owners need it.</li>
+  <li>Priority that cannot starve lower classes forever.</li>
+</ul>
+
+<p>
+  Return a stable machine-readable reason, limit scope, and retry guidance. HTTP APIs commonly use
+  <code>429 Too Many Requests</code> for policy limiting and may include <code>Retry-After</code>.
+  Use <code>503 Service Unavailable</code> for temporary service-wide inability when that
+  distinction helps clients. Under severe attack, generating detailed rejection responses can itself
+  be costly, so dropping traffic earlier may be safer.
+</p>
+
+<h3 id="fail-open-closed">Limiter dependency failure</h3>
+<p>
+  Fail-open preserves availability but may expose a protected dependency or allow abuse. Fail-closed
+  preserves the limit but turns a limiter outage into application unavailability. Choose per route:
+  a public search endpoint may use a conservative local fallback, while an expensive money-moving
+  operation may fail closed for policy and safety. Cache policy, use local emergency ceilings, and
+  alert on fallback mode.
+</p>
+
+<h2 id="backpressure-shedding">
+  <span class="num">13.</span> Backpressure, queues, and load shedding
+</h2>
+<p class="lead">
+  Rate limits enforce planned policy. Load shedding responds to actual pressure. Backpressure
+  carries the constraint upstream.
+</p>
+
+<p>
+  When arrival rate exceeds completion rate, queue length grows. Queues absorb short bursts, not
+  sustained overload. Long queues raise tail latency, consume memory, hold connections, and cause
+  clients to time out and retry while the server continues useless work.
+</p>
+
+<figure class="code">
+  <figcaption><b>Deadline-aware admission</b></figcaption>
+  <pre><code>estimated_wait =
+  queued_work_units / recent_sustainable_completion_rate
+
+if request.deadline_remaining &lt;=
+   estimated_wait + estimated_service_time + safety_margin:
+  reject_without_starting_dependency_work
+
+if in_flight_for_tenant &gt;= tenant_concurrency_limit:
+  reject_or_defer
+
+otherwise:
+  admit</code></pre>
+</figure>
+
+<p>
+  Prefer concurrency limits for work whose duration varies. Adaptive concurrency controllers can
+  change the limit based on latency or queueing, but must use floors, ceilings, smoothing, and
+  canaries. A dependency's limit should be below its measured saturation point.
+</p>
+
+<h3 id="shedding-order">Define a shedding order before an incident</h3>
+<ol>
+  <li>Stop speculative work such as prefetching and cache refresh.</li>
+  <li>Pause batch jobs, replays, analytics, and non-urgent synchronization.</li>
+  <li>Serve cheaper degraded results, smaller pages, or stale safe data.</li>
+  <li>Reject low-priority interactive traffic with clear retry behavior.</li>
+  <li>Preserve critical writes or safety operations within reserved capacity.</li>
+  <li>If collapse continues, sharply reduce admitted traffic, recover a warm fleet, then ramp.</li>
+</ol>
+
+<p>
+  Protect every layer because a gateway cannot see fan-out cost perfectly. A request admitted at the
+  edge may cause 100 downstream calls. The downstream service must remain in control of its own
+  concurrency. Propagate deadlines and cancellation so expired work stops consuming capacity.
+</p>
+
+<h2 id="end-to-end-design"><span class="num">14.</span> Worked design: API across three zones</h2>
+<p class="lead">
+  Scale an order-read and order-create API from one instance to a multi-zone fleet while protecting
+  its database, payment dependency, and tenants.
+</p>
+
+<h3 id="design-assumptions">Requirements and assumptions</h3>
+<ul>
+  <li>Peak external demand is 24,000 requests per second, 90% reads and 10% creates.</li>
+  <li>Traffic can jump 3 times within 30 seconds during a sale.</li>
+  <li>Read p99 target is 250 ms; create p99 target is 800 ms.</li>
+  <li>One zone may fail without exceeding the steady-state latency target.</li>
+  <li>Create requests require authenticated tenant identity and idempotency keys.</li>
+  <li>
+    The primary database safely supports 4,000 writes per second and 8,000 concurrent queries.
+  </li>
+  <li>One warm API instance safely serves 1,500 mixed requests per second at 60% CPU.</li>
+  <li>A new instance takes 90 seconds from decision to fully warm capacity.</li>
+</ul>
+
+<h3 id="design-architecture">Architecture and request path</h3>
+<figure class="code">
+  <figcaption><b>Three-zone protected API</b></figcaption>
+  <pre><code>clients
+  |
+  v
+global traffic policy
+  |
+  v
+multi-zone L7 gateway fleet
+  |  - authenticate identity
+  |  - request size and route policy
+  |  - coarse tenant token bucket
+  |
+  +---------+---------+
+  |         |         |
+zone A    zone B    zone C
+  |         |         |
+local load balancer prefers ready local API instances
+  |         |         |
+  +---------+---------+
+            |
+     API admission control
+       |            |
+       |            +-- create: tenant concurrency + idempotency
+       |
+       +-- read: bounded DB concurrency, optional safe degradation
+            |
+     database and dependencies with their own limits</code></pre>
+</figure>
+
+<h3 id="design-capacity">Capacity and scaling policy</h3>
+<p>
+  Run nine instances per zone, giving 40,500 requests per second normal tested capacity. After one
+  zone fails, 18 instances provide 27,000 requests per second, or 12.5% headroom over normal peak.
+  Validate that gateway, database, network, and connection pools also survive the failure.
+</p>
+
+<ul>
+  <li>Minimum is nine ready instances per zone, never a global pool of 27 placed arbitrarily.</li>
+  <li>Scale on the maximum of request rate per ready instance and normalized in-flight work.</li>
+  <li>
+    Schedule extra capacity before known sales because the 30-second burst outruns 90-second start.
+  </li>
+  <li>Scale up aggressively within provider and database ceilings, then apply slow start.</li>
+  <li>Scale down at most 10% per five minutes after a 15-minute stable low-demand window.</li>
+  <li>Hold capacity during zone impairment, rollout, or discovery lag.</li>
+</ul>
+
+<h3 id="design-state-flow">Create-order admission flow</h3>
+<figure class="code">
+  <figcaption><b>Request decision sequence</b></figcaption>
+  <pre><code>1. Gateway authenticates tenant and rejects oversized or malformed input.
+2. Coarse bucket checks tenant request rate.
+3. Zone balancer chooses two ready endpoints and sends to the less loaded.
+4. API validates deadline and idempotency key.
+5. Hierarchical admission checks:
+     global create ceiling
+     tenant weighted rate
+     tenant create concurrency
+     database write concurrency
+6. If rejected, return a stable reason and retry guidance.
+7. If admitted, reserve concurrency, call required dependencies once,
+   persist result, release reservation, and record outcome.
+8. A repeated idempotency key returns the recorded outcome, not a second order.</code></pre>
+</figure>
+
+<h3 id="design-failure">Zone-loss timeline</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>System behavior</th>
+        <th>Guardrail</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>T+0</td>
+        <td>Zone A loses network reachability</td>
+        <td>Short connection deadlines and independent health views detect failure</td>
+      </tr>
+      <tr>
+        <td>T+5s</td>
+        <td>Regional balancers stop new selection for A</td>
+        <td>Retries are bounded and consume a retry budget</td>
+      </tr>
+      <tr>
+        <td>T+10s</td>
+        <td>B and C receive roughly 50% more traffic</td>
+        <td>Pre-provisioned failure capacity carries normal peak</td>
+      </tr>
+      <tr>
+        <td>T+20s</td>
+        <td>Autoscaler requests replacement headroom in B and C</td>
+        <td>Database concurrency ceiling prevents caller scaling from overloading storage</td>
+      </tr>
+      <tr>
+        <td>T+110s</td>
+        <td>New endpoints become ready and ramp traffic gradually</td>
+        <td>Startup readiness and slow start prevent cold-instance overload</td>
+      </tr>
+      <tr>
+        <td>Recovery</td>
+        <td>A returns but receives no immediate full share</td>
+        <td>Health success threshold, warm-up, and controlled traffic ramp</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="design-evolution">Why this design fits, and when it changes</h3>
+<p>
+  The API fleet is stateless, latency-sensitive, and horizontally partitionable by request, so
+  multi-zone active serving is suitable. The database remains a shared constraint, so concurrency
+  admission is more important than adding unlimited API replicas. If write demand approaches the
+  database ceiling, the next design work is data partitioning, asynchronous workflows, or a changed
+  product consistency requirement, not another gateway.
+</p>
+
+<h2 id="implementation"><span class="num">15.</span> Focused implementation example</h2>
+<p class="lead">
+  Implement the algorithm after defining the policy. This Go example demonstrates a process-local
+  token bucket for one protected route, not a global multi-instance quota.
+</p>
+
+<figure class="code">
+  <figcaption><b>Go: thread-safe local token bucket using monotonic elapsed time</b></figcaption>
+  <pre><code>type Bucket struct {
+    mu       sync.Mutex
+    tokens   float64
+    capacity float64
+    refill   float64
+    last     time.Time
+}
+
+func (b *Bucket) Allow(cost float64, now time.Time) bool {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    elapsed := now.Sub(b.last).Seconds()
+    if elapsed &lt; 0 {
+        elapsed = 0
+    }
+    b.tokens = math.Min(b.capacity, b.tokens+elapsed*b.refill)
+    b.last = now
+
+    if cost &lt;= 0 || b.tokens &lt; cost {
+        return false
+    }
+    b.tokens -= cost
+    return true
+}</code></pre>
+</figure>
+
+<p>
+  Production code also needs bounded key cardinality, idle-key eviction, configuration validation,
+  metrics, clear failure policy, and separate logic for invalid costs. For global limits, replace
+  local state with atomic owned state or leased token batches. Do not put remote coordination under
+  the mutex of a request-serving process.
+</p>
+
+<h2 id="observability"><span class="num">16.</span> Observability and operating signals</h2>
+<p class="lead">
+  Observe demand, admission, placement, capacity, saturation, and membership together. A fleet
+  average hides the endpoint that is about to fail.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Signals</th>
+        <th>Question</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Demand</td>
+        <td>Offered RPS, request cost, tenant, operation, burst size, retries</td>
+        <td>What work arrived before any rejection?</td>
+      </tr>
+      <tr>
+        <td>Admission</td>
+        <td>Allowed, delayed, rejected, shed, reason, retry-after, bucket utilization</td>
+        <td>Who is limited and by which policy?</td>
+      </tr>
+      <tr>
+        <td>Balancing</td>
+        <td>
+          Requests, connections, bytes, active work, errors, and latency per endpoint and zone
+        </td>
+        <td>Is traffic distribution proportional to useful capacity?</td>
+      </tr>
+      <tr>
+        <td>Endpoint lifecycle</td>
+        <td>Startup time, warm-up time, readiness changes, drain duration, forced termination</td>
+        <td>How much declared capacity is actually serving?</td>
+      </tr>
+      <tr>
+        <td>Discovery</td>
+        <td>Endpoint count, revision, update age, watch reconnects, stale-set use</td>
+        <td>Do clients agree on current membership?</td>
+      </tr>
+      <tr>
+        <td>Saturation</td>
+        <td>CPU, memory, event loop, threads, file descriptors, pools, queue depth and age</td>
+        <td>Which finite resource limits useful work?</td>
+      </tr>
+      <tr>
+        <td>Autoscaling</td>
+        <td>
+          Observed metric, desired and ready capacity, max-bound time, decision-to-ready delay
+        </td>
+        <td>Did capacity react early and stably enough?</td>
+      </tr>
+      <tr>
+        <td>Dependencies</td>
+        <td>In-flight calls, latency, errors, timeouts, rejected work, connection-pool wait</td>
+        <td>Is caller capacity overwhelming a smaller dependency?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Track distribution, not only totals: maximum-to-median endpoint load, coefficient of variation,
+  per-zone utilization, and the fraction of traffic on the hottest 1% of endpoints. Use bounded
+  labels. Tenant IDs can create dangerous metric cardinality, so retain sampled exemplars or
+  aggregated heavy-hitter reports instead of an unbounded time series per tenant.
+</p>
+
+<h3 id="alerts">Actionable alerts</h3>
+<ul>
+  <li>Ready capacity cannot survive the configured failure domain.</li>
+  <li>Desired capacity stays at the configured maximum while demand or queue age rises.</li>
+  <li>Decision-to-ready time exceeds burst tolerance.</li>
+  <li>One endpoint or zone carries materially more normalized work than peers.</li>
+  <li>Discovery revision age or last-known-good use exceeds its safe bound.</li>
+  <li>Rejection rate threatens the SLO, or one tenant consumes an abnormal share.</li>
+  <li>Dependency concurrency reaches its ceiling while upstream continues admitting work.</li>
+  <li>Drain deadlines expire and force cancellation or connection termination.</li>
+</ul>
+
+<h2 id="security"><span class="num">17.</span> Security, privacy, and abuse resistance</h2>
+<p class="lead">
+  Load balancers, discovery, gateways, and limiters cross trust boundaries and decide where valuable
+  traffic and identity flow.
+</p>
+
+<ul>
+  <li>
+    Authenticate workloads that register endpoints. Authorize service identity, namespace, locality,
+    and metadata updates separately.
+  </li>
+  <li>
+    Encrypt control-plane and data-plane traffic where the threat model requires it. Rotate
+    credentials without removing all endpoints together.
+  </li>
+  <li>
+    Treat forwarding headers as untrusted unless a known proxy stripped and recreated them. Preserve
+    verified identity in an integrity-protected channel.
+  </li>
+  <li>
+    Validate host, path, header size, body size, decompressed size, method, and protocol upgrade
+    before expensive routing or buffering.
+  </li>
+  <li>
+    Apply limits before costly authentication where possible, then apply stronger identity-based
+    limits after authentication.
+  </li>
+  <li>
+    Avoid exposing internal topology, endpoint addresses, quota policy, or tenant activity in public
+    errors and metrics.
+  </li>
+  <li>
+    Protect the limiter state store from arbitrary high-cardinality keys. Attackers can create
+    millions of identities or headers to exhaust memory.
+  </li>
+  <li>
+    Audit policy changes and emergency bypasses. A hidden unlimited allow-list can defeat every
+    capacity assumption.
+  </li>
+</ul>
+
+<div class="warn">
+  <strong>Rate limiting is not complete denial-of-service protection</strong>
+  <p>
+    A limiter consumes some CPU, memory, and network before it can reject. Volumetric attacks may
+    saturate links or connection tables earlier. Combine upstream filtering, connection limits,
+    request limits, authentication, bounded parsing, isolation, and tested load shedding.
+  </p>
+</div>
+
+<h2 id="performance-cost">
+  <span class="num">18.</span> Performance, capacity, and cost trade-offs
+</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Benefit</th>
+        <th>Cost or risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>More headroom</td>
+        <td>Absorbs failures, bursts, and deployment overlap</td>
+        <td>Idle compute cost</td>
+      </tr>
+      <tr>
+        <td>Cross-zone balancing</td>
+        <td>Uses all healthy capacity and tolerates uneven placement</td>
+        <td>Network cost, latency, and larger failure coupling</td>
+      </tr>
+      <tr>
+        <td>Locality preference</td>
+        <td>Lower latency and transfer cost</td>
+        <td>Uneven load and insufficient local failure capacity</td>
+      </tr>
+      <tr>
+        <td>Frequent health checks</td>
+        <td>Faster detection</td>
+        <td>Probe load, false positives, and synchronized ejection</td>
+      </tr>
+      <tr>
+        <td>Long connections</td>
+        <td>Fewer handshakes and better latency</td>
+        <td>Slow rebalancing, drain delay, and flow skew</td>
+      </tr>
+      <tr>
+        <td>Central exact limiter</td>
+        <td>High quota precision and utilization</td>
+        <td>Coordination latency, hot keys, and availability dependency</td>
+      </tr>
+      <tr>
+        <td>Local leased limits</td>
+        <td>Low request latency and better fault isolation</td>
+        <td>Approximation and temporarily stranded allowance</td>
+      </tr>
+      <tr>
+        <td>Large queues</td>
+        <td>Absorb longer bursts</td>
+        <td>Tail latency, memory, timeout waste, and slow recovery</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Optimize cost per successful SLO-compliant operation, not utilization alone. Driving every
+  instance to 95% CPU may reduce machine count while dramatically increasing queueing, retries, and
+  failure risk. Include load-balancer processing units, cross-zone bytes, control-plane calls,
+  limiter storage, idle failure capacity, and rejected-work cost in the model.
+</p>
+
+<h2 id="failures"><span class="num">19.</span> Failure scenarios and troubleshooting</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely mechanism</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>New instances fail immediately</td>
+        <td>Readiness is too early; full traffic hits cold caches and pools</td>
+        <td>Fix startup readiness, add slow start, preserve warm minimum</td>
+      </tr>
+      <tr>
+        <td>More replicas increase errors</td>
+        <td>Shared dependency, connection pool, or write limit is saturated</td>
+        <td>Cap downstream concurrency and scale or redesign the bottleneck</td>
+      </tr>
+      <tr>
+        <td>Some endpoints are hot</td>
+        <td>Long connections, stickiness, heavy requests, hot keys, or stale weights</td>
+        <td>Measure normalized work, rotate pools, change placement, split hot keys</td>
+      </tr>
+      <tr>
+        <td>All instances restart under load</td>
+        <td>Liveness depends on overloaded request path</td>
+        <td>Separate process liveness from readiness; reserve probe resources</td>
+      </tr>
+      <tr>
+        <td>Scale-in causes 5xx spikes</td>
+        <td>Endpoint terminates before discovery and connections drain</td>
+        <td>Order the drain and measure maximum connection lifetime</td>
+      </tr>
+      <tr>
+        <td>Limit multiplies after scaling</td>
+        <td>Each instance enforces the full nominal allowance</td>
+        <td>Use owned/global state, leases, or explicitly divide conservative budget</td>
+      </tr>
+      <tr>
+        <td>Autoscaler flaps</td>
+        <td>Noisy delayed metric, identical thresholds, or fast scale-down</td>
+        <td>Add tolerance, smoothing, asymmetric rates, and stabilization</td>
+      </tr>
+      <tr>
+        <td>Regional failover collapses target</td>
+        <td>Failover traffic exceeds warm failure capacity</td>
+        <td>Provision N-1 capacity, shed by priority, and ramp transfer</td>
+      </tr>
+      <tr>
+        <td>DNS change has no effect</td>
+        <td>Resolver, runtime, or connection pool still uses cached endpoint</td>
+        <td>Inspect every cache layer and keep old capacity through drain</td>
+      </tr>
+      <tr>
+        <td>429 retry storm</td>
+        <td>Clients retry immediately or synchronize on the same time</td>
+        <td>Return guidance, use jitter, cap retries, and enforce retry budgets</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="troubleshooting-order">Evidence-first investigation</h3>
+<ol>
+  <li>Compare offered, admitted, completed, failed, retried, and shed rates.</li>
+  <li>
+    Find the first saturated resource in the request path, not the loudest downstream symptom.
+  </li>
+  <li>
+    Compare per-endpoint and per-zone work, latency, errors, readiness, and discovery revision.
+  </li>
+  <li>
+    Check whether capacity is ready, only requested, starting, draining, or stuck at a maximum.
+  </li>
+  <li>Inspect connection age, protocol multiplexing, stickiness, and endpoint-set refresh.</li>
+  <li>Check dependency concurrency, queue age, pool wait, and retry amplification.</li>
+  <li>
+    Mitigate by reducing low-priority load, enforcing admission, restoring warm capacity, then ramp.
+  </li>
+</ol>
+
+<h2 id="testing"><span class="num">20.</span> Testing strategy</h2>
+<p class="lead">
+  Test the controller, the data plane, and the failure transitions. A balanced steady-state chart
+  does not prove safe scaling.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Test</th>
+        <th>What to verify</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Unit and property</td>
+        <td>
+          Bucket refill bounds, window edges, weight normalization, no negative tokens, time jumps
+        </td>
+      </tr>
+      <tr>
+        <td>Integration</td>
+        <td>
+          Registration, readiness publication, watch reconnect, stale endpoint ejection, 429
+          contract
+        </td>
+      </tr>
+      <tr>
+        <td>Distribution</td>
+        <td>Algorithm behavior with unequal weights, long requests, hot keys, and small samples</td>
+      </tr>
+      <tr>
+        <td>Load</td>
+        <td>Sustainable throughput and latency at normal peak and one-zone-loss capacity</td>
+      </tr>
+      <tr>
+        <td>Spike</td>
+        <td>
+          Whether bounded queues and limits cover demand during measured autoscaling reaction time
+        </td>
+      </tr>
+      <tr>
+        <td>Stress</td>
+        <td>Useful throughput after saturation and whether rejection protects dependencies</td>
+      </tr>
+      <tr>
+        <td>Soak</td>
+        <td>
+          Connection skew, key-state leaks, timer drift, cache changes, and slow resource exhaustion
+        </td>
+      </tr>
+      <tr>
+        <td>Fault</td>
+        <td>
+          Endpoint crash, probe delay, registry outage, stale DNS, zone isolation, limiter-store
+          loss
+        </td>
+      </tr>
+      <tr>
+        <td>Recovery</td>
+        <td>
+          Cold fleet warm-up, slow traffic ramp, queue drain, and no retry-driven second outage
+        </td>
+      </tr>
+      <tr>
+        <td>Security and abuse</td>
+        <td>
+          Key-cardinality attack, forged headers, registration authorization, payload and connection
+          floods
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Use production-shaped request cost and connection lifetime. Closed-loop load generators wait for
+  responses and can hide overload because their offered rate falls as latency rises. Use an
+  open-loop generator when validating behavior at a fixed arrival rate, while keeping explicit
+  safety boundaries in shared environments.
+</p>
+
+<h2 id="exercises"><span class="num">21.</span> Hands-on exercises and design scenarios</h2>
+
+<h3 id="exercise-one">Exercise 1: simulate the algorithms</h3>
+<p>
+  Simulate 100 endpoints, including 10 half-capacity endpoints and requests whose durations follow a
+  heavy-tailed distribution. Compare round robin, random, least requests, and power of two choices.
+  Report p99 endpoint occupancy and maximum-to-median work. Expected reasoning: equal request counts
+  fail under duration and capacity skew; normalized load improves placement; delayed metrics can
+  destabilize strict least-load selection.
+</p>
+
+<h3 id="exercise-two">Exercise 2: build and test a distributed limiter</h3>
+<p>
+  Implement a token bucket with one owner per tenant, then add leased token batches to ten gateway
+  processes. Kill a gateway while it holds a lease and partition two gateways from the owner.
+  Expected reasoning: define whether unused tokens are lost or reclaimable, bound overshoot, choose
+  fail-open or fail-closed per operation, and measure latency versus exactness.
+</p>
+
+<h3 id="exercise-three">Exercise 3: plan a drain</h3>
+<p>
+  Run an HTTP API with keep-alive plus WebSocket chat sessions. Remove 25% of instances. Expected
+  reasoning: stop new selection first, signal long-lived clients to reconnect, checkpoint or
+  externalize session state, enforce a maximum drain deadline, and measure forced disconnects.
+</p>
+
+<h3 id="scenario-sale">Scenario: flash-sale inventory API</h3>
+<p>
+  Demand rises 20 times in five seconds, writes are expensive, and overselling is unacceptable. A
+  strong answer pre-provisions capacity, uses authenticated per-buyer and global admission, reserves
+  concurrency for inventory, uses idempotency, rejects early rather than building a long queue, and
+  separates browse reads from purchase writes. Autoscaling alone cannot meet the rise time, and
+  adding stateless instances cannot exceed inventory storage capacity.
+</p>
+
+<h3 id="scenario-chat">Scenario: multi-zone chat gateway</h3>
+<p>
+  Millions of persistent connections make request-count balancing misleading. A strong answer
+  balances new connections by normalized active connection cost, caps connections per gateway,
+  externalizes durable message state, supports reconnect and resume, drains gradually, and keeps
+  enough per-zone connection capacity for failure. It also handles a few unusually active rooms as
+  hot keys rather than assuming every connection costs the same.
+</p>
+
+<h3 id="scenario-search">Scenario: public search API</h3>
+<p>
+  Anonymous traffic and expensive queries create abuse risk. A strong answer combines network
+  protection, per-IP-prefix coarse limits, authenticated tenant limits, weighted query cost, bounded
+  execution time, result-size limits, query complexity guards, concurrency admission, and cheaper
+  degraded results. It does not rely on IP as a fair user identity.
+</p>
+
+<h2 id="interview"><span class="num">22.</span> Interview questions and model answers</h2>
+
+<h3 id="qa-scale-up-out">1. Vertical versus horizontal scaling?</h3>
+<p>
+  Vertical scaling adds capacity to one resource and is operationally simple but bounded by machine
+  size and a larger failure unit. Horizontal scaling adds independently schedulable resources and
+  can improve capacity and fault isolation, but needs balancing, partitioning, and explicit state
+  ownership. Most systems combine them. Follow-up: identify the shared bottleneck that stops linear
+  scale-out.
+</p>
+
+<h3 id="qa-stateless">2. Why are stateless API instances easier to scale?</h3>
+<p>
+  Any ready instance can serve the next request, so instances can be added, removed, and replaced
+  without moving correctness-critical local state. Durable state still exists in explicit stores.
+  Follow-up: sessions, local files, schedulers, and long connections often reveal hidden state.
+</p>
+
+<h3 id="qa-elasticity">3. Scalability versus elasticity?</h3>
+<p>
+  Scalability is the ability to handle growth by adding resources with acceptable efficiency.
+  Elasticity is the time-dependent adjustment of resources to demand. A system may scale manually
+  but have slow or unsafe elasticity. Follow-up: reaction time determines whether reactive scaling
+  can catch a burst.
+</p>
+
+<h3 id="qa-autoscale-latency">4. Why can autoscaling make an outage worse?</h3>
+<p>
+  Scaling on latency from a saturated database can add callers and connections to that database.
+  Noisy metrics and rapid scale-down can flap capacity. Cold new instances can fail readiness or
+  receive too much traffic. Use demand-related signals, dependency concurrency ceilings,
+  stabilization, warm-up, and failure-capacity bounds.
+</p>
+
+<h3 id="qa-l4-l7">5. Layer 4 versus Layer 7 load balancing?</h3>
+<p>
+  Layer 4 chooses a destination using transport flow information and supports broad protocols with
+  low application visibility. Layer 7 understands an application protocol and can route individual
+  requests using hosts, paths, or headers, but adds processing, trust, and protocol complexity.
+  Follow-up: one multiplexed connection can make Layer 4 request distribution uneven.
+</p>
+
+<h3 id="qa-round-robin">6. When does round robin fail?</h3>
+<p>
+  It assumes similar endpoint capacity and request cost. Long requests, heavy tenants, heterogeneous
+  machines, sticky sessions, and multiplexed connections break that assumption. Least active work,
+  weights, random sampling, or cost-aware routing may fit better.
+</p>
+
+<h3 id="qa-two-choice">7. What is power of two choices?</h3>
+<p>
+  Randomly sample two ready endpoints and choose the less loaded after normalizing for capacity. It
+  dramatically improves tail occupancy over one random choice without globally searching for the
+  least-loaded endpoint. Follow-up: stale load signals and synchronized balancers still require
+  smoothing and randomness.
+</p>
+
+<h3 id="qa-consistent-hash">8. Why use consistent hashing?</h3>
+<p>
+  It keeps most key-to-endpoint mappings stable as membership changes, which helps cache locality
+  and partition ownership. It does not solve endpoint health, hot keys, replication, or correctness.
+  Define fallback and rebalancing behavior.
+</p>
+
+<h3 id="qa-health">9. Liveness versus readiness?</h3>
+<p>
+  Liveness asks whether restarting the process is appropriate. Readiness asks whether it should
+  receive new traffic. Conflating them can restart every overloaded instance and amplify failure.
+  Startup checks protect slow initialization before either decision becomes meaningful.
+</p>
+
+<h3 id="qa-drain">10. How do you remove an instance safely?</h3>
+<p>
+  Mark it draining, stop new selection, wait for propagation, stop accepting new work, complete or
+  transfer bounded in-flight work, close resources, then terminate. Account for DNS caches,
+  connection reuse, streams, and a maximum deadline.
+</p>
+
+<h3 id="qa-discovery">11. Registry versus DNS discovery?</h3>
+<p>
+  Registries can provide watches, rich metadata, leases, and rapid updates but require a client or
+  proxy integration. DNS is widely supported and cached but has multiple cache layers and limited
+  real-time load information. Both can be stale, so data-plane health and last-known-good policy
+  still matter.
+</p>
+
+<h3 id="qa-control-plane">12. Should discovery be queried for every request?</h3>
+<p>
+  Usually no. It makes control-plane availability and latency part of every data-plane request.
+  Clients or proxies should watch or poll asynchronously and use a bounded local endpoint set,
+  exposing its revision and age.
+</p>
+
+<h3 id="qa-sticky">13. What is wrong with sticky sessions?</h3>
+<p>
+  They constrain balancing, concentrate heavy users, slow recovery, and tie availability to one
+  endpoint. They can be a locality optimization, but correctness should survive loss of affinity.
+  Externalize or reconstruct essential session state.
+</p>
+
+<h3 id="qa-token-bucket">14. Explain token bucket.</h3>
+<p>
+  Tokens refill at a configured rate up to a capacity. Work spends tokens. The refill rate controls
+  long-run speed and capacity controls allowed burst. Weighted token cost represents unequal work.
+  Follow-up: use atomic updates and a trusted monotonic time source.
+</p>
+
+<h3 id="qa-leaky">15. Token bucket versus leaky bucket?</h3>
+<p>
+  Token bucket permits a bounded burst after idle time. A queue-style leaky bucket releases at a
+  steadier rate but adds wait and needs a bounded queue. Terminology varies, so state the exact
+  algorithm and behavior rather than relying only on the name.
+</p>
+
+<h3 id="qa-window">16. Fixed versus sliding windows?</h3>
+<p>
+  Fixed counters are cheap but allow boundary bursts. Sliding logs are precise but store an event
+  history. Sliding counters interpolate neighboring windows for lower cost and approximate rolling
+  behavior. Choose based on the protected resource's burst tolerance.
+</p>
+
+<h3 id="qa-global-limit">17. How do you enforce a global distributed limit?</h3>
+<p>
+  Options include a shared atomic counter, one owner per key, or token leases to local gateways.
+  Exact centralized decisions cost latency and availability. Local leases improve performance but
+  allow bounded approximation and stranded allowance. State the acceptable overshoot and failure
+  policy.
+</p>
+
+<h3 id="qa-rate-concurrency">18. Why is rate limiting not enough?</h3>
+<p>
+  Ten requests per second can still create 1,000 in-flight operations if each lasts 100 seconds.
+  Concurrency limits protect occupancy, while rate limits protect arrival speed and quotas protect
+  longer allocations. Expensive dependencies commonly need all three.
+</p>
+
+<h3 id="qa-backpressure">19. Backpressure versus load shedding?</h3>
+<p>
+  Backpressure asks upstream to slow or stop. Load shedding rejects selected work to preserve useful
+  capacity. Backpressure works only if upstream honors it and queues remain bounded. At public
+  boundaries, rejection is often the practical backpressure signal.
+</p>
+
+<h3 id="qa-failure-capacity">20. How much spare capacity is enough?</h3>
+<p>
+  Start from the required failure model. For one-zone survival, verify that remaining zones support
+  peak demand at tested safe per-instance capacity, then include balancing skew, rollout overlap,
+  warm-up, recovery work, growth, and dependency limits. A fixed 20% rule without this model is not
+  evidence.
+</p>
+
+<h3 id="qa-overload">21. Why reject requests during overload?</h3>
+<p>
+  After saturation, accepting more work increases queues, latency, memory, timeouts, and retries,
+  often reducing successful throughput. Early cheap rejection preserves capacity for useful work and
+  lets clients back off. Follow-up: define priority and degraded modes before the incident.
+</p>
+
+<h3 id="qa-measure-balance">22. How do you know balancing is good?</h3>
+<p>
+  Compare normalized per-endpoint requests, bytes, active work, latency, errors, CPU, and zones. Use
+  distributions such as maximum-to-median, not fleet averages. The goal is balanced constrained
+  resource use and SLO-compliant completions, not identical request counts.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">23.</span> Concise cheat sheet</h2>
+<ul>
+  <li>
+    Scaling supplies capacity; discovery publishes it; balancing places work; admission protects it.
+  </li>
+  <li>Scale the bottleneck, not merely the visible frontend.</li>
+  <li>Stateless means replaceable compute, not an application without state.</li>
+  <li>Shared-nothing reduces coordination but needs explicit partition ownership.</li>
+  <li>Autoscaling is delayed feedback. Model reaction time and burst rise time.</li>
+  <li>Keep minimum warm capacity and verify one-failure-domain capacity.</li>
+  <li>Layer 4 usually places flows; Layer 7 can place application requests.</li>
+  <li>Round robin assumes similar endpoint capacity and request cost.</li>
+  <li>Power of two choices gives strong balance with cheap approximate information.</li>
+  <li>Hashing provides affinity, not health or hot-key protection.</li>
+  <li>Separate startup, liveness, readiness, draining, and slow-start behavior.</li>
+  <li>Connection reuse improves efficiency but delays rebalancing and draining.</li>
+  <li>
+    Discovery views are always potentially stale. Keep revision, age, and last-known-good policy.
+  </li>
+  <li>DNS TTL is not an instant failover guarantee because caches and connections persist.</li>
+  <li>Rate controls speed; quota controls allocation; concurrency controls occupancy.</li>
+  <li>Token refill rate sets long-run speed; bucket capacity sets burst.</li>
+  <li>Fixed windows have boundary bursts; sliding approaches reduce them at higher cost.</li>
+  <li>
+    Exact global limits require coordination. Leases trade exactness for speed and availability.
+  </li>
+  <li>Bound every queue. Reject work that cannot finish before its deadline.</li>
+  <li>Protect dependencies with their own admission and concurrency limits.</li>
+  <li>Return 429 for policy limiting and 503 for temporary service inability when useful.</li>
+  <li>Measure offered, admitted, completed, retried, rejected, and shed work separately.</li>
+  <li>Test spike, saturation, zone loss, stale discovery, cold recovery, and limiter failure.</li>
+</ul>
+
+<h2 id="references"><span class="num">24.</span> Official references</h2>
+<ul>
+  <li>
+    <a
+      href="https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Kubernetes: Horizontal Pod Autoscaling</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://kubernetes.io/docs/concepts/workloads/pods/probes/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Kubernetes: Liveness, Readiness, and Startup Probes</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://kubernetes.io/docs/concepts/services-networking/service/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Kubernetes: Service and Cloud-Native Service Discovery</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Kubernetes: DNS for Services and Pods</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Envoy: Load Balancing Algorithms</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/slow_start"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Envoy: Slow Start Mode</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/how-elastic-load-balancing-works.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >AWS Elastic Load Balancing: How Load Balancing Works</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >AWS Elastic Load Balancing: Routing Algorithms and Target Behavior</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/sre-book/load-balancing-frontend/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Load Balancing at the Frontend</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/sre-book/load-balancing-datacenter/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Load Balancing in the Datacenter</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://sre.google/sre-book/addressing-cascading-failures/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google SRE Book: Addressing Cascading Failures</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Amazon Builders' Library: Using Load Shedding to Avoid Overload</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://nginx.org/en/docs/http/ngx_http_limit_req_module.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >NGINX: HTTP Request Limiting Module</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://datatracker.ietf.org/doc/html/rfc6585"
+      target="_blank"
+      rel="noopener noreferrer"
+      >IETF RFC 6585: 429 Too Many Requests</a
+    >
+  </li>
+  <li>
+    <a
+      href="https://datatracker.ietf.org/doc/html/rfc2782"
+      target="_blank"
+      rel="noopener noreferrer"
+      >IETF RFC 2782: DNS SRV Records</a
+    >
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
