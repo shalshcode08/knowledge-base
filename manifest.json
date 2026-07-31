@@ -116,6 +116,10 @@
         {
           "title": "Caching and Content Delivery",
           "path": "systemdesign/caching-content-delivery"
+        },
+        {
+          "title": "Data Storage and Data-Model Selection",
+          "path": "systemdesign/data-storage-data-model-selection"
         }
       ]
     }
