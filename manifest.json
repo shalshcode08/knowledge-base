@@ -130,6 +130,10 @@
           "path": "systemdesign/caching-content-delivery"
         },
         {
+          "title": "Distributed-Systems Fundamentals, Time, Ordering, and Consistency",
+          "path": "systemdesign/distributed-systems-time-ordering-consistency"
+        },
+        {
           "title": "Replication, Partitioning, Sharding, and Quorum Systems",
           "path": "systemdesign/replication-partitioning-sharding-quorum-systems"
         }
