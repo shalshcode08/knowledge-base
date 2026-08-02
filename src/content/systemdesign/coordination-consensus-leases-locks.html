@@ -1,23 +1,24 @@
 <h1>Coordination, Consensus, Leader Election, Leases, and Distributed Locks - Complete Notes</h1>
 <p class="subtitle">
-  A language-neutral guide to making safe shared decisions under partial failure, understanding Raft,
-  using leaders and leases correctly, fencing stale owners, choosing coordination primitives, and
-  explaining production trade-offs in system-design interviews.
+  A language-neutral guide to making safe shared decisions under partial failure, understanding
+  Raft, using leaders and leases correctly, fencing stale owners, choosing coordination primitives,
+  and explaining production trade-offs in system-design interviews.
 </p>
 
 <h2 id="mental-model"><span class="num">00.</span> Mental model and precise terminology</h2>
 <p class="lead">
-  Coordination is the work required when independent participants must agree before an action is safe.
+  Coordination is the work required when independent participants must agree before an action is
+  safe.
 </p>
 
 <div class="analogy">
   <p>
     Imagine several airport control towers sharing one runway plan. Radio messages can be late, a
     tower can restart, and a cable can split the network. Safety requires more than choosing the
-    tower that spoke most recently. The towers need an agreed history, a rule for who may decide, and
-    a way for the runway controller to reject instructions from an old tower. Consensus establishes
-    the history. Leadership selects a proposer. A lease bounds how long authority may be assumed.
-    A fencing token lets the runway reject stale authority.
+    tower that spoke most recently. The towers need an agreed history, a rule for who may decide,
+    and a way for the runway controller to reject instructions from an old tower. Consensus
+    establishes the history. Leadership selects a proposer. A lease bounds how long authority may be
+    assumed. A fencing token lets the runway reject stale authority.
   </p>
 </div>
 
@@ -38,7 +39,9 @@
       </tr>
       <tr>
         <td>Consensus</td>
-        <td>Non-faulty participants agree on one irrevocable value or ordered sequence of values</td>
+        <td>
+          Non-faulty participants agree on one irrevocable value or ordered sequence of values
+        </td>
         <td>Correct application commands, Byzantine resistance, or unlimited availability</td>
       </tr>
       <tr>
@@ -63,7 +66,9 @@
       </tr>
       <tr>
         <td>Distributed lock</td>
-        <td>A coordination protocol intended to grant exclusive or shared ownership across processes</td>
+        <td>
+          A coordination protocol intended to grant exclusive or shared ownership across processes
+        </td>
         <td>Data integrity if an expired owner can still write</td>
       </tr>
       <tr>
@@ -73,7 +78,9 @@
       </tr>
       <tr>
         <td>Failure detector</td>
-        <td>A mechanism that suspects a participant based on missing evidence such as heartbeats</td>
+        <td>
+          A mechanism that suspects a participant based on missing evidence such as heartbeats
+        </td>
         <td>Proof that the participant has stopped</td>
       </tr>
       <tr>
@@ -90,10 +97,10 @@
   <p>
     Consensus protects an agreed decision. A leader is usually a performance and ordering mechanism.
     A lease is time-bounded permission. A lock is an application-facing abstraction. Fencing is the
-    final defense at the resource being changed. Treating these as synonyms creates subtle corruption.
+    final defense at the resource being changed. Treating these as synonyms creates subtle
+    corruption.
   </p>
 </div>
-
 
 <h2 id="why-coordinate"><span class="num">01.</span> Why coordination is expensive</h2>
 <p class="lead">
@@ -103,10 +110,10 @@
 <p>
   Independent work scales well because each participant can proceed without waiting. Coordination
   adds messages, durable writes, quorum waits, serialization, contention, and recovery state. In a
-  healthy three-node regional cluster, one committed update usually needs a leader disk write plus an
-  acknowledgement from at least one follower. Across regions, the speed of a majority path and its
-  tail latency matter. During a partition, the minority must stop accepting decisions if safety is to
-  remain intact.
+  healthy three-node regional cluster, one committed update usually needs a leader disk write plus
+  an acknowledgement from at least one follower. Across regions, the speed of a majority path and
+  its tail latency matter. During a partition, the minority must stop accepting decisions if safety
+  is to remain intact.
 </p>
 
 <div class="tbl">
@@ -173,7 +180,9 @@
   </p>
 </div>
 
-<h2 id="consensus-problem"><span class="num">02.</span> Consensus goals, assumptions, and limits</h2>
+<h2 id="consensus-problem">
+  <span class="num">02.</span> Consensus goals, assumptions, and limits
+</h2>
 
 <h3 id="consensus-properties">Safety and liveness properties</h3>
 <dl>
@@ -197,9 +206,10 @@
 <h3 id="fault-model">Fault model and the majority rule</h3>
 <p>
   Standard Raft assumes crash faults and non-Byzantine participants. A node may stop, restart, lose
-  volatile state, or become unreachable, but it is not assumed to forge messages maliciously. Durable
-  protocol state must survive restart. Authentication and transport integrity prevent outsiders from
-  pretending to be voting members, but they do not turn Raft into a Byzantine consensus protocol.
+  volatile state, or become unreachable, but it is not assumed to forge messages maliciously.
+  Durable protocol state must survive restart. Authentication and transport integrity prevent
+  outsiders from pretending to be voting members, but they do not turn Raft into a Byzantine
+  consensus protocol.
 </p>
 
 <figure class="code">
@@ -262,9 +272,9 @@ crash_failures_tolerated = floor((N - 1) / 2)
 <p>
   Each log entry contains a command and protocol metadata such as index and term. Committed entries
   form the authoritative order. Applying the same deterministic command sequence yields the same
-  state. External time, random numbers, remote API calls, and process-specific values must not be read
-  nondeterministically during state-machine application. Put a chosen value into the command first or
-  treat external effects as a separate idempotent workflow.
+  state. External time, random numbers, remote API calls, and process-specific values must not be
+  read nondeterministically during state-machine application. Put a chosen value into the command
+  first or treat external effects as a separate idempotent workflow.
 </p>
 
 <div class="example">
@@ -272,8 +282,8 @@ crash_failures_tolerated = floor((N - 1) / 2)
   <p>
     Instead of logging "decrement if current time is before sale end," the leader validates the sale
     policy and logs <code>reserve(sku, quantity, reservation_id, accepted_at)</code>. Every replica
-    applies the same inputs. The request ID table stores the prior result so a retry returns it without
-    reserving twice.
+    applies the same inputs. The request ID table stores the prior result so a retry returns it
+    without reserving twice.
   </p>
 </div>
 
@@ -314,7 +324,9 @@ crash_failures_tolerated = floor((N - 1) / 2)
 <h3 id="raft-state">Durable and volatile protocol state</h3>
 <ul>
   <li><code>currentTerm</code> is durable so a restart cannot vote in an old generation.</li>
-  <li><code>votedFor</code> is durable so a server cannot grant two votes in one term after restart.</li>
+  <li>
+    <code>votedFor</code> is durable so a server cannot grant two votes in one term after restart.
+  </li>
   <li>The log is durable before acknowledging its entries.</li>
   <li><code>commitIndex</code> tracks the highest known committed entry.</li>
   <li><code>lastApplied</code> tracks the highest entry applied to the local state machine.</li>
@@ -349,17 +361,28 @@ crash_failures_tolerated = floor((N - 1) / 2)
 <h3 id="election-flow">Election flow</h3>
 <ol>
   <li>Followers reset an election timer when valid leader contact arrives.</li>
-  <li>A timed-out follower increments its term, becomes candidate, persists its self-vote, and sends vote requests.</li>
-  <li>A voter grants at most one vote per term and only if the candidate's log is at least as up to date.</li>
-  <li>A candidate with a majority becomes leader and immediately establishes authority with heartbeats.</li>
-  <li>A candidate seeing a higher term steps down. A split vote waits for another randomized timeout.</li>
+  <li>
+    A timed-out follower increments its term, becomes candidate, persists its self-vote, and sends
+    vote requests.
+  </li>
+  <li>
+    A voter grants at most one vote per term and only if the candidate's log is at least as up to
+    date.
+  </li>
+  <li>
+    A candidate with a majority becomes leader and immediately establishes authority with
+    heartbeats.
+  </li>
+  <li>
+    A candidate seeing a higher term steps down. A split vote waits for another randomized timeout.
+  </li>
 </ol>
 
 <p>
-  Randomized election timeouts reduce repeated split votes. The heartbeat interval must be comfortably
-  shorter than the election timeout. Election timeouts should exceed normal network, disk, runtime
-  pause, and scheduling delay, but not be so large that genuine failure recovery violates the service
-  objective. A fixed timer copied from a tutorial is not an operations policy.
+  Randomized election timeouts reduce repeated split votes. The heartbeat interval must be
+  comfortably shorter than the election timeout. Election timeouts should exceed normal network,
+  disk, runtime pause, and scheduling delay, but not be so large that genuine failure recovery
+  violates the service objective. A fixed timer copied from a tutorial is not an operations policy.
 </p>
 
 <figure class="code">
@@ -378,9 +401,9 @@ grant vote only if:
 </figure>
 
 <p>
-  The freshness check is a safety rule, not a preference for the busiest node. It prevents a candidate
-  missing committed information from winning. CPU, zone, version, or workload preference can guide a
-  planned handoff only if the core election safety rules remain intact.
+  The freshness check is a safety rule, not a preference for the busiest node. It prevents a
+  candidate missing committed information from winning. CPU, zone, version, or workload preference
+  can guide a planned handoff only if the core election safety rules remain intact.
 </p>
 
 <h3 id="election-timeline">Partition timeline</h3>
@@ -397,9 +420,9 @@ t5         partition heals        A sees higher term and steps down</code></pre>
 
 <p>
   A can still believe it is leader locally because failure detection is imperfect. It cannot commit
-  new Raft entries because two of five is not a majority. If A can mutate an external system that does
-  not check authority, split-brain damage remains possible. This is exactly where fencing or a single
-  transactional authority matters.
+  new Raft entries because two of five is not a majority. If A can mutate an external system that
+  does not check authority, split-brain damage remains possible. This is exactly where fencing or a
+  single transactional authority matters.
 </p>
 
 <h2 id="log-replication"><span class="num">06.</span> Log replication, matching, and commitment</h2>
@@ -408,7 +431,8 @@ t5         partition heals        A sees higher term and steps down</code></pre>
 <p>
   The leader sends the index and term immediately before the new entries. A follower accepts only if
   that preceding entry matches. On conflict, the follower removes the conflicting suffix and accepts
-  the leader's suffix. The leader backs up the follower's next index until a matching prefix is found.
+  the leader's suffix. The leader backs up the follower's next index until a matching prefix is
+  found.
 </p>
 
 <div class="key">
@@ -458,30 +482,32 @@ leader after acknowledgements:
 
 <h3 id="reads">Linearizable reads</h3>
 <p>
-  A local leader read is unsafe immediately after a partition because the server may be an old leader.
-  A conservative path records the read through the log. Optimized approaches confirm current-term
-  leadership with quorum communication and wait until the state machine has applied through a safe
-  read index. Lease reads can avoid a quorum round trip only when the implementation's timing
-  assumptions are justified. Follower reads are usually stale unless a protocol supplies a bound or
-  linearizable read mechanism.
+  A local leader read is unsafe immediately after a partition because the server may be an old
+  leader. A conservative path records the read through the log. Optimized approaches confirm
+  current-term leadership with quorum communication and wait until the state machine has applied
+  through a safe read index. Lease reads can avoid a quorum round trip only when the
+  implementation's timing assumptions are justified. Follower reads are usually stale unless a
+  protocol supplies a bound or linearizable read mechanism.
 </p>
 
 <div class="warn">
   <strong>Committed is not necessarily applied everywhere</strong>
   <p>
-    A majority may have durably stored a committed entry while a slow follower has neither learned its
-    commitment nor applied it. Reads from arbitrary followers must account for this lag.
+    A majority may have durably stored a committed entry while a slow follower has neither learned
+    its commitment nor applied it. Reads from arbitrary followers must account for this lag.
   </p>
 </div>
 
-<h2 id="membership-snapshots"><span class="num">07.</span> Membership changes, snapshots, and recovery</h2>
+<h2 id="membership-snapshots">
+  <span class="num">07.</span> Membership changes, snapshots, and recovery
+</h2>
 
 <h3 id="membership">Safe membership changes</h3>
 <p>
   Replacing a configuration in one local step can create two disjoint majorities, each believing it
-  may decide. Raft's joint-consensus approach commits an intermediate configuration in which decisions
-  require majorities from both old and new voter sets. After that entry commits, the new-only
-  configuration can commit. This overlapping decision period preserves quorum intersection.
+  may decide. Raft's joint-consensus approach commits an intermediate configuration in which
+  decisions require majorities from both old and new voter sets. After that entry commits, the
+  new-only configuration can commit. This overlapping decision period preserves quorum intersection.
 </p>
 
 <figure class="code">
@@ -504,10 +530,10 @@ C_new = {C, D, E}
 
 <h3 id="snapshots">Snapshots and log compaction</h3>
 <p>
-  Logs grow without bound unless old committed entries are compacted. A snapshot records state through
-  an included log index and term. After the snapshot is durable and validated, earlier log entries can
-  be discarded. A far-behind follower receives an install-snapshot operation, verifies it, installs it
-  atomically, then resumes replication after the included index.
+  Logs grow without bound unless old committed entries are compacted. A snapshot records state
+  through an included log index and term. After the snapshot is durable and validated, earlier log
+  entries can be discarded. A far-behind follower receives an install-snapshot operation, verifies
+  it, installs it atomically, then resumes replication after the included index.
 </p>
 
 <ul>
@@ -529,8 +555,8 @@ C_new = {C, D, E}
 
 <h2 id="raft-paxos"><span class="num">08.</span> Raft and Paxos at a high level</h2>
 <p class="lead">
-  Raft and Multi-Paxos can provide equivalent replicated-log safety, but organize the explanation and
-  implementation differently.
+  Raft and Multi-Paxos can provide equivalent replicated-log safety, but organize the explanation
+  and implementation differently.
 </p>
 
 <div class="tbl">
@@ -589,8 +615,8 @@ C_new = {C, D, E}
 <p>
   A heartbeat is evidence of recent communication, not proof of health. It can carry term,
   replication, and commit information. A missing heartbeat causes suspicion after a timeout. A
-  process may still be running yet unable to reach storage, may reach some peers but not others, or may
-  be paused long enough to lose authority and later resume.
+  process may still be running yet unable to reach storage, may reach some peers but not others, or
+  may be paused long enough to lose authority and later resume.
 </p>
 
 <div class="tbl">
@@ -634,16 +660,17 @@ C_new = {C, D, E}
 
 <h3 id="timeout-design">Timeout design</h3>
 <p>
-  Measure round-trip delay, durable-write latency, runtime pauses, scheduling delay, packet loss, and
-  maintenance events. Pick a heartbeat interval that detects loss early enough without excessive
-  write and network cost. Pick an election or session timeout with margin above healthy tail behavior.
-  Alert when healthy observations approach the timeout because the cluster is close to unnecessary
-  elections. Randomize contender timeouts to reduce simultaneous acquisition.
+  Measure round-trip delay, durable-write latency, runtime pauses, scheduling delay, packet loss,
+  and maintenance events. Pick a heartbeat interval that detects loss early enough without excessive
+  write and network cost. Pick an election or session timeout with margin above healthy tail
+  behavior. Alert when healthy observations approach the timeout because the cluster is close to
+  unnecessary elections. Randomize contender timeouts to reduce simultaneous acquisition.
 </p>
 
 <h2 id="leases"><span class="num">10.</span> Leases and clock assumptions</h2>
 <p class="lead">
-  A lease grants authority for a bounded interval, but safe use depends on whose clock defines that interval.
+  A lease grants authority for a bounded interval, but safe use depends on whose clock defines that
+  interval.
 </p>
 
 <h3 id="lease-model">Lease states</h3>
@@ -690,10 +717,10 @@ NO_LEASE or ACTIVE(newer token)</code></pre>
 <div class="warn">
   <strong>Pause is the classic lease trap</strong>
   <p>
-    Worker A acquires a 30-second lease, pauses for 45 seconds, and then resumes. Worker B legitimately
-    acquired after expiry. If A continues using its old in-memory belief, both can act. Checking the
-    clock before each action helps, but only a resource-side fencing check closes the pause between
-    that check and the actual write.
+    Worker A acquires a 30-second lease, pauses for 45 seconds, and then resumes. Worker B
+    legitimately acquired after expiry. If A continues using its old in-memory belief, both can act.
+    Checking the clock before each action helps, but only a resource-side fencing check closes the
+    pause between that check and the actual write.
   </p>
 </div>
 
@@ -713,9 +740,9 @@ Using t1 would assume authority lasted longer than evidence supports.</code></pr
 
 <p>
   An implementation can provide a stronger documented contract, but callers should never invent one.
-  Renew well before the deadline, stop admitting new work when renewal is uncertain, and expose lease
-  remaining time as a metric. Do not persist a local lease across process restart unless the protocol
-  explicitly supports that behavior.
+  Renew well before the deadline, stop admitting new work when renewal is uncertain, and expose
+  lease remaining time as a metric. Do not persist a local lease across process restart unless the
+  protocol explicitly supports that behavior.
 </p>
 
 <h2 id="fencing"><span class="num">11.</span> Fencing tokens prevent stale-owner corruption</h2>
@@ -762,10 +789,10 @@ function allocate(sku, quantity, token, request_id):
 
 <p>
   In the earlier timeline, B writes token 732. When A resumes with 731, inventory rejects it. Tokens
-  must increase for each ownership generation and be compared by the resource that can corrupt state.
-  A random lock-owner ID proves identity but not freshness. A timestamp is unsafe unless its ordering
-  contract is strong enough. A consensus log revision, database sequence, or monotonically increasing
-  version can supply a token when the full path preserves ordering.
+  must increase for each ownership generation and be compared by the resource that can corrupt
+  state. A random lock-owner ID proves identity but not freshness. A timestamp is unsafe unless its
+  ordering contract is strong enough. A consensus log revision, database sequence, or monotonically
+  increasing version can supply a token when the full path preserves ordering.
 </p>
 
 <div class="key">
@@ -781,13 +808,18 @@ function allocate(sku, quantity, token, request_id):
 
 <h3 id="lock-properties">Required properties</h3>
 <ul>
-  <li><strong>Mutual exclusion:</strong> conflicting valid owners are not granted simultaneously.</li>
+  <li>
+    <strong>Mutual exclusion:</strong> conflicting valid owners are not granted simultaneously.
+  </li>
   <li><strong>Ownership:</strong> only the owner can release or renew its generation.</li>
   <li><strong>Dead-owner recovery:</strong> a crash does not block progress forever.</li>
   <li><strong>Fencing:</strong> later ownership can supersede stale in-flight work.</li>
   <li><strong>Fairness:</strong> when required, waiting contenders are not starved.</li>
   <li><strong>Bounded waiting:</strong> callers have deadlines and cancellation.</li>
-  <li><strong>Observable state:</strong> acquisition delay, contention, expiry, and ownership are inspectable.</li>
+  <li>
+    <strong>Observable state:</strong> acquisition delay, contention, expiry, and ownership are
+    inspectable.
+  </li>
 </ul>
 
 <figure class="code">
@@ -809,8 +841,8 @@ The lease may expire and another owner may acquire between GET and DELETE.</code
 <p>
   Owner checking prevents deleting somebody else's lock, but it is not fencing. Acquisition and
   protected work also need a defined transaction boundary. Keep critical sections short, propagate
-  cancellation, set a maximum queue wait, and decide whether an ambiguous acquire is retried with the
-  same attempt identity or discovered through coordinator state.
+  cancellation, set a maximum queue wait, and decide whether an ambiguous acquire is retried with
+  the same attempt identity or discovered through coordinator state.
 </p>
 
 <h3 id="lock-granularity">Granularity and deadlocks</h3>
@@ -822,7 +854,9 @@ The lease may expire and another owner may acquire between GET and DELETE.</code
   difficult to prove.
 </p>
 
-<h2 id="coordination-primitives"><span class="num">13.</span> Semaphores, barriers, and coordination recipes</h2>
+<h2 id="coordination-primitives">
+  <span class="num">13.</span> Semaphores, barriers, and coordination recipes
+</h2>
 
 <div class="tbl">
   <table>
@@ -875,10 +909,11 @@ The lease may expire and another owner may acquire between GET and DELETE.</code
 
 <h3 id="semaphore">Lease-backed semaphore</h3>
 <p>
-  Represent K permits as individually leased slots or an atomic count plus owner records. Acquisition
-  must never observe a count and decrement it in separate unprotected operations. On expiry, reclaim
-  the permit, but fence any external activity that could continue. Use a semaphore for capacity, not
-  as a hidden queue with unbounded waiters. Admission requests need deadlines and fairness policy.
+  Represent K permits as individually leased slots or an atomic count plus owner records.
+  Acquisition must never observe a count and decrement it in separate unprotected operations. On
+  expiry, reclaim the permit, but fence any external activity that could continue. Use a semaphore
+  for capacity, not as a hidden queue with unbounded waiters. Admission requests need deadlines and
+  fairness policy.
 </p>
 
 <h3 id="barrier">Generation-aware barrier</h3>
@@ -899,13 +934,16 @@ abort or advance according to policy if a participant lease expires</code></pre>
 
 <p>
   The generation prevents a delayed participant from joining the next run accidentally. A timeout
-  policy must say whether the barrier aborts, reduces its required count, or waits for operator action.
-  Notifications are hints: reconnect, re-read authoritative state, and handle missed events.
+  policy must say whether the barrier aborts, reduces its required count, or waits for operator
+  action. Notifications are hints: reconnect, re-read authoritative state, and handle missed events.
 </p>
 
-<h2 id="coordination-services"><span class="num">14.</span> Coordination services and database primitives</h2>
+<h2 id="coordination-services">
+  <span class="num">14.</span> Coordination services and database primitives
+</h2>
 <p class="lead">
-  Use a battle-tested service whose guarantees match the recipe, then keep the coordinated state small.
+  Use a battle-tested service whose guarantees match the recipe, then keep the coordinated state
+  small.
 </p>
 
 <div class="tbl">
@@ -950,11 +988,11 @@ abort or advance according to policy if a participant lease expires</code></pre>
 <h3 id="zookeeper-recipe">Sequential-node election and lock intuition</h3>
 <p>
   Apache ZooKeeper documents recipes based on ephemeral sequential nodes. Each contender creates a
-  uniquely sequenced child. The lowest sequence becomes leader or lock owner. Instead of every waiter
-  watching the owner and causing a herd on release, each contender watches only its immediate
+  uniquely sequenced child. The lowest sequence becomes leader or lock owner. Instead of every
+  waiter watching the owner and causing a herd on release, each contender watches only its immediate
   predecessor. If the predecessor disappears, it re-reads children and re-evaluates. A client must
-  handle the ambiguous case where create succeeded but its response was lost, commonly by embedding a
-  unique attempt identifier and discovering the created node.
+  handle the ambiguous case where create succeeded but its response was lost, commonly by embedding
+  a unique attempt identifier and discovering the created node.
 </p>
 
 <h3 id="watch-contract">Watches are notifications, not state</h3>
@@ -966,7 +1004,9 @@ abort or advance according to policy if a participant lease expires</code></pre>
   <li>Avoid making every waiter watch one key when predecessor watching is available.</li>
 </ul>
 
-<h2 id="avoid-lock"><span class="num">15.</span> When a constraint or idempotent operation is safer</h2>
+<h2 id="avoid-lock">
+  <span class="num">15.</span> When a constraint or idempotent operation is safer
+</h2>
 
 <div class="tbl">
   <table>
@@ -1032,7 +1072,8 @@ commit</code></pre>
   PostgreSQL unique constraints are enforced through unique indexes, and its advisory locks carry
   application-defined meaning that PostgreSQL itself does not enforce. This illustrates the general
   rule: a declarative constraint protects every write reaching the database, while an advisory lock
-  protects only cooperating code paths. Choose the invariant at the narrowest authoritative boundary.
+  protects only cooperating code paths. Choose the invariant at the narrowest authoritative
+  boundary.
 </p>
 
 <h2 id="scheduler-design"><span class="num">16.</span> Case study: leader-elected scheduler</h2>
@@ -1162,9 +1203,9 @@ async function lead(leadership: Leadership, stop: AbortSignal) {
 
 <p>
   Real code should measure lease time with a monotonic clock, renew independently of batch cadence,
-  stop before the safe deadline, classify ambiguous renewal, and avoid assuming <code>release</code>
-  succeeds. The database must reject a stale <code>leaderFence</code>; the loop alone is not a safety
-  boundary.
+  stop before the safe deadline, classify ambiguous renewal, and avoid assuming
+  <code>release</code> succeeds. The database must reject a stale <code>leaderFence</code>; the loop
+  alone is not a safety boundary.
 </p>
 
 <h3 id="scheduler-failover">Failover timeline</h3>
@@ -1180,10 +1221,11 @@ async function lead(leadership: Leadership, stop: AbortSignal) {
 
 <h3 id="scheduler-scale">Scaling the scheduler</h3>
 <p>
-  One leader may become a throughput bottleneck. Partition schedules by stable hash or tenant region,
-  then elect one leader per partition. Store an assignment epoch and move partitions gradually. Each
-  partition retains its own run uniqueness and fence. A hundred partition leaders spread over several
-  replicas is usually better than placing all scheduling work behind one global lock.
+  One leader may become a throughput bottleneck. Partition schedules by stable hash or tenant
+  region, then elect one leader per partition. Store an assignment epoch and move partitions
+  gradually. Each partition retains its own run uniqueness and fence. A hundred partition leaders
+  spread over several replicas is usually better than placing all scheduling work behind one global
+  lock.
 </p>
 
 <h2 id="inventory-design"><span class="num">17.</span> Case study: fenced inventory allocator</h2>
@@ -1266,8 +1308,8 @@ durable reservation result</code></pre>
 <div class="warn">
   <strong>Do not read, unlock, then write</strong>
   <p>
-    Fencing proves owner generation, but the available-quantity check and decrement must still be one
-    atomic transaction. Two valid requests from the same owner generation can race each other.
+    Fencing proves owner generation, but the available-quantity check and decrement must still be
+    one atomic transaction. Two valid requests from the same owner generation can race each other.
   </p>
 </div>
 
@@ -1311,14 +1353,16 @@ durable reservation result</code></pre>
   </table>
 </div>
 
-<h2 id="production-architecture"><span class="num">18.</span> Production architecture and deployment</h2>
+<h2 id="production-architecture">
+  <span class="num">18.</span> Production architecture and deployment
+</h2>
 
 <h3 id="failure-domains">Place voters by failure domain</h3>
 <p>
-  Put voters on independent machines and, where latency permits, independent zones. Three processes on
-  one host are one failure domain. Avoid placing a majority behind one power, network, storage, or
-  maintenance boundary. A five-voter cluster spanning three zones might use a 2-2-1 placement, but
-  capacity planning must test which zone loss leaves a reachable majority and enough application
+  Put voters on independent machines and, where latency permits, independent zones. Three processes
+  on one host are one failure domain. Avoid placing a majority behind one power, network, storage,
+  or maintenance boundary. A five-voter cluster spanning three zones might use a 2-2-1 placement,
+  but capacity planning must test which zone loss leaves a reachable majority and enough application
   capacity.
 </p>
 
@@ -1410,9 +1454,10 @@ durable reservation result</code></pre>
 <h3 id="logs-traces">Logs and traces</h3>
 <p>
   Structured events should include cluster ID, member ID, term, role, peer, log index, commit index,
-  lease ID, fencing token, lock key hash, request ID, and outcome. Do not log secrets or raw sensitive
-  resource keys. Trace a proposal from client through leader replication and application, but sample
-  high-volume heartbeats. Correlate leadership changes with disk, network, and runtime evidence.
+  lease ID, fencing token, lock key hash, request ID, and outcome. Do not log secrets or raw
+  sensitive resource keys. Trace a proposal from client through leader replication and application,
+  but sample high-volume heartbeats. Correlate leadership changes with disk, network, and runtime
+  evidence.
 </p>
 
 <h3 id="troubleshooting-order">Troubleshooting a flapping leader</h3>
@@ -1424,7 +1469,9 @@ durable reservation result</code></pre>
   <li>Inspect CPU throttling, long pauses, snapshots, compaction, and disk saturation.</li>
   <li>Verify membership and endpoints are identical and no restored duplicate cluster exists.</li>
   <li>Mitigate by removing overload or repairing the failed path while preserving quorum.</li>
-  <li>Change timeouts only after understanding the distribution; larger timers can hide failure.</li>
+  <li>
+    Change timeouts only after understanding the distribution; larger timers can hide failure.
+  </li>
 </ol>
 
 <div class="tip">
@@ -1440,20 +1487,36 @@ durable reservation result</code></pre>
 
 <h3 id="security-boundaries">Trust boundaries</h3>
 <ul>
-  <li>Authenticate members mutually and authorize cluster membership changes separately from client writes.</li>
-  <li>Encrypt client and peer traffic, verify host identity, and rotate certificates without losing quorum.</li>
-  <li>Use least-privilege credentials per application and restrict each lock or key namespace by tenant.</li>
-  <li>Protect snapshots, logs, and backups because coordination values can contain topology and secrets.</li>
-  <li>Audit membership, lease ownership, administrative override, and destructive key operations.</li>
-  <li>Validate that a token belongs to the expected resource namespace, not merely that it is numeric.</li>
+  <li>
+    Authenticate members mutually and authorize cluster membership changes separately from client
+    writes.
+  </li>
+  <li>
+    Encrypt client and peer traffic, verify host identity, and rotate certificates without losing
+    quorum.
+  </li>
+  <li>
+    Use least-privilege credentials per application and restrict each lock or key namespace by
+    tenant.
+  </li>
+  <li>
+    Protect snapshots, logs, and backups because coordination values can contain topology and
+    secrets.
+  </li>
+  <li>
+    Audit membership, lease ownership, administrative override, and destructive key operations.
+  </li>
+  <li>
+    Validate that a token belongs to the expected resource namespace, not merely that it is numeric.
+  </li>
 </ul>
 
 <h3 id="abuse">Abuse and denial of service</h3>
 <p>
-  Attackers or buggy tenants can create millions of lock keys, hold permits, open watch streams, churn
-  leases, or force hot-key contention. Enforce quotas on keys, sessions, watchers, request rate,
-  transaction size, and history retention. Bound names and payloads. Separate administrative APIs.
-  Avoid exposing raw coordinator errors or membership addresses to untrusted clients.
+  Attackers or buggy tenants can create millions of lock keys, hold permits, open watch streams,
+  churn leases, or force hot-key contention. Enforce quotas on keys, sessions, watchers, request
+  rate, transaction size, and history retention. Bound names and payloads. Separate administrative
+  APIs. Avoid exposing raw coordinator errors or membership addresses to untrusted clients.
 </p>
 
 <h3 id="compromised-member">Compromised participants</h3>
@@ -1461,19 +1524,21 @@ durable reservation result</code></pre>
   Crash-fault consensus is not designed to remain correct when a voting member deliberately violates
   the protocol. Strong authentication reduces unauthorized membership but does not protect against a
   compromised authorized voter or malicious storage. If the threat model includes Byzantine faults,
-  select a protocol designed for them, define identity and quorum assumptions accordingly, and expect
-  higher message, operational, and latency cost.
+  select a protocol designed for them, define identity and quorum assumptions accordingly, and
+  expect higher message, operational, and latency cost.
 </p>
 
 <h3 id="privacy">Privacy</h3>
 <p>
   Lock and lease names can reveal tenant IDs, file paths, order IDs, or business activity. Prefer
-  scoped opaque identifiers or keyed hashes, minimize retained history, and apply deletion and backup
-  policies. Metrics should aggregate lock keys and control cardinality. Debug access to coordination
-  state is privileged production data access.
+  scoped opaque identifiers or keyed hashes, minimize retained history, and apply deletion and
+  backup policies. Metrics should aggregate lock keys and control cardinality. Debug access to
+  coordination state is privileged production data access.
 </p>
 
-<h2 id="performance"><span class="num">21.</span> Performance, scalability, capacity, latency, and cost</h2>
+<h2 id="performance">
+  <span class="num">21.</span> Performance, scalability, capacity, latency, and cost
+</h2>
 
 <h3 id="commit-latency">Commit latency model</h3>
 <figure class="code">
@@ -1498,25 +1563,27 @@ throughput is bounded by the tightest of:
 <p>
   This is an intuition, not a universal formula. Implementations pipeline and batch replication, and
   acknowledgement contracts differ. Measure client-visible commit latency at p50, p95, p99, and
-  p99.9. Tail disk and network behavior often matters more than averages because the quorum path must
-  complete repeatedly.
+  p99.9. Tail disk and network behavior often matters more than averages because the quorum path
+  must complete repeatedly.
 </p>
 
 <h3 id="capacity-example">Capacity example</h3>
 <p>
   Suppose leadership metadata receives 8,000 proposals per second, with 400 bytes of entry and
   protocol overhead per proposal. The raw leader log ingress is about 3.2 MB/s. Replicating to four
-  followers sends roughly 12.8 MB/s before transport overhead, snapshots, retries, and reads. At 86400
-  seconds per day, the uncompacted raw entries are about 276 GB per day. This immediately motivates
-  batching, compaction, retention limits, and keeping bulk payloads outside the coordinator.
+  followers sends roughly 12.8 MB/s before transport overhead, snapshots, retries, and reads. At
+  86400 seconds per day, the uncompacted raw entries are about 276 GB per day. This immediately
+  motivates batching, compaction, retention limits, and keeping bulk payloads outside the
+  coordinator.
 </p>
 
 <h3 id="contention-cost">Lock contention and queueing</h3>
 <p>
   If a critical section averages 20 ms, one exclusive lock has a theoretical ceiling near 50 owners
-  per second before overhead. At high utilization, waiting time grows sharply and tail latency becomes
-  unstable. Shorten the critical section, partition the key, batch compatible work, or replace the
-  lock with an atomic operation. Adding coordinator nodes does not parallelize one hot lock.
+  per second before overhead. At high utilization, waiting time grows sharply and tail latency
+  becomes unstable. Shorten the critical section, partition the key, batch compatible work, or
+  replace the lock with an atomic operation. Adding coordinator nodes does not parallelize one hot
+  lock.
 </p>
 
 <div class="tbl">
@@ -1565,13 +1632,15 @@ throughput is bounded by the tightest of:
 
 <h3 id="headroom">Headroom planning</h3>
 <p>
-  Size for a voter loss, snapshot transfer, compaction, backup, and application peak at the same time.
-  A cluster that is 65 percent busy per voter may overload when traffic shifts after one failure.
-  Preserve enough disk for log growth during an unavailable follower and enough network for catch-up
-  without starving foreground quorum messages. Set hard payload and transaction limits.
+  Size for a voter loss, snapshot transfer, compaction, backup, and application peak at the same
+  time. A cluster that is 65 percent busy per voter may overload when traffic shifts after one
+  failure. Preserve enough disk for log growth during an unavailable follower and enough network for
+  catch-up without starving foreground quorum messages. Set hard payload and transaction limits.
 </p>
 
-<h2 id="failures"><span class="num">22.</span> Failure scenarios, edge cases, and safer corrections</h2>
+<h2 id="failures">
+  <span class="num">22.</span> Failure scenarios, edge cases, and safer corrections
+</h2>
 
 <div class="tbl">
   <table>
@@ -1669,10 +1738,10 @@ throughput is bounded by the tightest of:
 
 <h3 id="ambiguous-outcomes">Ambiguous outcomes</h3>
 <p>
-  Timeout does not mean failure. An acquire, proposal, or release may have committed before its response
-  disappeared. Every API needs an operation identity and a way to query or retry its outcome. Never
-  convert a timeout directly into a second non-idempotent command. Record uncertainty explicitly and
-  reconcile against authoritative state.
+  Timeout does not mean failure. An acquire, proposal, or release may have committed before its
+  response disappeared. Every API needs an operation identity and a way to query or retry its
+  outcome. Never convert a timeout directly into a second non-idempotent command. Record uncertainty
+  explicitly and reconcile against authoritative state.
 </p>
 
 <h2 id="testing"><span class="num">23.</span> Testing strategy</h2>
@@ -1680,10 +1749,14 @@ throughput is bounded by the tightest of:
 <h3 id="unit-model-tests">Unit and model tests</h3>
 <ul>
   <li>Test every role transition, term comparison, vote rule, and log-conflict case.</li>
-  <li>Use deterministic clocks and schedulers to explore lease boundaries and delayed callbacks.</li>
+  <li>
+    Use deterministic clocks and schedulers to explore lease boundaries and delayed callbacks.
+  </li>
   <li>Property-test that fencing tokens increase and stale tokens never mutate protected state.</li>
   <li>Test lock release with wrong owner, expired owner, and new owner interleavings.</li>
-  <li>Model small protocol state spaces and assert agreement, leader completeness, and apply order.</li>
+  <li>
+    Model small protocol state spaces and assert agreement, leader completeness, and apply order.
+  </li>
   <li>Test dedup retention and repeated requests before, during, and after expiry.</li>
 </ul>
 
@@ -1691,21 +1764,35 @@ throughput is bounded by the tightest of:
 <ol>
   <li>Start a real three or five voter cluster with isolated storage per member.</li>
   <li>Commit data, kill a follower, restart it, and verify catch-up without lost commitment.</li>
-  <li>Kill the leader after durable append, after follower acknowledgement, and after commit but before client response.</li>
-  <li>Partition the old leader into a minority and verify it cannot commit or bypass external fencing.</li>
-  <li>Pause an owner beyond lease expiry, grant a new token, resume the old process, and expect rejection.</li>
-  <li>Corrupt or truncate a test snapshot and verify fail-safe recovery rather than silent state divergence.</li>
+  <li>
+    Kill the leader after durable append, after follower acknowledgement, and after commit but
+    before client response.
+  </li>
+  <li>
+    Partition the old leader into a minority and verify it cannot commit or bypass external fencing.
+  </li>
+  <li>
+    Pause an owner beyond lease expiry, grant a new token, resume the old process, and expect
+    rejection.
+  </li>
+  <li>
+    Corrupt or truncate a test snapshot and verify fail-safe recovery rather than silent state
+    divergence.
+  </li>
   <li>Exercise safe membership addition, learner catch-up, promotion, removal, and rollback.</li>
-  <li>Disconnect a watch client through compaction and verify full re-read and correct resubscription.</li>
+  <li>
+    Disconnect a watch client through compaction and verify full re-read and correct resubscription.
+  </li>
 </ol>
 
 <h3 id="history-testing">History-based correctness testing</h3>
 <p>
-  Record invocation and completion times, request IDs, returned values, terms, tokens, and authoritative
-  state. Check whether completed operations admit the promised sequential or linearizable explanation.
-  For locks, assert no two accepted protected writes violate fencing order. For the scheduler, assert a
-  unique logical run and eventual outbox publication. For inventory, assert available quantity never
-  becomes negative and every decrement has one durable reservation.
+  Record invocation and completion times, request IDs, returned values, terms, tokens, and
+  authoritative state. Check whether completed operations admit the promised sequential or
+  linearizable explanation. For locks, assert no two accepted protected writes violate fencing
+  order. For the scheduler, assert a unique logical run and eventual outbox publication. For
+  inventory, assert available quantity never becomes negative and every decrement has one durable
+  reservation.
 </p>
 
 <h3 id="load-tests">Load, stress, and soak tests</h3>
@@ -1714,8 +1801,13 @@ throughput is bounded by the tightest of:
   <li>Create one hot lock plus many cold keys to expose unfairness and head-of-line blocking.</li>
   <li>Run with one voter unavailable to prove failure headroom.</li>
   <li>Include compaction, snapshot, backup, certificate rotation, and follower catch-up.</li>
-  <li>Soak long enough to observe log growth, watch leaks, session churn, and token exhaustion assumptions.</li>
-  <li>Rate-limit fault injection so the test remains diagnosable and stop if safety evidence is lost.</li>
+  <li>
+    Soak long enough to observe log growth, watch leaks, session churn, and token exhaustion
+    assumptions.
+  </li>
+  <li>
+    Rate-limit fault injection so the test remains diagnosable and stop if safety evidence is lost.
+  </li>
 </ul>
 
 <h3 id="fault-matrix">Minimum fault matrix</h3>
@@ -1773,11 +1865,19 @@ throughput is bounded by the tightest of:
 <h3 id="quorum-loss">Quorum unavailable</h3>
 <ol>
   <li>Freeze destructive automation and identify the exact configured voter set.</li>
-  <li>Determine which data directories contain the newest durable committed history without starting conflicting clusters.</li>
-  <li>Restore network, disk, credentials, or a stopped voter before attempting membership surgery.</li>
+  <li>
+    Determine which data directories contain the newest durable committed history without starting
+    conflicting clusters.
+  </li>
+  <li>
+    Restore network, disk, credentials, or a stopped voter before attempting membership surgery.
+  </li>
   <li>Keep client writes blocked if quorum authority cannot be established.</li>
   <li>Use the product's documented disaster-recovery procedure if quorum cannot be restored.</li>
-  <li>After recovery, verify cluster identity, membership, commit index, application invariants, and backups.</li>
+  <li>
+    After recovery, verify cluster identity, membership, commit index, application invariants, and
+    backups.
+  </li>
 </ol>
 
 <h3 id="lease-incident">Lease or split-brain incident</h3>
@@ -1794,9 +1894,10 @@ throughput is bounded by the tightest of:
 <div class="warn">
   <strong>Do not form a new cluster casually</strong>
   <p>
-    Force-bootstrapping from an arbitrary node can discard committed data or create two authoritative
-    histories. Product-specific recovery documentation and verified backups are part of the safety
-    model. If evidence is incomplete, prefer temporary unavailability over silent divergence.
+    Force-bootstrapping from an arbitrary node can discard committed data or create two
+    authoritative histories. Product-specific recovery documentation and verified backups are part
+    of the safety model. If evidence is incomplete, prefer temporary unavailability over silent
+    divergence.
   </p>
 </div>
 
@@ -1805,31 +1906,31 @@ throughput is bounded by the tightest of:
 <h3 id="exercise-election">Exercise 1: trace a Raft election</h3>
 <p>
   Given five voters, terms and last log positions are A=(7, 20), B=(7, 19), C=(6, 24), D=(7, 20),
-  E=(5, 30), where each pair is <code>(lastTerm, lastIndex)</code>. Candidate B requests votes in term
-  9. Which voters may consider B up to date?
+  E=(5, 30), where each pair is <code>(lastTerm, lastIndex)</code>. Candidate B requests votes in
+  term 9. Which voters may consider B up to date?
 </p>
 <div class="key">
   <strong>Expected reasoning</strong>
   <p>
-    Compare last term first, then index only when last terms match. B's last term 7 is newer than C's
-    6 and E's 5 despite their longer indexes. A and D have the same last term but index 20, so B at 19
-    is behind them. B can vote for itself, and C and E can pass the freshness test. If their vote state
-    permits, B can reach three votes. This question shows why log length alone is wrong.
+    Compare last term first, then index only when last terms match. B's last term 7 is newer than
+    C's 6 and E's 5 despite their longer indexes. A and D have the same last term but index 20, so B
+    at 19 is behind them. B can vote for itself, and C and E can pass the freshness test. If their
+    vote state permits, B can reach three votes. This question shows why log length alone is wrong.
   </p>
 </div>
 
 <h3 id="exercise-lock">Exercise 2: break and repair a TTL lock</h3>
 <p>
-  Implement a test coordinator, pause owner A beyond TTL, allow B to acquire, then resume A. First use
-  only owner IDs; observe both writes. Next return monotonically increasing tokens and make a database
-  row reject tokens no greater than its highest token.
+  Implement a test coordinator, pause owner A beyond TTL, allow B to acquire, then resume A. First
+  use only owner IDs; observe both writes. Next return monotonically increasing tokens and make a
+  database row reject tokens no greater than its highest token.
 </p>
 <div class="key">
   <strong>Expected reasoning</strong>
   <p>
     The corrected safety assertion belongs at the database row. A's old token is rejected even if A
-    skipped its local expiry check. Add an idempotent request ID because B may repeat a command whose
-    response was lost.
+    skipped its local expiry check. Add an idempotent request ID because B may repeat a command
+    whose response was lost.
   </p>
 </div>
 
@@ -1842,11 +1943,11 @@ throughput is bounded by the tightest of:
 <div class="key">
   <strong>Expected reasoning</strong>
   <p>
-    Partition by stable subscription hash or due-time bucket, elect or assign ownership per partition,
-    and store an ownership epoch. Use a unique subscription and billing-period run key, transactionally
-    insert run plus outbox, and charge with the run ID as payment idempotency key. Leadership reduces
-    duplicate scans but does not guarantee one charge. Monitor due lag, ownership churn, outbox lag,
-    and ambiguous provider results.
+    Partition by stable subscription hash or due-time bucket, elect or assign ownership per
+    partition, and store an ownership epoch. Use a unique subscription and billing-period run key,
+    transactionally insert run plus outbox, and charge with the run ID as payment idempotency key.
+    Leadership reduces duplicate scans but does not guarantee one charge. Monitor due lag, ownership
+    churn, outbox lag, and ambiguous provider results.
   </p>
 </div>
 
@@ -1859,16 +1960,16 @@ throughput is bounded by the tightest of:
   <strong>Expected reasoning</strong>
   <p>
     Add one new member as a learner if supported, wait for catch-up, promote through the documented
-    configuration protocol, then remove one old member. Verify quorum and lag. Repeat for the second.
-    Never remove two old voters first, never copy a live data directory casually, and never combine
-    both replacements into an unverified reconfiguration.
+    configuration protocol, then remove one old member. Verify quorum and lag. Repeat for the
+    second. Never remove two old voters first, never copy a live data directory casually, and never
+    combine both replacements into an unverified reconfiguration.
   </p>
 </div>
 
 <h3 id="exercise-tradeoff">Exercise 5: decide whether to coordinate</h3>
 <p>
-  A content feed wants a globally exact view counter on every read. Peak load is two million reads per
-  second and values may be a minute stale. Should every request use consensus?
+  A content feed wants a globally exact view counter on every read. Peak load is two million reads
+  per second and values may be a minute stale. Should every request use consensus?
 </p>
 <div class="key">
   <strong>Expected reasoning</strong>
@@ -1886,8 +1987,8 @@ throughput is bounded by the tightest of:
 <p>
   Consensus lets participants agree on one irrevocable value or ordered command history despite some
   crash failures and delayed messages. In replicated state machines, it ensures replicas apply the
-  same command at each log position. It preserves safety when a minority is unavailable, but progress
-  normally requires a reachable majority and a sufficiently stable period of communication.
+  same command at each log position. It preserves safety when a minority is unavailable, but
+  progress normally requires a reachable majority and a sufficiently stable period of communication.
 </p>
 <p><strong>Follow-up:</strong> Why is consensus not the same as replication?</p>
 <p>
@@ -1908,15 +2009,16 @@ throughput is bounded by the tightest of:
 <h3>3. Explain a Raft election.</h3>
 <p>
   A follower missing leader contact reaches a randomized election timeout, increments its term,
-  persists its self-vote, and requests votes. Each voter grants at most one vote in the term and only
-  to a candidate whose log is at least as up to date. A majority elects the leader. Any participant
-  seeing a higher term steps down or updates its term. Split votes cause another randomized round.
+  persists its self-vote, and requests votes. Each voter grants at most one vote in the term and
+  only to a candidate whose log is at least as up to date. A majority elects the leader. Any
+  participant seeing a higher term steps down or updates its term. Split votes cause another
+  randomized round.
 </p>
 <p><strong>Follow-up:</strong> Can two nodes both think they are leader?</p>
 <p>
-  Locally, yes, during different terms or before an old leader learns of the new term. Two leaders for
-  the same term cannot both obtain majorities from the same correct membership. External effects still
-  need fencing because local belief can be stale.
+  Locally, yes, during different terms or before an old leader learns of the new term. Two leaders
+  for the same term cannot both obtain majorities from the same correct membership. External effects
+  still need fencing because local belief can be stale.
 </p>
 
 <h3>4. What is Raft's log matching property?</h3>
@@ -1940,19 +2042,20 @@ throughput is bounded by the tightest of:
 
 <h3>6. How do Raft and Paxos differ?</h3>
 <p>
-  Both can implement fault-tolerant replicated logs with comparable majority assumptions. Raft makes a
-  strong leader and one coherent log central, with explicit terms and roles. Classic Paxos presents
-  proposers, acceptors, learners, ballots, and one chosen value; Multi-Paxos repeats the process and
-  uses a stable leader for efficiency. The most important interview skill is explaining one protocol
-  accurately, not declaring a universal winner.
+  Both can implement fault-tolerant replicated logs with comparable majority assumptions. Raft makes
+  a strong leader and one coherent log central, with explicit terms and roles. Classic Paxos
+  presents proposers, acceptors, learners, ballots, and one chosen value; Multi-Paxos repeats the
+  process and uses a stable leader for efficiency. The most important interview skill is explaining
+  one protocol accurately, not declaring a universal winner.
 </p>
 
 <h3>7. What is a lease, and why are clocks dangerous?</h3>
 <p>
   A lease is authority limited by time. Network delay means the holder may learn about a grant after
   some of its duration has passed. Clock skew, drift, jumps, and process pauses can invalidate naive
-  comparisons. Measure local elapsed time with a monotonic clock, subtract safety margin, renew early,
-  and stop on uncertainty. Use fencing for protected writes because a paused holder can resume.
+  comparisons. Measure local elapsed time with a monotonic clock, subtract safety margin, renew
+  early, and stop on uncertainty. Use fencing for protected writes because a paused holder can
+  resume.
 </p>
 <p><strong>Follow-up:</strong> Does clock synchronization eliminate fencing?</p>
 <p>
@@ -1963,9 +2066,10 @@ throughput is bounded by the tightest of:
 <h3>8. Why is a distributed lock without fencing unsafe?</h3>
 <p>
   Lock ownership can expire while a process is paused. A new process acquires legitimately, then the
-  old one resumes and still writes. A fencing token gives each ownership generation a greater number,
-  and the protected resource rejects values older than the highest accepted number. Owner IDs prevent
-  mistaken release, but only monotonic ordering checked at the resource prevents stale writes.
+  old one resumes and still writes. A fencing token gives each ownership generation a greater
+  number, and the protected resource rejects values older than the highest accepted number. Owner
+  IDs prevent mistaken release, but only monotonic ordering checked at the resource prevents stale
+  writes.
 </p>
 
 <h3>9. When is a database constraint better than a lock?</h3>
@@ -1979,22 +2083,22 @@ throughput is bounded by the tightest of:
 <h3>10. How would you build a leader-elected scheduler?</h3>
 <p>
   Run replicas across failure domains and acquire a lease plus fencing epoch from a consistent
-  authority. The active leader scans due work, but each logical run has a unique schedule and due-time
-  key. Commit the run and an outbox record transactionally. Workers are idempotent. On uncertain lease
-  renewal, stop starting work. The schedule database rejects old epochs. Partition the schedule space
-  when one leader cannot handle peak load.
+  authority. The active leader scans due work, but each logical run has a unique schedule and
+  due-time key. Commit the run and an outbox record transactionally. Workers are idempotent. On
+  uncertain lease renewal, stop starting work. The schedule database rejects old epochs. Partition
+  the schedule space when one leader cannot handle peak load.
 </p>
 <p><strong>Follow-up:</strong> Why retain idempotency if there is one leader?</p>
 <p>
-  Failover can overlap local execution, responses can be lost, queue messages can repeat, and external
-  effects can be ambiguous. Leadership is not an exactly-once guarantee.
+  Failover can overlap local execution, responses can be lost, queue messages can repeat, and
+  external effects can be ambiguous. Leadership is not an exactly-once guarantee.
 </p>
 
 <h3>11. How do you change consensus membership safely?</h3>
 <p>
   Use the implementation's reconfiguration protocol. In Raft joint consensus, an intermediate state
-  requires majorities of both old and new configurations, preserving overlap. Operationally, catch up
-  new members before promotion, change one member at a time, and confirm quorum after every step.
+  requires majorities of both old and new configurations, preserving overlap. Operationally, catch
+  up new members before promotion, change one member at a time, and confirm quorum after every step.
 </p>
 
 <h3>12. What causes leader flapping?</h3>
@@ -2009,23 +2113,25 @@ throughput is bounded by the tightest of:
 <p>
   The cluster should preserve safety and stop committing decisions that require quorum. Applications
   may serve explicitly stale reads or degraded functions whose correctness allows it. Do not force a
-  minority to accept writes. Restore a voter or network path, or use documented disaster recovery with
-  a known authoritative history.
+  minority to accept writes. Restore a voter or network path, or use documented disaster recovery
+  with a known authoritative history.
 </p>
 
 <h3>14. How would you test a distributed lock?</h3>
 <p>
   Generate concurrent histories, inject process pauses beyond TTL, network partitions, lost acquire
-  and release responses, crashes, clock changes, and coordinator failover. Record tokens and accepted
-  writes. Assert that the resource never accepts an older token after a newer one, wrong owners cannot
-  release, ambiguous attempts can be discovered, and progress resumes after valid expiry.
+  and release responses, crashes, clock changes, and coordinator failover. Record tokens and
+  accepted writes. Assert that the resource never accepts an older token after a newer one, wrong
+  owners cannot release, ambiguous attempts can be discovered, and progress resumes after valid
+  expiry.
 </p>
 
 <h3>15. Why should a coordination service hold little data?</h3>
 <p>
-  Consensus turns every write into durable quorum work, and large values increase network, disk, log,
-  snapshot, recovery, and compaction cost. Store membership, ownership, versions, and small metadata.
-  Put bulk documents, media, analytics, or event payloads in systems designed for their access pattern.
+  Consensus turns every write into durable quorum work, and large values increase network, disk,
+  log, snapshot, recovery, and compaction cost. Store membership, ownership, versions, and small
+  metadata. Put bulk documents, media, analytics, or event payloads in systems designed for their
+  access pattern.
 </p>
 
 <h2 id="cheat-sheet"><span class="num">27.</span> Revision cheat sheet</h2>
@@ -2037,7 +2143,9 @@ throughput is bounded by the tightest of:
   <li>Raft uses followers, candidates, leaders, terms, votes, and a replicated log.</li>
   <li>Vote for at most one candidate per term and only when its log is sufficiently up to date.</li>
   <li>AppendEntries checks the preceding index and term to preserve log matching.</li>
-  <li>Raft advances commit by counting a current-term entry, which indirectly commits prior entries.</li>
+  <li>
+    Raft advances commit by counting a current-term entry, which indirectly commits prior entries.
+  </li>
   <li>Uncommitted log suffixes can be overwritten after leadership change.</li>
   <li>Client request IDs handle committed commands whose responses were lost.</li>
   <li>Linearizable reads need current authority evidence and applied-state progress.</li>
@@ -2050,10 +2158,14 @@ throughput is bounded by the tightest of:
   <li>Mutex means one owner, semaphore means K permits, and barrier means wait for a phase.</li>
   <li>Notifications are hints. Re-read authoritative state after events and reconnects.</li>
   <li>Prefer database constraints and atomic updates when one database owns the invariant.</li>
-  <li>A leader-elected scheduler still needs unique run IDs, outbox delivery, and idempotent workers.</li>
+  <li>
+    A leader-elected scheduler still needs unique run IDs, outbox delivery, and idempotent workers.
+  </li>
   <li>A fenced allocator also needs an atomic quantity check and unique reservation ID.</li>
   <li>Spread voters across failure domains and keep failure capacity headroom.</li>
-  <li>Monitor term churn, quorum latency, fsync tail, lag, lease margin, and stale-token rejects.</li>
+  <li>
+    Monitor term churn, quorum latency, fsync tail, lag, lease margin, and stale-token rejects.
+  </li>
   <li>Never force-restore or manually break a lock without a documented fenced procedure.</li>
 </ul>
 
@@ -2061,7 +2173,8 @@ throughput is bounded by the tightest of:
 <ul>
   <li>
     <a href="https://raft.github.io/raft.pdf"
-      >Ongaro and Ousterhout: In Search of an Understandable Consensus Algorithm, extended version</a
+      >Ongaro and Ousterhout: In Search of an Understandable Consensus Algorithm, extended
+      version</a
     >
     - Raft roles, elections, log replication, safety, membership changes, and snapshots.
   </li>
@@ -2073,13 +2186,15 @@ throughput is bounded by the tightest of:
   </li>
   <li>
     <a href="https://raft.github.io/">Raft consensus algorithm official resource site</a>
-    - replicated-state-machine overview, paper, dissertation, formal specification, and implementations.
+    - replicated-state-machine overview, paper, dissertation, formal specification, and
+    implementations.
   </li>
   <li>
     <a href="https://www.microsoft.com/en-us/research/publication/paxos-made-simple/"
       >Leslie Lamport: Paxos Made Simple</a
     >
-    - proposers, acceptors, ballots, chosen values, and the foundation for the high-level comparison.
+    - proposers, acceptors, ballots, chosen values, and the foundation for the high-level
+    comparison.
   </li>
   <li>
     <a href="https://etcd.io/docs/v3.7/learning/api_guarantees/">etcd API guarantees</a>
@@ -2099,7 +2214,8 @@ throughput is bounded by the tightest of:
   </li>
   <li>
     <a href="https://curator.apache.org/docs/recipes/">Apache Curator official recipes</a>
-    - production client recipes for locks, leader election, barriers, and related coordination patterns.
+    - production client recipes for locks, leader election, barriers, and related coordination
+    patterns.
   </li>
   <li>
     <a href="https://kubernetes.io/docs/concepts/architecture/leases/"
@@ -2108,7 +2224,8 @@ throughput is bounded by the tightest of:
     - leases used for node heartbeats and component leader election.
   </li>
   <li>
-    <a href="https://kubernetes.io/docs/concepts/cluster-administration/coordinated-leader-election/"
+    <a
+      href="https://kubernetes.io/docs/concepts/cluster-administration/coordinated-leader-election/"
       >Kubernetes coordinated leader election</a
     >
     - Lease fields, optimistic concurrency, acquisition, renewal, and leadership transition.
