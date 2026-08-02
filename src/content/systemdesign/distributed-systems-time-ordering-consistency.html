@@ -1,0 +1,1432 @@
+<h1>Distributed Systems, Time, Ordering, and Consistency - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to reasoning about partial failure, uncertain time, causal order,
+  consistency contracts, partitions, and the production choices that make distributed behavior
+  understandable, testable, and safe.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The distributed-systems mental model</h2>
+<p class="lead">
+  A distributed system is a group of independent processes that cooperate by exchanging messages,
+  while no participant can instantly know the complete current state of every other participant.
+</p>
+
+<div class="analogy">
+  <p>
+    Imagine several bank branches connected by couriers. Each branch can update local records, but a
+    courier may arrive late, arrive twice, or stop arriving. A silent branch might be closed, cut
+    off, or simply busy. The branches need explicit rules for which updates are valid, how conflicts
+    are detected, what customers may observe, and when an answer must wait. Distributed software has
+    the same uncertainty, only at much shorter time scales.
+  </p>
+</div>
+
+<p>
+  Distribution removes shared fate and enables geographic reach, independent scaling, and fault
+  isolation. It also removes assumptions that are easy on one machine. Memory is not instantly
+  shared. Message delay has no safe universal upper bound. Clocks do not exactly agree. A timeout is
+  evidence of waiting, not proof of failure. Two healthy nodes can each be unable to reach the
+  other. A useful design therefore begins with a system model and an observable contract, not a
+  product name.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Precise meaning</th>
+        <th>Question it forces</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Process</td>
+        <td>An independently executing program with private state</td>
+        <td>What survives if this process stops?</td>
+      </tr>
+      <tr>
+        <td>Node</td>
+        <td>A failure and deployment unit that may host one or more processes</td>
+        <td>Which supposedly separate replicas share this node or rack?</td>
+      </tr>
+      <tr>
+        <td>Message</td>
+        <td>A finite piece of information sent through an unreliable or delayed channel</td>
+        <td>Can it be lost, duplicated, reordered, delayed, or corrupted?</td>
+      </tr>
+      <tr>
+        <td>State</td>
+        <td>Information whose value affects future behavior</td>
+        <td>Who owns it, replicates it, and decides its valid transitions?</td>
+      </tr>
+      <tr>
+        <td>History</td>
+        <td>
+          Invocations, responses, reads, writes, and messages ordered as far as evidence permits
+        </td>
+        <td>Does this observed execution satisfy the promised consistency model?</td>
+      </tr>
+      <tr>
+        <td>Consistency model</td>
+        <td>A contract restricting which histories clients are allowed to observe</td>
+        <td>Which stale, reordered, or conflicting results are legal?</td>
+      </tr>
+      <tr>
+        <td>Availability</td>
+        <td>A defined class of requests receives a non-error response within a stated bound</td>
+        <td>Which requests, failures, and deadlines are included?</td>
+      </tr>
+      <tr>
+        <td>Partition</td>
+        <td>Communication between groups is lost or delayed beyond the useful deadline</td>
+        <td>Which side may continue, and with what correctness loss?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The central discipline</strong>
+  <p>
+    Separate what is true from what a participant can know. Then state what clients may observe when
+    messages, clocks, processes, and storage do not behave ideally.
+  </p>
+</div>
+
+<h2 id="system-model"><span class="num">01.</span> State the system model before reasoning</h2>
+<p class="lead">
+  An algorithm is correct only relative to assumptions about processes, networks, clocks, and
+  faults.
+</p>
+
+<h3 id="network-models">Synchronous, asynchronous, and partially synchronous networks</h3>
+<dl>
+  <dt>Synchronous model</dt>
+  <dd>
+    Known upper bounds exist for message delivery and processing. Missing a bound can prove a fault,
+    but real wide-area systems rarely preserve a tight bound during every overload or failure.
+  </dd>
+  <dt>Asynchronous model</dt>
+  <dd>
+    There is no known finite upper bound on message or process delay. A slow response and a failed
+    node are indistinguishable from the observer's current evidence.
+  </dd>
+  <dt>Partially synchronous model</dt>
+  <dd>
+    Useful bounds eventually hold, or hold during normal periods, but the system does not know
+    exactly when. Many practical coordination algorithms use this model for progress while
+    preserving safety when timing assumptions fail.
+  </dd>
+</dl>
+
+<p>
+  Do not call an internal network reliable merely because packet loss is rare. Queueing, garbage
+  collection, CPU starvation, connection-pool exhaustion, DNS failure, firewall changes, routing
+  convergence, and overloaded peers can all look like loss. The end-to-end request observes the
+  whole path, not the intended topology.
+</p>
+
+<h3 id="failure-models">Common failure models</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Behavior</th>
+        <th>Design consequence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Crash-stop</td>
+        <td>A process stops forever and performs no more actions</td>
+        <td>Replacement is enough; recovered local state is irrelevant</td>
+      </tr>
+      <tr>
+        <td>Crash-recovery</td>
+        <td>A process stops and later restarts with durable state but lost volatile state</td>
+        <td>Epochs, replay, idempotency, and durable progress records matter</td>
+      </tr>
+      <tr>
+        <td>Omission</td>
+        <td>A send, receive, or storage action is missing</td>
+        <td>Retries may help but can duplicate an action whose response was lost</td>
+      </tr>
+      <tr>
+        <td>Timing</td>
+        <td>An action occurs outside its promised time bound</td>
+        <td>Real-time guarantees or leases may become unsafe</td>
+      </tr>
+      <tr>
+        <td>Arbitrary or Byzantine</td>
+        <td>A participant may lie, corrupt data, equivocate, or behave inconsistently</td>
+        <td>Crash-fault algorithms are insufficient; authentication alone does not create truth</td>
+      </tr>
+      <tr>
+        <td>Correlated</td>
+        <td>
+          Several components fail because they share power, software, control plane, or operator
+        </td>
+        <td>Replica count helps only when failure domains are genuinely independent</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  An ambiguous outcome is especially important. A client sends a payment command, the server commits
+  it, and the reply is lost. The client sees a timeout but the payment happened. Retrying without an
+  idempotency key may pay twice. Declaring failure without reconciliation may tell the user a lie.
+</p>
+
+<h2 id="safety-liveness">
+  <span class="num">02.</span> Safety, liveness, and impossibility intuition
+</h2>
+<p class="lead">
+  Safety says that nothing forbidden happens. Liveness says that something desired eventually
+  happens.
+</p>
+
+<ul>
+  <li>Safety: two confirmed orders never receive the same unique reservation.</li>
+  <li>Safety: an acknowledged write is not silently replaced by an older version.</li>
+  <li>Liveness: a valid request eventually receives a result when enough components recover.</li>
+  <li>Liveness: replicas eventually converge after writes and partitions stop.</li>
+</ul>
+
+<p>
+  Safety is normally required in every execution admitted by the model. Liveness needs environmental
+  conditions such as eventual message delivery, available quorum, bounded load, or a fair scheduler.
+  Retrying forever can preserve the possibility of progress while violating a user's deadline.
+  Returning immediately can improve response availability while violating a correctness invariant.
+</p>
+
+<div class="warn">
+  <strong>Do not turn uncertainty into certainty</strong>
+  <p>
+    In a fully asynchronous network, silence cannot distinguish a crashed process from a delayed
+    one. The FLP result shows that deterministic consensus cannot guarantee termination in every
+    admissible asynchronous execution with even one possible crash. Practical systems recover
+    progress by using timeouts, randomized choices, leaders, and eventual timing assumptions, while
+    protecting safety even when those progress assumptions are temporarily false.
+  </p>
+</div>
+
+<h3 id="state-machine-reasoning">Reason with states and transitions</h3>
+<figure class="code">
+  <figcaption><b>Reservation state machine</b></figcaption>
+  <pre><code>AVAILABLE
+  -- reserve(request_id, deadline) --&gt; HELD
+
+HELD
+  -- confirm(same request_id) ------&gt; SOLD
+  -- release(same request_id) ------&gt; AVAILABLE
+  -- expiry confirmed by authority -&gt; AVAILABLE
+
+SOLD
+  -- ordinary retry ---------------&gt; SOLD</code></pre>
+</figure>
+
+<p>
+  Attach invariants to transitions. Only one authority may move an item from AVAILABLE to HELD for a
+  given epoch. Replaying the same request ID returns the recorded transition. A stale holder from an
+  older epoch cannot confirm after ownership changes. This exposes coordination requirements more
+  clearly than saying the storage should be strongly consistent.
+</p>
+
+<h2 id="physical-time">
+  <span class="num">03.</span> Physical time: wall clocks, monotonic clocks, skew, and drift
+</h2>
+<p class="lead">A clock reading is a measurement with error, not a universal ordering oracle.</p>
+
+<dl>
+  <dt>Wall clock</dt>
+  <dd>
+    Represents civil or UTC-related time for timestamps, schedules, certificates, and audit records.
+    Synchronization may move it forward or backward, and leap-second handling differs by platform.
+  </dd>
+  <dt>Monotonic clock</dt>
+  <dd>
+    Advances in one direction for measuring elapsed time within one process or machine. Its origin
+    is arbitrary, so readings from different machines are not directly comparable.
+  </dd>
+  <dt>Skew</dt>
+  <dd>The difference between two clocks' readings at the same real instant.</dd>
+  <dt>Drift</dt>
+  <dd>The rate at which a clock gains or loses time relative to a reference.</dd>
+  <dt>Resolution</dt>
+  <dd>The smallest observable tick, which is not the same as accuracy.</dd>
+  <dt>Uncertainty</dt>
+  <dd>A bound or estimate around a reading within which the real time is believed to lie.</dd>
+</dl>
+
+<p>
+  Network Time Protocol estimates offset using timestamp exchanges and disciplines local clocks, but
+  asymmetric delays and faulty sources limit certainty. Synchronization reduces error; it does not
+  make timestamps identical. Monitor offset, source health, stratum, reachability, and sudden steps.
+  Set operational thresholds according to the feature: log correlation tolerates more error than a
+  short security-token lifetime or a lease protocol.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Use</th>
+        <th>Avoid</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Measure request duration</td>
+        <td>Monotonic elapsed-time source</td>
+        <td>Subtracting wall-clock timestamps</td>
+      </tr>
+      <tr>
+        <td>Store a user-visible creation time</td>
+        <td>UTC instant plus formatting time zone</td>
+        <td>Local time without offset or zone</td>
+      </tr>
+      <tr>
+        <td>Order causally related events</td>
+        <td>Protocol sequence, logical clock, or dependency metadata</td>
+        <td>Sorting solely by machine wall clocks</td>
+      </tr>
+      <tr>
+        <td>Expire a local timeout</td>
+        <td>Monotonic deadline</td>
+        <td>Assuming a wall clock never steps backward</td>
+      </tr>
+      <tr>
+        <td>Coordinate a cross-node lease</td>
+        <td>Explicit clock bound plus fencing, or a consensus-backed authority</td>
+        <td>Trusting synchronized clocks without a failure plan</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<figure class="code">
+  <figcaption><b>Java: use elapsed time for a local deadline</b></figcaption>
+  <pre><code>long started = System.nanoTime();
+long timeout = Duration.ofMillis(250).toNanos();
+
+Result result = operation();
+
+if (System.nanoTime() - started &gt;= timeout) {
+    return Result.timedOut();
+}
+return result;</code></pre>
+</figure>
+
+<p>
+  Java documents that <code>nanoTime()</code> is for elapsed time and has an arbitrary origin. Use a
+  subtractive comparison to handle numeric wraparound. Inject <code>java.time.Clock</code> for
+  business time so expiry and scheduling tests are deterministic, but do not mistake a testable
+  abstraction for a distributed ordering guarantee.
+</p>
+
+<h2 id="timeouts"><span class="num">04.</span> Timeouts are local decisions, not failure proofs</h2>
+<p class="lead">A timeout means an observer stopped waiting after its own deadline.</p>
+
+<figure class="code">
+  <figcaption><b>Ambiguous request timeline</b></figcaption>
+  <pre><code>Client                    Service                   Store
+  | POST payment K           |                        |
+  |-------------------------&gt;| write K                |
+  |                          |-----------------------&gt;|
+  |                          |          committed     |
+  |                          |&lt;-----------------------|
+  |  X response delayed     |                        |
+  | timeout                  |                        |
+  |                          |                        |
+
+Client knows: no response arrived before its deadline.
+Client does not know: whether the payment committed.</code></pre>
+</figure>
+
+<p>
+  A failure detector converts observations such as missed heartbeats into suspicion. Aggressive
+  thresholds detect failures quickly but falsely suspect healthy slow nodes. Conservative thresholds
+  reduce false positives but delay failover. Measure heartbeat delay distributions and include
+  processing pauses, not only network round trips. Use epochs or fencing whenever a falsely
+  suspected old owner could still mutate state.
+</p>
+
+<h2 id="causality"><span class="num">05.</span> Causality and the happens-before relation</h2>
+<p class="lead">
+  Causality asks whether one event could have influenced another, not which wall-clock timestamp is
+  smaller.
+</p>
+
+<p>
+  Lamport's happens-before relation, written here as <code>a -&gt; b</code>, follows three rules:
+</p>
+<ol>
+  <li>
+    If events <code>a</code> and <code>b</code> occur in one process and <code>a</code> is first,
+    then <code>a -&gt; b</code>.
+  </li>
+  <li>
+    If <code>a</code> sends a message and <code>b</code> receives that message, then
+    <code>a -&gt; b</code>.
+  </li>
+  <li>If <code>a -&gt; b</code> and <code>b -&gt; c</code>, then <code>a -&gt; c</code>.</li>
+</ol>
+
+<p>
+  If neither <code>a -&gt; b</code> nor <code>b -&gt; a</code>, the events are concurrent in this
+  model. They need not occur at the same physical instant. It means no causal path in the observed
+  computation orders them. A deterministic tie-breaker may place concurrent events in a total
+  display order, but it must not invent a causal dependency.
+</p>
+
+<figure class="code">
+  <figcaption><b>Causal and concurrent events</b></figcaption>
+  <pre><code>Process A:  a1 edit order ----send-----&gt; a2
+                                  
+Process B:  b1 independent note      receive a1 -&gt; b2 approve order
+
+a1 -&gt; b2 because a message carries the influence.
+a1 and b1 are concurrent unless another path connects them.</code></pre>
+</figure>
+
+<p>
+  Preserve causality explicitly through request IDs, trace context, parent event IDs, message
+  offsets, and version metadata. Timestamps are useful evidence, but a clock correction can make a
+  child log line appear earlier than its parent. For incident reconstruction, retain both wall time
+  and protocol order.
+</p>
+
+<h2 id="lamport-clocks"><span class="num">06.</span> Lamport logical clocks</h2>
+<p class="lead">A Lamport clock assigns numbers so causal order implies numeric order.</p>
+
+<figure class="code">
+  <figcaption><b>Lamport clock algorithm</b></figcaption>
+  <pre><code>state counter := 0
+
+before every local event:
+  counter := counter + 1
+
+when sending message m:
+  counter := counter + 1
+  m.logical_time := counter
+
+when receiving message m:
+  counter := max(counter, m.logical_time) + 1
+
+ordering key when a total order is required:
+  (logical_time, stable_process_id)</code></pre>
+</figure>
+
+<p>
+  If <code>a -&gt; b</code>, then <code>L(a) &lt; L(b)</code>. The converse is false: a smaller
+  Lamport number does not prove causality. Lamport clocks are compact and useful for ordering
+  replicated log proposals, audit events, or deterministic conflict application. They cannot by
+  themselves detect that two versions are concurrent.
+</p>
+
+<div class="note">
+  <strong>Total order is not automatically correctness</strong>
+  <p>
+    Adding a process ID creates a deterministic total order for concurrent events. That may make
+    every replica apply updates identically, but business rules still decide whether silently
+    choosing one update is acceptable. A shopping cart can often merge additions; an account balance
+    cannot safely use an arbitrary last writer.
+  </p>
+</div>
+
+<h2 id="vector-clocks"><span class="num">07.</span> Vector clocks and version vectors</h2>
+<p class="lead">
+  A vector records each participant's known progress so causal ancestry and concurrency can be
+  distinguished.
+</p>
+
+<p>
+  For a fixed set of participants, maintain one counter per participant. A participant increments
+  its own entry before an event, messages carry the vector, and receivers take the component-wise
+  maximum before incrementing locally. Compare vectors <code>V</code> and <code>W</code>:
+</p>
+
+<ul>
+  <li>
+    <code>V &lt; W</code> when every component of V is at most W and at least one is smaller. V is
+    an ancestor.
+  </li>
+  <li><code>V = W</code> when every component matches.</li>
+  <li>
+    They are concurrent when one has a larger component in one position and a smaller component in
+    another.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Python: focused vector comparison</b></figcaption>
+  <pre><code>def compare(left: dict[str, int], right: dict[str, int]) -&gt; str:
+    actors = left.keys() | right.keys()
+    left_le = all(left.get(a, 0) &lt;= right.get(a, 0) for a in actors)
+    right_le = all(right.get(a, 0) &lt;= left.get(a, 0) for a in actors)
+
+    if left_le and right_le:
+        return "equal"
+    if left_le:
+        return "ancestor"
+    if right_le:
+        return "descendant"
+    return "concurrent"</code></pre>
+</figure>
+
+<p>
+  A version vector is commonly associated with versions of a replicated object rather than every
+  individual process event. The vocabulary varies across systems, so inspect the exact API. Metadata
+  grows with actors. Practical systems use replica IDs instead of client IDs, dotted version
+  vectors, bounded histories, or server-issued causal tokens. Truncating metadata can lose the
+  ability to distinguish ancestry from concurrency and must be treated as a correctness trade-off.
+</p>
+
+<h3 id="conflict-resolution">Detect first, resolve second</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Data</th>
+        <th>Safer resolution</th>
+        <th>Dangerous shortcut</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Shopping-cart item additions</td>
+        <td>Union item identities, then apply explicit removals</td>
+        <td>Overwrite the whole cart by wall-clock timestamp</td>
+      </tr>
+      <tr>
+        <td>User profile display name</td>
+        <td>Ask user or use a documented deterministic winner</td>
+        <td>Assume the later machine clock represents user intent</td>
+      </tr>
+      <tr>
+        <td>Account balance</td>
+        <td>Serialize ledger entries or use an invariant-preserving operation</td>
+        <td>Merge two independently calculated balances</td>
+      </tr>
+      <tr>
+        <td>Document edits</td>
+        <td>Operation-aware merge, CRDT, or user-visible conflict</td>
+        <td>Discard one branch without audit</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="consistency-contract">
+  <span class="num">08.</span> A consistency model is an observable contract
+</h2>
+<p class="lead">
+  Consistency does not mean one universal property. Name the scope, operations, and ordering rule.
+</p>
+
+<p>
+  First identify the object and boundary: one key, one partition, one session, a transaction, or the
+  whole database. Then identify the history being constrained: reads and writes, all operations on
+  an abstract object, or committed transactions. Finally state whether the order must respect
+  program order, causality, or non-overlapping real-time order.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Guarantee</th>
+        <th>What clients can rely on</th>
+        <th>What it does not promise</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Eventual consistency</td>
+        <td>When updates stop and communication continues, replicas eventually converge</td>
+        <td>Fresh reads, bounded convergence time, or meaningful conflict resolution</td>
+      </tr>
+      <tr>
+        <td>Read-your-writes</td>
+        <td>A session sees its previously completed writes</td>
+        <td>Another user immediately sees those writes</td>
+      </tr>
+      <tr>
+        <td>Monotonic reads</td>
+        <td>A session does not move backward to an older observed version</td>
+        <td>The first observation is current</td>
+      </tr>
+      <tr>
+        <td>Monotonic writes</td>
+        <td>A session's writes are applied in its issued order</td>
+        <td>Ordering relative to other sessions</td>
+      </tr>
+      <tr>
+        <td>Consistent prefix</td>
+        <td>Reads see a prefix of an accepted global or causal order without gaps</td>
+        <td>The prefix includes the latest update</td>
+      </tr>
+      <tr>
+        <td>Causal consistency</td>
+        <td>All observers respect causal dependencies; concurrent updates may differ in order</td>
+        <td>One immediate global order for concurrent operations</td>
+      </tr>
+      <tr>
+        <td>Sequential consistency</td>
+        <td>Operations appear in one total order that preserves each process's program order</td>
+        <td>That order respects real-time order between different processes</td>
+      </tr>
+      <tr>
+        <td>Linearizability</td>
+        <td>Each operation appears atomic between invocation and response, respecting real time</td>
+        <td>
+          Multi-object transaction serializability unless the object is the transaction boundary
+        </td>
+      </tr>
+      <tr>
+        <td>Serializability</td>
+        <td>Committed transactions are equivalent to some serial execution</td>
+        <td>The serial order follows wall-clock order</td>
+      </tr>
+      <tr>
+        <td>Strict serializability</td>
+        <td>Serializable transactions also respect non-overlapping real-time order</td>
+        <td>Automatic correctness for external side effects outside the transaction</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The word strong is too vague in a design contract. Replace it with linearizable per-key reads,
+  strict-serializable transactions, bounded-staleness reads within five seconds, or causal session
+  reads. A precise weaker guarantee is safer than an undefined stronger-sounding claim.
+</p>
+
+<h2 id="histories"><span class="num">09.</span> Evaluate histories, not marketing labels</h2>
+<p class="lead">
+  A history satisfies a model only if a legal explanation exists under that model's rules.
+</p>
+
+<h3 id="linearizable-history">Linearizable register example</h3>
+<figure class="code">
+  <figcaption><b>History A</b></figcaption>
+  <pre><code>real time ---&gt;
+
+Client A: write(x=1) [invoke------response]
+Client B:                              read(x) [invoke--returns 0]</code></pre>
+</figure>
+
+<p>
+  This is not linearizable because the write completed before the read began, so the write must
+  appear first in any real-time-respecting order. It might satisfy eventual consistency if the
+  replica has not converged yet. If the read overlapped the write, returning 0 or 1 could both be
+  linearizable because the atomic point could be placed before or after the write's atomic point.
+</p>
+
+<h3 id="sequential-history">Sequential but not linearizable</h3>
+<figure class="code">
+  <figcaption><b>History B</b></figcaption>
+  <pre><code>Client A: write(x=1) [done]
+Client B:                    read(x) -&gt; 0
+
+Possible sequential explanation: read 0, then write 1.
+Problem: that explanation reverses the observed non-overlapping real-time order.</code></pre>
+</figure>
+
+<p>
+  Sequential consistency may permit this explanation if it preserves each client's own program
+  order. Linearizability does not. This difference matters after a user receives a successful write
+  and tells another user to read it.
+</p>
+
+<h3 id="serializable-history">Serializable but stale in real time</h3>
+<p>
+  Transactions T1 and T2 can be serializable in the order T2 then T1 even if T1 completed before T2
+  began, unless the database also promises strict serializability or external consistency.
+  Serializable answers whether transactions can be placed in a legal serial order. Linearizability
+  concerns operations on an object and respects real-time precedence. They are related but not
+  interchangeable.
+</p>
+
+<h2 id="session-guarantees"><span class="num">10.</span> Session guarantees and causal tokens</h2>
+<p class="lead">
+  Session guarantees provide user-friendly behavior without forcing every replica read to be
+  globally current.
+</p>
+
+<p>
+  A client can carry the highest version or causal dependency it has observed. A replica serves the
+  request only after reaching that version, forwards to a sufficiently current replica, or reports
+  that the requested guarantee cannot meet the deadline. Sticky routing is a simpler technique, but
+  it fails over poorly and does not preserve the guarantee if the chosen replica loses state.
+</p>
+
+<figure class="code">
+  <figcaption><b>TypeScript: propagate a minimum visible version</b></figcaption>
+  <pre><code>type SessionContext = { minimumVersion: string | null };
+
+async function readOrder(id: string, session: SessionContext) {
+  const response = await fetch(`/orders/${id}`, {
+    headers: session.minimumVersion
+      ? { "If-Version-At-Least": session.minimumVersion }
+      : {},
+  });
+
+  const observed = response.headers.get("Observed-Version");
+  if (observed) session.minimumVersion = maxVersion(session.minimumVersion, observed);
+  return response.json();
+}</code></pre>
+</figure>
+
+<p>
+  Treat version tokens as untrusted input. Authenticate or validate their format, cap their size,
+  and stop a client from demanding an impossible future version that pins resources. Tokens can
+  reveal update rates, topology, or tenant activity, so expose opaque signed values when that
+  metadata is sensitive.
+</p>
+
+<h2 id="cap"><span class="num">11.</span> CAP without slogans</h2>
+<p class="lead">
+  CAP describes a forced choice during a network partition under specific definitions, not a menu
+  for choosing any two letters.
+</p>
+
+<p>
+  In the Gilbert and Lynch formulation, consistency is atomic or linearizable behavior, availability
+  means every request to a non-failing node eventually receives a response, and partition tolerance
+  means the system must continue despite lost messages between groups. During a partition, two sides
+  cannot both accept every conflicting operation and still act like one linearizable object. A
+  design must sometimes refuse, delay, or redirect operations, or allow histories that are not
+  linearizable.
+</p>
+
+<figure class="code">
+  <figcaption><b>Why the partition forces a decision</b></figcaption>
+  <pre><code>Initial x = 0
+
+        partition
+Node A  X-----------X  Node B
+write x=1              read x=?
+
+If A confirms the write and B must answer without communication:
+- B returns 0: response is available, but the object is not linearizable.
+- B waits/refuses: linearizable behavior may be preserved, but this request is unavailable.
+- B guesses 1: another possible write value makes guessing unsafe.</code></pre>
+</figure>
+
+<p>
+  Partition tolerance is not normally optional because a real network can partition. The useful
+  design question is per operation and per failure: which side retains authority, which reads may be
+  stale, which writes can be merged, what error is returned, and how recovery reconciles state. A
+  system can choose differently for catalog reads, inventory decrements, and analytics events.
+</p>
+
+<div class="warn">
+  <strong>Availability has several meanings</strong>
+  <p>
+    CAP availability is not a monthly uptime percentage and has no practical response-time bound in
+    its pure definition. An SLO such as 99.95 percent successful responses within 300 ms is a
+    separate operational measure. State both instead of using one word for two contracts.
+  </p>
+</div>
+
+<h2 id="pacelc"><span class="num">12.</span> PACELC and the normal-operation trade-off</h2>
+<p class="lead">Partitions are not the only time replicas trade latency for coordination.</p>
+
+<p>
+  PACELC asks: if there is a Partition, how does the system trade Availability against Consistency;
+  Else, during normal operation, how does it trade Latency against Consistency? A synchronous
+  cross-region write can provide a stronger visibility guarantee but must wait for distant
+  communication. A local asynchronous write is faster but another region can lag or lose the newest
+  acknowledged update during failover.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Benefit</th>
+        <th>Cost or risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Leader plus synchronous quorum write</td>
+        <td>One ordered committed value survives stated failures</td>
+        <td>Quorum latency and unavailability without enough replicas</td>
+      </tr>
+      <tr>
+        <td>Local write plus asynchronous replication</td>
+        <td>Low local latency and continued regional acceptance</td>
+        <td>Lag, conflicts, and possible loss on failover</td>
+      </tr>
+      <tr>
+        <td>Stale local read</td>
+        <td>Low latency and reduced leader load</td>
+        <td>May violate read-your-writes or business freshness</td>
+      </tr>
+      <tr>
+        <td>Linearizable read through authority</td>
+        <td>Current result under the model</td>
+        <td>Coordination latency and dependence on authority availability</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="database-isolation">
+  <span class="num">13.</span> Database isolation is not distributed consistency
+</h2>
+<p class="lead">
+  Isolation constrains concurrent transactions; distributed consistency constrains observations
+  across copies and clients.
+</p>
+
+<p>
+  A database may provide serializable transactions on its primary while an asynchronous read replica
+  returns an older committed state. Both claims can be true. A transaction can be serializable yet a
+  message published outside it can be lost in a dual write. A linearizable single-row
+  compare-and-set does not make a multi-row workflow serializable. Define each boundary
+  independently.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Relevant property</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Can concurrent transactions produce a state impossible in any serial order?</td>
+        <td>Serializability</td>
+      </tr>
+      <tr>
+        <td>Does a read after a completed write observe that write?</td>
+        <td>Linearizability or a session guarantee, depending on scope</td>
+      </tr>
+      <tr>
+        <td>Do replicas converge if updates stop?</td>
+        <td>Eventual consistency plus a defined conflict rule</td>
+      </tr>
+      <tr>
+        <td>Does a committed row change imply an event was durably published?</td>
+        <td>Atomic messaging pattern such as an outbox, not isolation alone</td>
+      </tr>
+      <tr>
+        <td>Does transaction order respect real time?</td>
+        <td>Strict serializability or external consistency</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  PostgreSQL documents Serializable as behavior equivalent to some serial execution and warns that
+  applications must retry serialization failures. That protects database invariants represented in
+  the transaction. It does not automatically include an HTTP call, a file write, or another service.
+</p>
+
+<h2 id="case-study">
+  <span class="num">14.</span> Case study: a multi-region order status service
+</h2>
+<p class="lead">
+  Choose different guarantees for commands, customer reads, support tools, and analytics instead of
+  forcing one model everywhere.
+</p>
+
+<h3 id="case-assumptions">Assumptions and requirements</h3>
+<ul>
+  <li>8,000 order reads per second at peak and 800 state transitions per second.</li>
+  <li>Three regions; customers read locally, while one authority owns each order at a time.</li>
+  <li>Payment-confirmed must never move backward to payment-pending.</li>
+  <li>A customer must see their successful update on the next page load.</li>
+  <li>Other regions may show status up to five seconds old during normal operation.</li>
+  <li>Analytics may be delayed and duplicated but must converge after replay.</li>
+</ul>
+
+<h3 id="case-design">First-pass design</h3>
+<figure class="code">
+  <figcaption><b>Data and causal flow</b></figcaption>
+  <pre><code>Customer command
+  -&gt; regional API
+  -&gt; order authority for partition
+  -&gt; conditional state transition + durable version
+  -&gt; response {orderVersion, status}
+  -&gt; ordered change stream
+  -&gt; regional read projections
+  -&gt; analytics consumers
+
+Next customer read carries minimum orderVersion.
+Local projection serves it if caught up, otherwise forwards to authority or waits within budget.</code></pre>
+</figure>
+
+<p>
+  Commands use a per-order monotonic version and a state-machine precondition. The authority rejects
+  illegal transitions and makes a repeated command ID idempotent. The response returns the committed
+  version. Regional projections provide fast reads; a causal token gives the writer
+  read-your-writes. Other readers accept bounded staleness. Analytics consumes at-least-once changes
+  with an idempotent event ID. This design spends coordination on irreversible transitions while
+  keeping most reads local.
+</p>
+
+<h3 id="case-partition">Behavior during a regional partition</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Partition behavior</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Existing order read without token</td>
+        <td>Serve labeled stale projection within policy</td>
+        <td>Useful and reversible; freshness is explicitly bounded in normal operation</td>
+      </tr>
+      <tr>
+        <td>Read with unmet minimum version</td>
+        <td>Return a retryable freshness error after deadline</td>
+        <td>Do not silently violate read-your-writes</td>
+      </tr>
+      <tr>
+        <td>Payment-confirmed transition</td>
+        <td>Route to authority or refuse when authority is unavailable</td>
+        <td>Conflicting confirmations are not safely mergeable</td>
+      </tr>
+      <tr>
+        <td>Analytics increment</td>
+        <td>Buffer durably and replay with event ID</td>
+        <td>Delay and duplicates are acceptable; loss is not</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="case-capacity">Capacity and latency reasoning</h3>
+<p>
+  With 8,000 reads per second and 90 percent served locally in 8 ms, about 800 reads per second
+  reach an authority or lag-recovery path. If a partition removes local freshness, authority load
+  can rise tenfold, so failover capacity must be sized for degraded mode or protected with admission
+  control. At 800 transitions per second and 1 KB per change envelope, the raw change stream is
+  about 800 KB/s before replication and protocol overhead. Retention, indexes, replicas, and replay
+  headroom dominate the storage estimate more than the payload alone.
+</p>
+
+<h2 id="operations"><span class="num">15.</span> Production operations and observability</h2>
+<p class="lead">Observe uncertainty and contract violations, not only CPU and error counts.</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>Why it matters</th>
+        <th>Useful action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Replication lag by time and version</td>
+        <td>Shows freshness risk and replay distance</td>
+        <td>Route freshness-sensitive reads or shed optional work</td>
+      </tr>
+      <tr>
+        <td>Clock offset and synchronization source health</td>
+        <td>Protects expiry, certificates, logs, and any bounded-clock assumption</td>
+        <td>Quarantine unsafe nodes and investigate time service</td>
+      </tr>
+      <tr>
+        <td>Causal wait or forward rate</td>
+        <td>Shows cost of read-your-writes guarantees</td>
+        <td>Repair lagging replicas or tune placement</td>
+      </tr>
+      <tr>
+        <td>Conflict count by object and resolver</td>
+        <td>Reveals unexpected concurrency and data loss risk</td>
+        <td>Review ownership, merge semantics, and client retries</td>
+      </tr>
+      <tr>
+        <td>Timeouts with eventual outcome</td>
+        <td>Separates true rejection from ambiguous success</td>
+        <td>Improve idempotency, reconciliation, and deadline budgets</td>
+      </tr>
+      <tr>
+        <td>Version regression detections</td>
+        <td>Direct evidence of monotonic-read violations</td>
+        <td>Stop unsafe routing and preserve the history for analysis</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Include node ID, process epoch, monotonic duration, wall timestamp, trace ID, request ID, object
+  version, source replica, and consistency mode in structured telemetry where safe. Redact payloads
+  and tenant-sensitive causal metadata. Dashboards should separate steady state from partition and
+  failover behavior. An alert should name the violated user promise, not merely report replica lag.
+</p>
+
+<h2 id="security"><span class="num">16.</span> Security, privacy, and trust boundaries</h2>
+<ul>
+  <li>
+    Authenticate peers and authorize operations at the state owner. Transport encryption prevents
+    observation and tampering in transit, but does not make a compromised peer correct.
+  </li>
+  <li>
+    Treat replay as normal network behavior and as an attack technique. Bind idempotency keys to
+    tenant, operation, payload digest, and expiry; reject reuse with different parameters.
+  </li>
+  <li>
+    Sign or keep opaque client-carried version tokens. Validate length and provenance to prevent
+    forged dependencies, resource pinning, metadata leakage, and cross-tenant access.
+  </li>
+  <li>
+    Use fencing or epochs when ownership changes. Authentication of an old owner does not prove it
+    is still authorized to mutate state.
+  </li>
+  <li>
+    Protect time synchronization. Clock manipulation can affect certificate checks, token expiry,
+    audit order, rate windows, and leases. Prefer several independent trusted sources and alert on
+    steps.
+  </li>
+  <li>
+    Causal graphs and precise timestamps may expose business relationships and user behavior. Apply
+    data minimization, retention limits, access control, and deletion rules to operational metadata.
+  </li>
+</ul>
+
+<h2 id="performance"><span class="num">17.</span> Performance, scalability, and cost trade-offs</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Technique</th>
+        <th>Performance effect</th>
+        <th>Correctness or cost effect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Local stale reads</td>
+        <td>Low latency, high read throughput</td>
+        <td>Needs an explicit staleness contract and repair path</td>
+      </tr>
+      <tr>
+        <td>Cross-region quorum</td>
+        <td>Tail latency includes slow quorum members</td>
+        <td>Stronger committed-state survival with higher network cost</td>
+      </tr>
+      <tr>
+        <td>Per-client causal context</td>
+        <td>Usually avoids global coordination</td>
+        <td>Metadata, routing, and waiting grow with dependency scope</td>
+      </tr>
+      <tr>
+        <td>Global total order</td>
+        <td>Can limit throughput and create a hot authority</td>
+        <td>Simplifies reasoning only when the workload truly needs one order</td>
+      </tr>
+      <tr>
+        <td>Partitioned ordering</td>
+        <td>Scales independently by key</td>
+        <td>Cross-partition invariants require extra coordination</td>
+      </tr>
+      <tr>
+        <td>Large vector metadata</td>
+        <td>Adds payload, comparison, and storage work</td>
+        <td>Preserves richer concurrency information</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Estimate coordination, not only request count. Measure round trips per operation, geographic RTT,
+  serialized bytes, causal-context size, conflict-repair work, replica fan-out, and the load shift
+  during failover. Tail latency often follows the slowest required dependency. Quorum and
+  consistency choices therefore belong in capacity tables and cost reviews.
+</p>
+
+<h2 id="failures"><span class="num">18.</span> Failure scenarios and safer corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario or mistake</th>
+        <th>Failure</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Sort all events by wall timestamp</td>
+        <td>Clock skew reverses causality and last-write-wins loses updates</td>
+        <td>Use protocol order or logical metadata; keep wall time for human context</td>
+      </tr>
+      <tr>
+        <td>Timeout means operation failed</td>
+        <td>Retry duplicates an already committed side effect</td>
+        <td>Use idempotency and queryable outcome reconciliation</td>
+      </tr>
+      <tr>
+        <td>Eventual consistency means a few seconds</td>
+        <td>No bound exists and backlog causes hours of stale reads</td>
+        <td>Specify and monitor a bounded-staleness SLO separately</td>
+      </tr>
+      <tr>
+        <td>Sticky session guarantees read-your-writes</td>
+        <td>Failover sends the client to an older replica</td>
+        <td>Carry a minimum version and verify the serving replica</td>
+      </tr>
+      <tr>
+        <td>Serializable means replicas are fresh</td>
+        <td>Read replica returns an old serializable commit</td>
+        <td>Define read routing and visibility guarantees explicitly</td>
+      </tr>
+      <tr>
+        <td>Choose AP for every operation</td>
+        <td>Non-mergeable inventory or money conflicts corrupt invariants</td>
+        <td>Classify operations; coordinate irreversible invariant changes</td>
+      </tr>
+      <tr>
+        <td>Assume replicas fail independently</td>
+        <td>One deploy or control-plane error removes all copies</td>
+        <td>Map and test correlated failure domains</td>
+      </tr>
+      <tr>
+        <td>Unbounded causal token</td>
+        <td>Metadata and wait amplification enable resource abuse</td>
+        <td>Use opaque bounded tokens, quotas, and expiry</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="testing"><span class="num">19.</span> Testing consistency and recovery</h2>
+<p class="lead">
+  Example-based unit tests validate algorithms; generated histories and faults validate distributed
+  claims.
+</p>
+
+<ul>
+  <li>
+    <strong>Unit tests:</strong> verify logical-clock merge, vector comparison, state-machine
+    transitions, token validation, idempotency, and deterministic conflict resolution.
+  </li>
+  <li>
+    <strong>Model-based tests:</strong> generate operation sequences and compare the implementation
+    against a small reference state machine.
+  </li>
+  <li>
+    <strong>History checking:</strong> record invocation and response intervals, then search for a
+    legal linearizable, sequential, causal, or serial explanation as appropriate.
+  </li>
+  <li>
+    <strong>Integration tests:</strong> exercise real databases, brokers, replica reads, failover,
+    causal token forwarding, and restart recovery.
+  </li>
+  <li>
+    <strong>Fault tests:</strong> delay, drop, duplicate, and reorder messages; pause processes;
+    skew clocks; fill queues; exhaust pools; partition one direction; and restart with old local
+    state.
+  </li>
+  <li>
+    <strong>Load tests:</strong> measure conflict rate, causal waiting, quorum latency, lag, and
+    convergence under steady, burst, hot-key, and degraded-capacity workloads.
+  </li>
+  <li>
+    <strong>Recovery tests:</strong> verify replicas converge, tombstones do not resurrect deleted
+    data, epochs reject stale owners, and reconciliation explains every ambiguous command.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Fault-test pseudocode</b></figcaption>
+  <pre><code>start three replicas and a history recorder
+generate concurrent reads and conditional writes
+after random intervals:
+  partition replica A from B and C
+  delay only A -&gt; B messages
+  pause one process
+  move one wall clock backward
+heal all faults
+wait for the documented convergence bound
+
+assert state-machine invariants
+check completed history against promised model
+assert all acknowledged writes are present or explicitly superseded
+assert every client session preserved its requested guarantee</code></pre>
+</figure>
+
+<h2 id="production-checklist"><span class="num">20.</span> Production design checklist</h2>
+<ul>
+  <li>Write the process, network, clock, storage, and failure assumptions.</li>
+  <li>Name the consistency guarantee per operation and data scope.</li>
+  <li>Define behavior for timeout, partition, lag, failover, and recovery.</li>
+  <li>Classify every result as committed, rejected, or ambiguous.</li>
+  <li>Use monotonic time for local durations and wall time for civil timestamps.</li>
+  <li>Preserve causal evidence through versions, sequence numbers, IDs, or tokens.</li>
+  <li>Make conflict resolution match business semantics and remain auditable.</li>
+  <li>Map replicas to independent failure and trust domains.</li>
+  <li>Size and load-test the degraded path, not only the warm steady state.</li>
+  <li>Monitor contract violations, lag, offset, conflicts, and reconciliation outcomes.</li>
+  <li>Protect metadata and synchronization paths as security boundaries.</li>
+  <li>Run recovery and history-checking tests before claiming a guarantee.</li>
+</ul>
+
+<h2 id="exercises"><span class="num">21.</span> Hands-on exercises and design scenarios</h2>
+
+<h3 id="exercise-one">Exercise 1: classify histories</h3>
+<p>
+  Generate ten two-client register histories with overlapping and non-overlapping reads and writes.
+  For each, decide whether it is linearizable, sequentially consistent, only eventually consistent,
+  or invalid even under the application's convergence rule.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> draw operation intervals, enforce real-time order only for
+  non-overlapping operations, preserve each client's program order, and try to construct a legal
+  sequential register execution. Do not use completion timestamps as atomic points.
+</p>
+
+<h3 id="exercise-two">Exercise 2: implement logical metadata</h3>
+<p>
+  Implement Lamport clocks and vector comparison in one approved language. Simulate three replicas,
+  deliver messages in different orders, and display which updates are ancestors or concurrent.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> Lamport values provide a deterministic order but cannot prove
+  concurrency. Vectors detect concurrency but grow with participants. Explain which metadata your
+  production workload can afford.
+</p>
+
+<h3 id="exercise-three">Exercise 3: multi-region inventory</h3>
+<p>
+  Design inventory for 100,000 products, 15,000 reads per second, 1,000 reservations per second, and
+  three regions. Product descriptions may be stale for a minute; the last sellable unit must not be
+  promised twice. State behavior during a region partition.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> separate catalog reads from inventory transitions. Cache and
+  replicate catalog data asynchronously. Give each inventory partition one current authority or
+  pre-allocate bounded regional stock. Use conditional versioned transitions, idempotent reservation
+  IDs, expiries with fencing, and reconciliation. Refuse unsafe reservations when authority or quota
+  cannot be proved.
+</p>
+
+<h3 id="exercise-four">Exercise 4: incident reconstruction</h3>
+<p>
+  Inject a two-second clock step on one node while a trace crosses four services. Reconstruct the
+  request using parent spans, message IDs, offsets, and local monotonic durations rather than
+  sorting wall timestamps.
+</p>
+<p>
+  <strong>Expected reasoning:</strong> wall time remains useful for correlating with external
+  events, but protocol edges establish causality. Document uncertainty when two events remain
+  concurrent.
+</p>
+
+<h2 id="interview"><span class="num">22.</span> Interview questions and model answers</h2>
+
+<h3>1. Why is a timeout not proof that a server failed?</h3>
+<p>
+  The observer knows only that no acceptable response arrived before its local deadline. The request
+  may be queued, the server may be paused, the reply may be lost, or the operation may already have
+  committed. A safe design uses idempotency, durable request status, bounded retries, and
+  reconciliation.
+  <strong>Follow-up:</strong> ask how the candidate prevents a stale recovered server from acting as
+  owner.
+</p>
+
+<h3>2. What is the difference between wall and monotonic clocks?</h3>
+<p>
+  Wall clocks represent civil time and may be corrected. Monotonic clocks measure elapsed duration
+  within one clock domain and do not provide comparable global timestamps. Use monotonic time for
+  timeouts and wall time for audit or schedules. <strong>Follow-up:</strong> ask why NTP does not
+  make wall-clock last-write-wins safe.
+</p>
+
+<h3>3. What does happens-before mean?</h3>
+<p>
+  It is a partial causal order formed by local program order, message send-before-receive, and
+  transitivity. If neither event happens before the other, the events are concurrent in the model.
+  <strong>Follow-up:</strong> ask whether a lower Lamport timestamp proves causality. It does not.
+</p>
+
+<h3>4. Compare Lamport and vector clocks.</h3>
+<p>
+  Lamport clocks are compact and guarantee that causality implies increasing values, but the values
+  cannot distinguish concurrency. Vector clocks use per-participant progress to identify ancestry,
+  equality, and concurrency, at a metadata and membership cost. <strong>Follow-up:</strong> ask how
+  actor churn and truncation affect correctness.
+</p>
+
+<h3>5. Explain eventual consistency precisely.</h3>
+<p>
+  If updates stop and communication and processing continue, replicas eventually converge according
+  to a defined resolution rule. It does not promise a fixed delay, fresh reads, preserved user
+  intent, or absence of conflicts. <strong>Follow-up:</strong> ask how to turn eventual convergence
+  into a five-second user-facing freshness SLO.
+</p>
+
+<h3>6. Sequential consistency versus linearizability?</h3>
+<p>
+  Both seek a legal total order. Sequential consistency preserves each process's program order but
+  may reorder non-overlapping operations from different processes. Linearizability also respects
+  real-time precedence and places each operation's effect between invocation and response.
+  <strong>Follow-up:</strong> ask for a history that is sequential but not linearizable.
+</p>
+
+<h3>7. What are session guarantees?</h3>
+<p>
+  They constrain one client's observations, including read-your-writes, monotonic reads, monotonic
+  writes, and writes-follow-reads. A causal or version token can preserve them across replicas
+  without making every read globally current. <strong>Follow-up:</strong> ask what happens during
+  failover when the target replica has not reached the token.
+</p>
+
+<h3>8. Explain CAP without saying choose two.</h3>
+<p>
+  When communication is partitioned, isolated sides cannot both answer every conflicting request and
+  preserve one linearizable object. The design chooses per operation whether to refuse or delay,
+  route to an authority, serve stale data, or accept mergeable updates. Partition tolerance is a
+  condition imposed by the network. <strong>Follow-up:</strong> distinguish CAP availability from an
+  uptime SLO.
+</p>
+
+<h3>9. What does PACELC add?</h3>
+<p>
+  It highlights that even without a partition, replica coordination trades latency against stronger
+  consistency. During a partition the trade-off is availability versus consistency; else it is often
+  latency versus consistency. <strong>Follow-up:</strong> compare a local asynchronous write with a
+  cross-region quorum write.
+</p>
+
+<h3>10. Why is serializable isolation not the same as linearizability?</h3>
+<p>
+  Serializability constrains whole transactions to be equivalent to some serial order. It need not
+  preserve non-overlapping real-time order. Linearizability constrains operations on an object and
+  does preserve real time. Strict serializability combines serial transaction behavior with
+  real-time order. <strong>Follow-up:</strong> ask whether a serializable primary makes an
+  asynchronous replica fresh.
+</p>
+
+<h3>11. How would you choose a consistency model for an order system?</h3>
+<p>
+  Start from invariants and user harm. Coordinate payment and inventory transitions that cannot be
+  safely merged. Provide read-your-writes after commands. Permit bounded-stale catalog and general
+  status reads when acceptable. Let analytics converge through idempotent replay. State the scope
+  and partition behavior for each operation. <strong>Follow-up:</strong> ask how degraded capacity
+  changes the design during regional failure.
+</p>
+
+<h3>12. How do you test a consistency claim?</h3>
+<p>
+  Record invocation and response intervals plus versions, generate concurrent workloads, inject
+  realistic network, process, storage, and clock faults, and check histories against a formal model.
+  Also verify convergence, acknowledged-write durability, session guarantees, and business
+  invariants after recovery. <strong>Follow-up:</strong> ask why a happy-path integration test is
+  insufficient.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">23.</span> Revision cheat sheet</h2>
+<ul>
+  <li>A distributed participant never has instant complete knowledge of the whole system.</li>
+  <li>A timeout proves the deadline passed, not that the operation failed.</li>
+  <li>Safety forbids bad states; liveness requires eventual progress under stated conditions.</li>
+  <li>Partial failure means one component can fail while others continue.</li>
+  <li>Use monotonic time for duration and wall time for civil timestamps.</li>
+  <li>Clock synchronization bounds error; it does not create a perfect global order.</li>
+  <li>Happens-before is a causal partial order based on processes and messages.</li>
+  <li>Lamport clocks preserve causal direction but do not detect concurrency.</li>
+  <li>Vector clocks detect ancestry and concurrency but add metadata and membership cost.</li>
+  <li>Eventual consistency promises convergence after updates stop, not bounded freshness.</li>
+  <li>Session guarantees improve one client's experience without forcing global freshness.</li>
+  <li>Sequential consistency preserves program order; linearizability also preserves real time.</li>
+  <li>Serializable transactions need not be strict serializable or make replicas current.</li>
+  <li>CAP forces an availability-versus-linearizability choice during a partition.</li>
+  <li>PACELC also exposes latency-versus-consistency choices during normal operation.</li>
+  <li>Choose guarantees per operation from invariants, harm, latency, and failure behavior.</li>
+  <li>Test histories, recovery, convergence, ambiguity, and degraded capacity.</li>
+</ul>
+
+<h2 id="references"><span class="num">24.</span> Primary official references</h2>
+<ul>
+  <li>
+    <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf"
+      >Leslie Lamport: Time, Clocks, and the Ordering of Events in a Distributed System</a
+    >
+    - the happens-before relation and Lamport logical clocks.
+  </li>
+  <li>
+    <a href="https://www.cs.princeton.edu/courses/archive/spring22/cos418/papers/cap.pdf"
+      >Gilbert and Lynch: Brewer's Conjecture and the Feasibility of Consistent, Available,
+      Partition-Tolerant Web Services</a
+    >
+    - the formal CAP result and its system-model definitions.
+  </li>
+  <li>
+    <a href="https://doi.org/10.1109/MC.2012.33"
+      >Daniel Abadi: Consistency Tradeoffs in Modern Distributed Database System Design</a
+    >
+    - the PACELC formulation and normal-operation latency trade-off.
+  </li>
+  <li>
+    <a href="https://www.cs.cmu.edu/~wing/publications/HerlihyWing90.pdf"
+      >Herlihy and Wing: Linearizability, a Correctness Condition for Concurrent Objects</a
+    >
+    - the original linearizability definition and history-based reasoning.
+  </li>
+  <li>
+    <a href="https://www.cs.utexas.edu/~dahlin/Classes/GradOS/papers/SessionGuaranteesPDIS.pdf"
+      >Terry, Demers, Petersen, Spreitzer, and Theimer: Session Guarantees for Weakly Consistent
+      Replicated Data</a
+    >
+    - read-your-writes, monotonic reads, monotonic writes, and writes-follow-reads.
+  </li>
+  <li>
+    <a
+      href="https://www.amazon.science/publications/dynamo-amazons-highly-available-key-value-store"
+      >Amazon Science: Dynamo, Amazon's Highly Available Key-Value Store</a
+    >
+    - versioning, vector clocks, conflict reconciliation, and availability trade-offs.
+  </li>
+  <li>
+    <a href="https://datatracker.ietf.org/doc/html/rfc5905"
+      >IETF RFC 5905: Network Time Protocol Version 4</a
+    >
+    - clock offset, delay, synchronization hierarchy, and discipline algorithms.
+  </li>
+  <li>
+    <a href="https://docs.oracle.com/en/java/javase/24/docs/api/java.base/java/lang/System.html"
+      >Oracle Java System API documentation</a
+    >
+    - wall-clock and monotonic elapsed-time semantics in Java.
+  </li>
+  <li>
+    <a href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency"
+      >Google Cloud Spanner: TrueTime and external consistency</a
+    >
+    - clock uncertainty, proper timestamping, external consistency, and MVCC reads.
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/transaction-iso.html"
+      >PostgreSQL: Transaction Isolation</a
+    >
+    - serializable transaction behavior, anomalies, and retry requirements.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
