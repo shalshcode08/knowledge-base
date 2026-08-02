@@ -1,0 +1,2388 @@
+<h1>Resilience, Retries, Backpressure, and Overload Control - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to containing partial failures, budgeting time and retry load,
+  controlling queues and concurrency, surviving overload, recovering dependencies safely, and
+  explaining every trade-off in production and system-design interviews.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The resilience mental model</h2>
+<p class="lead">
+  Resilience is the ability to keep useful, correct work flowing when parts of a system are slow,
+  unavailable, overloaded, or uncertain.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a hospital during a city-wide emergency. Triage does not promise that every arrival is
+    treated immediately. It identifies urgent work, limits admissions to available staff and beds,
+    sends safe cases elsewhere, and stops accepting work that would make care collapse for everyone.
+    A resilient service behaves similarly: it protects scarce capacity, finishes the most valuable
+    work, rejects excess demand early, and provides an honest degraded result when full service is
+    impossible.
+  </p>
+</div>
+
+<p>
+  Resilience is not the absence of failure. Networks delay messages, machines stop, processes pause,
+  callers disconnect, and traffic exceeds forecasts. The design goal is to keep one fault from
+  consuming unrelated resources or turning into a positive feedback loop. A small visible error is
+  often safer than waiting until every request, thread, connection, and dependency fails together.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Precise meaning</th>
+        <th>Important distinction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Reliability</td>
+        <td>The probability that a system performs its required function for a stated period</td>
+        <td>Measured against a workload and correctness definition</td>
+      </tr>
+      <tr>
+        <td>Resilience</td>
+        <td>The ability to absorb, contain, adapt to, and recover from disruption</td>
+        <td>Includes controlled degradation and recovery, not only uptime</td>
+      </tr>
+      <tr>
+        <td>Fault</td>
+        <td>An underlying defect or adverse condition</td>
+        <td>A disk fault may remain latent until it causes an error</td>
+      </tr>
+      <tr>
+        <td>Error</td>
+        <td>An incorrect internal state caused by a fault</td>
+        <td>An error can be detected and contained before users see failure</td>
+      </tr>
+      <tr>
+        <td>Failure</td>
+        <td>Observable behavior that violates the promised service</td>
+        <td>The promise must define latency, correctness, and availability</td>
+      </tr>
+      <tr>
+        <td>Overload</td>
+        <td>Offered work exceeds sustainable capacity for long enough to build pressure</td>
+        <td>Utilization near 100% is a warning, not the only definition</td>
+      </tr>
+      <tr>
+        <td>Backpressure</td>
+        <td>A downstream signal that makes upstream production slow, pause, or stay bounded</td>
+        <td>It requires a propagation path and an upstream response</td>
+      </tr>
+      <tr>
+        <td>Load shedding</td>
+        <td>Rejecting or dropping selected work to preserve useful throughput</td>
+        <td>It is a deliberate capacity decision, not an accidental timeout</td>
+      </tr>
+      <tr>
+        <td>Graceful degradation</td>
+        <td>Returning a cheaper or less complete but still safe result</td>
+        <td>It must preserve stated correctness and security boundaries</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The central invariant</strong>
+  <p>
+    Every layer must bound the time, attempts, queued work, in-flight work, and resource cost it can
+    impose on the next layer. If any one of those can grow without a limit, a partial failure can
+    become a full outage.
+  </p>
+</div>
+
+<h2 id="failure-model"><span class="num">01.</span> Failure classes and uncertainty</h2>
+<p class="lead">
+  A retry or fallback is safe only after the failure has been classified by duration, scope, and
+  whether the operation might already have taken effect.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure class</th>
+        <th>Example</th>
+        <th>Typical response</th>
+        <th>Main danger</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Transient</td>
+        <td>One lost packet, brief leader election, one busy connection</td>
+        <td>One bounded retry may succeed</td>
+        <td>Many clients retry together and prolong the event</td>
+      </tr>
+      <tr>
+        <td>Permanent</td>
+        <td>Invalid input, revoked credential, deleted resource</td>
+        <td>Fail without automatic retry until state changes</td>
+        <td>Pointless retries waste capacity and hide the real defect</td>
+      </tr>
+      <tr>
+        <td>Partial</td>
+        <td>One zone or shard fails while others remain healthy</td>
+        <td>Contain the failure domain and reroute within reserved capacity</td>
+        <td>Failover overloads healthy domains</td>
+      </tr>
+      <tr>
+        <td>Slow</td>
+        <td>Storage latency rises without returning errors</td>
+        <td>Deadlines, cancellation, concurrency limits, degradation</td>
+        <td>In-flight work grows before error rate reveals the problem</td>
+      </tr>
+      <tr>
+        <td>Ambiguous</td>
+        <td>Connection breaks after a payment command was sent</td>
+        <td>Query outcome or retry with stable idempotency identity</td>
+        <td>The first attempt may have committed</td>
+      </tr>
+      <tr>
+        <td>Byzantine or corrupt</td>
+        <td>A dependency returns a syntactically valid but impossible value</td>
+        <td>Validate invariants, quarantine, reconcile, alert</td>
+        <td>Retries may repeat or spread corruption</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="partial-failure">Partial failure changes the answer</h3>
+<p>
+  In one process, a function either returns, fails, or is still running. Across a network, the
+  caller cannot directly know whether the remote process never received the request, is still
+  working, or committed and lost the response. A timeout is a statement about the caller's patience,
+  not proof that the remote operation failed. This uncertainty is why writes need idempotency,
+  reconciliation, or an outcome-query API.
+</p>
+
+<h3 id="failure-scope">Name the failure scope</h3>
+<ul>
+  <li>Request-local: one malformed or unusually expensive request.</li>
+  <li>Instance-local: one process has a leak, pause, deadlock, or bad connection pool.</li>
+  <li>Partition or shard: one key range is hot or unavailable.</li>
+  <li>Zone or region: power, network, or control-plane failure affects a location.</li>
+  <li>Dependency-wide: every caller shares one overloaded database or identity service.</li>
+  <li>Correlated: a rollout, certificate expiry, or shared library fails everywhere together.</li>
+</ul>
+
+<p>
+  Redundancy helps only against faults outside the replicas' shared failure domain. Ten replicas do
+  not protect against one bad configuration pushed to all ten, and they may send ten times the retry
+  traffic to a shared dependency.
+</p>
+
+<h2 id="time-budgets"><span class="num">02.</span> Timeouts, deadlines, and cancellation</h2>
+<p class="lead">
+  A timeout bounds one wait; a deadline bounds the entire operation; cancellation stops work whose
+  result is no longer useful.
+</p>
+
+<h3 id="timeout-types">Timeout types</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Limit</th>
+        <th>What it bounds</th>
+        <th>Common mistake</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DNS timeout</td>
+        <td>Name-resolution wait</td>
+        <td>Assuming a socket timeout covers DNS</td>
+      </tr>
+      <tr>
+        <td>Connect timeout</td>
+        <td>Establishing transport, sometimes excluding TLS</td>
+        <td>Setting it equal to the whole request budget</td>
+      </tr>
+      <tr>
+        <td>TLS handshake timeout</td>
+        <td>Secure-session negotiation</td>
+        <td>Ignoring certificate or entropy delays during cold start</td>
+      </tr>
+      <tr>
+        <td>Response-header timeout</td>
+        <td>Waiting until the server begins a response</td>
+        <td>Leaving streamed bodies unbounded</td>
+      </tr>
+      <tr>
+        <td>Idle or read timeout</td>
+        <td>Maximum silence between bytes or messages</td>
+        <td>Treating it as total operation time</td>
+      </tr>
+      <tr>
+        <td>Attempt timeout</td>
+        <td>One remote attempt</td>
+        <td>Restarting the full timeout on every retry</td>
+      </tr>
+      <tr>
+        <td>End-to-end deadline</td>
+        <td>All queues, attempts, backoff, and processing for user intent</td>
+        <td>Giving every hop the full caller budget</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="deadline-budget">Budget time down the call graph</h3>
+<figure class="code">
+  <figcaption><b>A 900 ms end-to-end order quote budget</b></figcaption>
+  <pre><code>Client deadline: 900 ms
+
+Gateway validation and queue:       80 ms
+Order service local work:            70 ms
+Inventory call, all attempts:       350 ms
+Pricing call, all attempts:         220 ms
+Response serialization and network: 80 ms
+Reserve for variance and cleanup:   100 ms
+                                     ------
+Total:                               900 ms</code></pre>
+</figure>
+
+<p>
+  Pass the remaining deadline, not the original duration, to downstream calls. If 300 ms has already
+  elapsed, the remaining work has 600 ms. Reject before starting an expensive subtask when the
+  remaining time cannot cover its minimum useful execution. Use a monotonic clock for elapsed-time
+  calculations so wall-clock corrections do not create negative or extended timeouts.
+</p>
+
+<figure class="code">
+  <figcaption><b>Deadline-aware pseudocode</b></figcaption>
+  <pre><code>HANDLE(request, absolute_deadline):
+  remaining = absolute_deadline - monotonic_now()
+
+  if remaining &lt; minimum_useful_budget:
+    return DEADLINE_EXCEEDED
+
+  child_deadline = min(absolute_deadline, monotonic_now() + inventory_budget)
+  result = inventory.reserve(request, child_deadline)
+
+  if caller_cancelled():
+    cancel(result.in_flight_work)
+    return CANCELLED
+
+  return result</code></pre>
+</figure>
+
+<h3 id="select-timeouts">Selecting a timeout</h3>
+<ol>
+  <li>Start from the user or business deadline, not a library default.</li>
+  <li>Measure the dependency's latency distribution under expected load and failure conditions.</li>
+  <li>Choose an acceptable false-timeout rate, such as a small fraction above measured p99.9.</li>
+  <li>Add realistic network, handshake, cold-connection, and cross-region variance.</li>
+  <li>
+    Keep enough time for backoff, a second attempt when eligible, cleanup, and response delivery.
+  </li>
+  <li>Revalidate after releases and capacity changes. A timeout is an operational policy.</li>
+</ol>
+
+<div class="warn">
+  <strong>Too short and too long are both unsafe</strong>
+  <p>
+    A timeout below normal tail latency creates false failures and retry load. A very long timeout
+    holds memory, connections, locks, and concurrency slots while the user has already abandoned the
+    result. The correct value follows a stated deadline and measured distribution.
+  </p>
+</div>
+
+<h3 id="cancellation">Cancellation is cooperative</h3>
+<p>
+  A caller stopping its wait does not magically interrupt database work, CPU loops, queued jobs, or
+  child RPCs. Propagate cancellation through each boundary and check it before expensive work and
+  inside long loops. Close response bodies, return connections, release permits, and cancel child
+  calls in a guaranteed cleanup path. Some irreversible work may need to finish and reconcile even
+  after the caller leaves.
+</p>
+
+<h2 id="retry-policy"><span class="num">03.</span> Retry eligibility and idempotency</h2>
+<p class="lead">
+  A retry is a new load-bearing request. Make it only when the operation is safe to repeat, the
+  failure may be temporary, and enough deadline and retry budget remain.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Outcome</th>
+        <th>Retry?</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Connection refused before request transmission</td>
+        <td>Usually, within budget</td>
+        <td>No application work likely started, but classify transport carefully</td>
+      </tr>
+      <tr>
+        <td>HTTP 429 or 503 with pushback</td>
+        <td>Only after requested delay and if budget permits</td>
+        <td>The server is explicitly protecting capacity</td>
+      </tr>
+      <tr>
+        <td>HTTP 400, authentication failure, or permission denial</td>
+        <td>No automatic retry</td>
+        <td>The same request will remain invalid or unauthorized</td>
+      </tr>
+      <tr>
+        <td>Read-only request times out</td>
+        <td>Maybe</td>
+        <td>Safe semantics do not guarantee spare capacity</td>
+      </tr>
+      <tr>
+        <td>Payment response is lost after submission</td>
+        <td>Only with stable idempotency key or outcome lookup</td>
+        <td>The payment may already exist</td>
+      </tr>
+      <tr>
+        <td>Dependency reports invalid state or failed precondition</td>
+        <td>Not until state changes</td>
+        <td>Immediate repetition cannot fix the precondition</td>
+      </tr>
+      <tr>
+        <td>Deadline is exhausted</td>
+        <td>No</td>
+        <td>A later response is no longer useful to this caller</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="idempotency">Idempotent effect, not merely an HTTP verb</h3>
+<p>
+  An operation is idempotent when repeating the same logical command produces the same intended
+  effect as applying it once. A read is often naturally idempotent. A create, debit, notification,
+  or inventory decrement is not unless the protocol gives every logical operation stable identity
+  and stores the outcome atomically with the effect.
+</p>
+
+<figure class="code">
+  <figcaption><b>Idempotent command handling</b></figcaption>
+  <pre><code>PROCESS(command, idempotency_key, authenticated_principal):
+  identity = (principal, operation_type, idempotency_key)
+
+  begin transaction
+    prior = outcomes.find(identity)
+    if prior exists:
+      if hash(command) != prior.command_hash:
+        return KEY_REUSED_WITH_DIFFERENT_COMMAND
+      return prior.response
+
+    validate business invariants
+    effect = apply_once(command)
+    outcomes.insert(identity, hash(command), effect.response)
+  commit transaction
+
+  return effect.response</code></pre>
+</figure>
+
+<p>
+  Scope the key to the authenticated actor and operation. Store a command digest so an attacker or
+  bug cannot reuse one key for different parameters. Define retention long enough to cover delayed
+  retries, secure the stored response, and treat concurrent duplicates atomically. Idempotency does
+  not mean the server must return byte-identical timestamps or trace IDs, but the business effect
+  must not repeat.
+</p>
+
+<h3 id="ambiguous-timeline">Ambiguous write timeline</h3>
+<figure class="code">
+  <figcaption><b>A response loss is not a failed reservation</b></figcaption>
+  <pre><code>Time    Client                     Inventory service              Database
+t0      send reserve K-42  ------&gt;
+t1                                  begin transaction ----------&gt;
+t2                                                               decrement stock
+t3                                                               store outcome K-42
+t4                                                               commit
+t5                                  send success -X- connection breaks
+t6      timeout: outcome UNKNOWN
+t7      retry reserve K-42 -------&gt;
+t8                                  find stored outcome
+t9      &lt;------------------------- return original success
+
+Without K-42, the retry can decrement stock twice.</code></pre>
+</figure>
+
+<h2 id="backoff-jitter">
+  <span class="num">04.</span> Bounded retries, backoff, jitter, and budgets
+</h2>
+
+<h3 id="exponential-backoff">Exponential backoff</h3>
+<figure class="code">
+  <figcaption><b>Backoff families</b></figcaption>
+  <pre><code>capped_exponential(attempt) = min(cap, base * 2^attempt)
+
+full_jitter(attempt) = random(0, capped_exponential(attempt))
+
+equal_jitter(attempt) =
+  capped_exponential(attempt) / 2
+  + random(0, capped_exponential(attempt) / 2)
+
+decorrelated_jitter(previous) =
+  min(cap, random(base, previous * 3))</code></pre>
+</figure>
+
+<p>
+  Exponential backoff reduces attempt frequency while a dependency recovers. A cap prevents
+  impractically long sleeps. Jitter breaks synchronization among clients that failed at the same
+  time. Full jitter spreads attempts most widely; equal jitter preserves a minimum pause;
+  decorrelated jitter avoids a rigid schedule. Do not use the request ID as a permanently stable
+  random seed that causes the same clients to collide on every incident.
+</p>
+
+<h3 id="retry-bounds">A complete retry policy has six bounds</h3>
+<ol>
+  <li>Eligible operation and error classes.</li>
+  <li>Maximum total attempts, including the first attempt.</li>
+  <li>Maximum elapsed time under the original deadline.</li>
+  <li>Backoff schedule with jitter and a cap.</li>
+  <li>A process, client, or dependency retry budget.</li>
+  <li>Cancellation and server pushback behavior.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><b>Budgeted retry pseudocode</b></figcaption>
+  <pre><code>CALL_WITH_RETRY(operation, deadline):
+  previous_delay = base_delay
+
+  for attempt from 1 to max_attempts:
+    if cancelled() or remaining(deadline) &lt; minimum_attempt_time:
+      return DEADLINE_EXCEEDED
+
+    result = call(operation, timeout = attempt_slice(deadline))
+
+    if result.success:
+      return result
+
+    if not retryable(result) or not operation.is_idempotent:
+      return result
+
+    if attempt == max_attempts or not retry_budget.try_take(1):
+      return result
+
+    delay = server_pushback(result)
+            or decorrelated_jitter(previous_delay)
+    delay = min(delay, remaining(deadline) - minimum_attempt_time)
+    wait_until(delay, cancellation)
+    previous_delay = delay
+
+  return LAST_FAILURE</code></pre>
+</figure>
+
+<h3 id="retry-budget">Retry budgets</h3>
+<p>
+  An attempt limit bounds one logical request. A retry budget bounds the aggregate behavior of many
+  requests. One practical policy allows retries to be only a small percentage of original traffic,
+  such as 10 retries per 100 first attempts over a rolling window, with a small burst allowance.
+  When failures rise, the budget empties and clients stop adding load. Track original attempts and
+  retries separately so success after retry does not hide dependency instability.
+</p>
+
+<h3 id="amplification">Retry amplification</h3>
+<figure class="code">
+  <figcaption><b>Attempts multiply across layers</b></figcaption>
+  <pre><code>Browser:  3 total attempts
+Gateway:  3 total attempts for each browser attempt
+Service:  3 total attempts for each gateway attempt
+
+Worst-case dependency attempts = 3 * 3 * 3 = 27
+
+If "3 retries" means 4 total attempts:
+worst case = 4 * 4 * 4 = 64</code></pre>
+</figure>
+
+<p>
+  Prefer retries at one layer that understands the operation and end-to-end deadline. Disable or
+  coordinate hidden library, proxy, service-mesh, queue, and application retries. Report total
+  attempts in tracing so multiplicative behavior is visible.
+</p>
+
+<h2 id="hedging"><span class="num">05.</span> Hedged requests and tail latency</h2>
+<p class="lead">
+  Hedging sends a second copy before the first fails and uses the first acceptable response.
+</p>
+
+<figure class="code">
+  <figcaption><b>Delayed hedge</b></figcaption>
+  <pre><code>t0       send attempt A to replica 1
+t0+80ms no response, tail threshold crossed
+t0+80ms send attempt B to a different failure domain
+t0+105ms B succeeds
+t0+106ms cancel A and return B
+
+Both attempts share one deadline and one logical operation identity.</code></pre>
+</figure>
+
+<p>
+  Hedging can reduce tail latency when a small fraction of replicas are independently slow. It adds
+  load even when the first attempt would eventually succeed, so delay the hedge near a measured tail
+  percentile, select another failure domain, cap attempts, share a retry budget, and cancel losers.
+  Do not hedge overloaded dependencies, large uploads, expensive queries, non-idempotent effects, or
+  failures that are correlated across replicas. A hedge to the same saturated shard is duplicate
+  harm, not redundancy.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Condition</th>
+        <th>Sequential retry</th>
+        <th>Hedge</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Fast explicit transient failure</td>
+        <td>Useful after backoff</td>
+        <td>Usually unnecessary</td>
+      </tr>
+      <tr>
+        <td>Rare independent long-tail delay</td>
+        <td>Waits for timeout before retry</td>
+        <td>Can reduce tail latency</td>
+      </tr>
+      <tr>
+        <td>Shared overload</td>
+        <td>Can worsen overload</td>
+        <td>Worsens it sooner</td>
+      </tr>
+      <tr>
+        <td>Non-idempotent write</td>
+        <td>Unsafe without identity</td>
+        <td>Unsafe without identity and duplicate coordination</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="circuit-breakers"><span class="num">06.</span> Circuit breakers</h2>
+<p class="lead">
+  A circuit breaker temporarily stops calls that are unlikely to succeed, protecting both caller and
+  dependency while allowing controlled probes for recovery.
+</p>
+
+<figure class="code">
+  <figcaption><b>State machine</b></figcaption>
+  <pre><code>                 failure threshold crossed
+       +-------------------------------------------+
+       |                                           v
+   CLOSED --------------------------------------&gt; OPEN
+     ^  |                                           |
+     |  | normal calls                              | cool-down expires
+     |  | record eligible outcomes                  v
+     |  +-------------------------------------- HALF_OPEN
+     |                                               |
+     +------------- probe successes ----------------+
+                         |
+                         +-- probe failure --&gt; OPEN</code></pre>
+</figure>
+
+<ul>
+  <li><strong>Closed:</strong> calls flow and eligible outcomes update a rolling window.</li>
+  <li><strong>Open:</strong> calls fail fast, degrade, or use a safe fallback.</li>
+  <li><strong>Half-open:</strong> a small, bounded number of probes test recovery.</li>
+</ul>
+
+<h3 id="breaker-policy">Breaker policy</h3>
+<p>
+  Count timeouts, connection failures, and dependency overload responses when they indicate
+  dependency health. Usually exclude caller cancellation, validation errors, permission failures,
+  and business rejections. Use a minimum sample size plus a rolling time or count window. A breaker
+  per destination, operation, and sometimes tenant prevents one slow endpoint from blocking every
+  operation. Add jitter to reopen times so all clients do not probe together.
+</p>
+
+<div class="warn">
+  <strong>A breaker is not a capacity controller</strong>
+  <p>
+    It reacts after evidence of failure and can oscillate or hide recovery. Concurrency limits and
+    admission control prevent overload before failure rates explode. Use a breaker as one
+    containment mechanism, expose its state, and keep an emergency override with audit controls.
+  </p>
+</div>
+
+<h2 id="bulkheads"><span class="num">07.</span> Bulkheads and dependency isolation</h2>
+<p>
+  A bulkhead partitions resources so one workload cannot consume them all. Separate concurrency
+  pools, connection pools, queues, memory budgets, CPU allocations, rate quotas, or deployments by
+  workload and dependency. Isolation trades utilization efficiency for predictable failure scope.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Isolation boundary</th>
+        <th>Protects against</th>
+        <th>Cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Per-dependency connection pool</td>
+        <td>Slow analytics calls exhausting checkout connections</td>
+        <td>More pools and potentially idle connections</td>
+      </tr>
+      <tr>
+        <td>Interactive and batch queues</td>
+        <td>Backfills delaying user traffic</td>
+        <td>Explicit scheduling and unused reserved capacity</td>
+      </tr>
+      <tr>
+        <td>Per-tenant concurrency</td>
+        <td>Noisy-neighbor overload</td>
+        <td>Fairness policy and tenant identity propagation</td>
+      </tr>
+      <tr>
+        <td>Zone-local dependency pool</td>
+        <td>Failure spreading immediately across zones</td>
+        <td>Needs reserved failover capacity and locality policy</td>
+      </tr>
+      <tr>
+        <td>Separate process or deployment</td>
+        <td>Memory leak or crash in optional feature</td>
+        <td>Deployment and operational complexity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Do not create a thread pool for every call without modeling memory and scheduling cost. The
+  principle is bounded ownership. In event-loop systems, separate semaphores, queues, and connection
+  pools can provide isolation without a thread-per-request model.
+</p>
+
+<h2 id="fallbacks"><span class="num">08.</span> Fallbacks, brownouts, and graceful degradation</h2>
+<p class="lead">
+  A fallback must be cheaper, safe, bounded, and meaningfully better than an honest failure.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Workload</th>
+        <th>Safe degraded mode</th>
+        <th>Unsafe fallback</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Product page</td>
+        <td>Hide recommendations and serve bounded stale public details</td>
+        <td>Show stale authorization or unverified inventory as guaranteed</td>
+      </tr>
+      <tr>
+        <td>Content feed</td>
+        <td>Serve recent cached items without personalization</td>
+        <td>Return another tenant's cached feed</td>
+      </tr>
+      <tr>
+        <td>Checkout</td>
+        <td>Disable optional coupons or queue a clearly pending order if designed for it</td>
+        <td>Assume payment or inventory succeeded</td>
+      </tr>
+      <tr>
+        <td>Search</td>
+        <td>Lower result count, omit expensive facets, use lexical-only ranking</td>
+        <td>Retry every shard until deadline</td>
+      </tr>
+      <tr>
+        <td>Notification</td>
+        <td>Persist for later delivery and suppress duplicates</td>
+        <td>Silently discard security alerts</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A brownout intentionally disables optional expensive features while core functions remain
+  available. Trigger it from measured pressure with hysteresis so it does not switch rapidly. Keep
+  the path exercised through canaries or drills, make degraded responses explicit to users and
+  telemetry, and define which product and compliance promises still apply.
+</p>
+
+<h2 id="queues"><span class="num">09.</span> Bounded queues and queueing mechanics</h2>
+<p class="lead">
+  A queue moves waiting from one place to another. It absorbs a finite burst, but cannot create
+  sustained capacity.
+</p>
+
+<figure class="code">
+  <figcaption><b>Queue growth when arrival exceeds service</b></figcaption>
+  <pre><code>arrival rate lambda = 1,200 requests/s
+service rate mu     = 1,000 requests/s
+net growth          =   200 requests/s
+
+10,000 empty queue slots fill in:
+10,000 / 200 = 50 seconds
+
+After that, work must block, degrade, spill durably, or be rejected.</code></pre>
+</figure>
+
+<p>
+  Little's Law gives <code>L = lambda * W</code> for a stable system: average in-system work equals
+  throughput times average time in the system. At 1,000 completed requests/s and 200 ms average
+  response time, about 200 requests are in flight on average. If latency rises to 2 seconds at the
+  same throughput, in-flight work rises to about 2,000, consuming more memory, sockets, and permits.
+</p>
+
+<h3 id="queue-policy">Queue policy</h3>
+<ul>
+  <li>Bound both item count and bytes because request sizes vary.</li>
+  <li>Give queued items deadlines and discard work that can no longer finish usefully.</li>
+  <li>Separate priority classes and reserve capacity for control and recovery traffic.</li>
+  <li>Use FIFO when age fairness matters, but prevent head-of-line blocking by expensive work.</li>
+  <li>Use per-tenant limits so one producer cannot occupy the whole queue.</li>
+  <li>Persist only when delayed completion is part of the contract, not to hide overload.</li>
+  <li>Expose queue depth, oldest age, enqueue rate, wait time, rejection, and cancellation.</li>
+</ul>
+
+<div class="warn">
+  <strong>An unbounded queue converts overload into latency and memory failure</strong>
+  <p>
+    It may initially reduce errors, which makes the design look successful while work accumulates.
+    Users time out, queued requests become useless, memory rises, and the process eventually fails.
+    A bounded queue makes overload visible early enough to control it.
+  </p>
+</div>
+
+<h2 id="backpressure"><span class="num">10.</span> Backpressure across boundaries</h2>
+<p>
+  Backpressure is effective only when the producer can observe the signal and respond. A pull model
+  asks for a bounded number of items. A credit or window model grants permission for bytes or
+  messages. A bounded blocking queue pauses an in-process producer. An HTTP server can return 429 or
+  503 with pushback. A broker consumer can reduce fetch demand or pause partitions. If the external
+  producer cannot slow, the system must buffer within a bound, sample, aggregate, spill durably, or
+  drop according to policy.
+</p>
+
+<figure class="code">
+  <figcaption><b>Credit-based stream pseudocode</b></figcaption>
+  <pre><code>subscriber grants credit = 32 items
+publisher sends at most 32 items
+subscriber processes 16 items
+subscriber grants 16 more credits
+
+outstanding demand = total granted - total delivered
+
+Publisher invariant:
+delivered items must never exceed granted demand.</code></pre>
+</figure>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Boundary</th>
+        <th>Signal</th>
+        <th>Required upstream behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>In-process pipeline</td>
+        <td>Demand, semaphore, or full bounded queue</td>
+        <td>Stop scheduling or await capacity without blocking an event loop</td>
+      </tr>
+      <tr>
+        <td>Streaming protocol</td>
+        <td>Receive window or requested item count</td>
+        <td>Do not send beyond credit</td>
+      </tr>
+      <tr>
+        <td>Synchronous API</td>
+        <td>429, 503, Retry-After, or explicit overload status</td>
+        <td>Back off with jitter or fail, within the caller deadline</td>
+      </tr>
+      <tr>
+        <td>Message consumer</td>
+        <td>Reduced polling, delayed acknowledgement, paused partition</td>
+        <td>Broker retains only within configured capacity and retention</td>
+      </tr>
+      <tr>
+        <td>Uncontrollable telemetry source</td>
+        <td>No usable reverse channel</td>
+        <td>Sample, aggregate, prioritize, or drop with counters</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Transport flow control is not application backpressure. TCP can stop bytes entering one receiver,
+  but the sender may still create logical work, buffer elsewhere, or hold expensive state. Carry
+  demand and cancellation at the application level and bound buffers at every hop.
+</p>
+
+<h2 id="admission-control"><span class="num">11.</span> Admission control and load shedding</h2>
+<p class="lead">
+  Admission control decides whether work may enter. Load shedding removes work that would otherwise
+  push the system beyond a safe operating region.
+</p>
+
+<h3 id="admission-layers">Protect every meaningful choke point</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Useful decision</th>
+        <th>Limitation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Edge or gateway</td>
+        <td>Block abuse, enforce tenant quotas, reject known excess globally</td>
+        <td>Does not know instance-local CPU, queue, or dependency pressure</td>
+      </tr>
+      <tr>
+        <td>Load balancer</td>
+        <td>Route only to ready capacity and apply global overload policy</td>
+        <td>Health and capacity signals can lag</td>
+      </tr>
+      <tr>
+        <td>Service instance</td>
+        <td>Bound local queue, concurrency, memory, and event-loop lag</td>
+        <td>One instance cannot see all fleet demand</td>
+      </tr>
+      <tr>
+        <td>Dependency client</td>
+        <td>Limit calls per destination and operation</td>
+        <td>Independent clients need a shared fairness strategy</td>
+      </tr>
+      <tr>
+        <td>Worker or consumer</td>
+        <td>Pause intake based on downstream capacity</td>
+        <td>Broker lag grows and retention remains finite</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="shed-order">Shed by cost, value, and deadline</h3>
+<ol>
+  <li>Drop invalid, abusive, duplicate, expired, or already-cancelled work first.</li>
+  <li>Pause batch refreshes, prefetching, analytics, and optional fan-out.</li>
+  <li>Disable expensive nonessential fields or ranking stages.</li>
+  <li>Preserve authenticated control traffic, health reporting, and recovery operations.</li>
+  <li>Apply fair per-tenant or per-user limits to remaining work.</li>
+  <li>Reject new low-priority work early and cheaply when capacity is exhausted.</li>
+</ol>
+
+<p>
+  Return a precise outcome. HTTP 429 usually communicates a caller or quota limit. HTTP 503 usually
+  communicates temporary service unavailability or overload. A <code>Retry-After</code> field can
+  communicate minimum delay, but clients must still add jitter, respect their deadline, and avoid
+  retrying unsafe operations. Do not claim a guaranteed recovery time unless the server can support
+  it.
+</p>
+
+<h3 id="hysteresis">Hysteresis and pressure signals</h3>
+<p>
+  Enter overload mode at a high threshold and leave only after pressure stays below a lower
+  threshold for a recovery period. This prevents rapid mode changes. Prefer direct saturation
+  signals such as in-flight work, queue age, event-loop lag, memory, and dependency permits over CPU
+  alone. CPU can look low when threads are blocked on a saturated database, and high CPU can still
+  be healthy when useful throughput remains stable.
+</p>
+
+<figure class="code">
+  <figcaption><b>Priority-aware admission pseudocode</b></figcaption>
+  <pre><code>ADMIT(request):
+  if invalid(request) or request.deadline_expired:
+    reject_without_queueing()
+
+  class = authenticated_priority(request)
+
+  if tenant_inflight(request.tenant) &gt;= tenant_limit(class):
+    return OVERLOADED_WITH_PUSHBACK
+
+  if system_pressure &gt; enter_brownout_threshold:
+    disable_optional_work(request)
+
+  if dependency_permits.try_acquire(class) == false:
+    return safe_fallback_or_overload()
+
+  return ACCEPTED_WITH_PERMIT</code></pre>
+</figure>
+
+<h2 id="concurrency-limits">
+  <span class="num">12.</span> Concurrency limits and sustainable capacity
+</h2>
+<p class="lead">
+  Rate limits control starts per unit time. Concurrency limits control simultaneous resource
+  holders. Slow failures make concurrency the critical bound.
+</p>
+
+<p>
+  If a dependency normally handles 1,000 requests/s at 50 ms, average concurrency is about 50. If it
+  slows to 500 ms while arrivals remain 1,000/s, concurrency tends toward 500. Without a limit, the
+  caller may consume ten times the sockets, memory, threads, and downstream work before rate changes
+  at all.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Controller</th>
+        <th>Best at</th>
+        <th>Blind spot</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Fixed concurrency limit</td>
+        <td>Simple protection based on tested capacity</td>
+        <td>May waste capacity or overload after environment changes</td>
+      </tr>
+      <tr>
+        <td>Rate limit</td>
+        <td>Quota, fairness, and burst control</td>
+        <td>Does not react directly to slow requests</td>
+      </tr>
+      <tr>
+        <td>Queue bound</td>
+        <td>Absorbing short bursts and bounding memory</td>
+        <td>Admits work that may expire while waiting</td>
+      </tr>
+      <tr>
+        <td>Adaptive concurrency</td>
+        <td>Following latency and capacity changes</td>
+        <td>Needs stable feedback, bounds, and careful rollout</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="adaptive-concurrency">Adaptive limit intuition</h3>
+<p>
+  An adaptive controller can increase the limit slowly while latency remains near the measured
+  no-queue baseline, then reduce it quickly when queueing delay rises. This resembles additive
+  increase and multiplicative decrease. It must enforce a tested minimum and maximum, ignore noisy
+  tiny samples, separate operations with different costs, and react more slowly than transient
+  measurement noise. A control loop that every instance runs identically can synchronize, so add
+  jitter and canary changes.
+</p>
+
+<figure class="code">
+  <figcaption><b>Simplified adaptive controller</b></figcaption>
+  <pre><code>every control_interval with enough samples:
+  queueing_ratio = observed_latency / no_queue_baseline
+
+  if errors_due_to_overload or queueing_ratio &gt; high_threshold:
+    limit = max(min_limit, floor(limit * 0.8))
+  else if queueing_ratio &lt; low_threshold:
+    limit = min(max_limit, limit + 1)
+
+  publish limit, sample count, baseline, and decision reason</code></pre>
+</figure>
+
+<h3 id="capacity-headroom">Capacity must survive failure</h3>
+<p>
+  Suppose an inventory tier has 12 instances. Load tests show each instance preserves its latency
+  objective up to 400 requests/s, but operational policy uses only 70% of that limit. Normal safe
+  fleet capacity is <code>12 * 400 * 0.70 = 3,360 requests/s</code>. Losing one zone containing four
+  instances leaves eight, or <code>2,240 requests/s</code> at the same safety level. A 3,000
+  requests/s peak fits normally but does not fit after zone loss. The design needs more baseline
+  instances, lower admitted load, a safe degraded mode, or independently proven rapid failover
+  capacity.
+</p>
+
+<div class="key">
+  <strong>Size for useful throughput beyond the knee</strong>
+  <p>
+    The capacity limit is not where the service finally crashes. It is the highest offered load at
+    which useful completions, tail latency, error rate, and resource safety remain within objective.
+    Beyond the queueing knee, more arrivals can reduce completed useful work.
+  </p>
+</div>
+
+<h2 id="cascades"><span class="num">13.</span> Cascading failures and positive feedback</h2>
+<p class="lead">
+  A cascade begins when one failure increases pressure elsewhere, causing additional failures that
+  feed back into the original pressure.
+</p>
+
+<figure class="code">
+  <figcaption><b>Typical overload loop</b></figcaption>
+  <pre><code>dependency slows
+      |
+      v
+in-flight calls and queues grow
+      |
+      v
+memory, connections, threads, and CPU saturate
+      |
+      v
+timeouts and health-check failures rise
+      |
+      +----&gt; clients retry ----+
+      |                        |
+      +----&gt; instances removed |
+                               v
+                     less effective capacity
+                               |
+                               +----&gt; dependency slows further</code></pre>
+</figure>
+
+<h3 id="overload-timeline">Failure timeline: retries turn slowdown into outage</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Observed state</th>
+        <th>Mechanism</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>10:00:00</td>
+        <td>Inventory receives 2,800 requests/s, p99 120 ms</td>
+        <td>Healthy below tested 3,360 requests/s fleet limit</td>
+      </tr>
+      <tr>
+        <td>10:00:10</td>
+        <td>One shard compacts; p99 becomes 900 ms for 20% of keys</td>
+        <td>Slow partial failure, not total unavailability</td>
+      </tr>
+      <tr>
+        <td>10:00:20</td>
+        <td>Caller timeouts and retries add 500 attempts/s</td>
+        <td>Retry load consumes remaining headroom</td>
+      </tr>
+      <tr>
+        <td>10:00:30</td>
+        <td>Connection pools fill; queue age exceeds user deadline</td>
+        <td>Useless queued work still holds resources</td>
+      </tr>
+      <tr>
+        <td>10:00:40</td>
+        <td>Readiness checks fail on three instances</td>
+        <td>Health probes share saturated request resources</td>
+      </tr>
+      <tr>
+        <td>10:00:50</td>
+        <td>Load shifts to nine remaining instances</td>
+        <td>Removal reduces capacity during overload</td>
+      </tr>
+      <tr>
+        <td>10:01:10</td>
+        <td>Liveness restarts begin, caches and pools become cold</td>
+        <td>Restart cost lowers capacity further</td>
+      </tr>
+      <tr>
+        <td>10:01:30</td>
+        <td>Useful throughput falls below 1,000 requests/s</td>
+        <td>The fleet melts down despite high offered work</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="help-worsens-outage">Why apparently helpful mechanisms worsen outages</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mechanism</th>
+        <th>Normal benefit</th>
+        <th>Outage amplification</th>
+        <th>Safety control</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Retries</td>
+        <td>Hide brief transient faults</td>
+        <td>Adds work to the failing dependency</td>
+        <td>Eligibility, one owner, jitter, retry budget</td>
+      </tr>
+      <tr>
+        <td>Replicas and failover</td>
+        <td>Survive one instance or location loss</td>
+        <td>Redistributes load onto capacity that may not have headroom</td>
+        <td>Failure-capacity planning, slow ramp, locality</td>
+      </tr>
+      <tr>
+        <td>Caches</td>
+        <td>Reduce latency and source traffic</td>
+        <td>Cold start, purge, or bypass exposes full origin demand</td>
+        <td>Stale service, fill limits, warm-up, origin protection</td>
+      </tr>
+      <tr>
+        <td>Health checks</td>
+        <td>Remove broken instances</td>
+        <td>Overload looks like death, so capacity is removed</td>
+        <td>Cheap probes, readiness/liveness separation, hysteresis</td>
+      </tr>
+      <tr>
+        <td>Autoscaling</td>
+        <td>Add capacity as demand grows</td>
+        <td>Starts too late, adds cold instances, or scales callers faster than dependency</td>
+        <td>Leading signals, warm-up, downstream-aware limits</td>
+      </tr>
+      <tr>
+        <td>Fallback to source</td>
+        <td>Preserves function when optional layer fails</td>
+        <td>Turns cache failure into database failure</td>
+        <td>Bounded fallback concurrency and degradation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="health-checks"><span class="num">14.</span> Health checks, readiness, and draining</h2>
+<p>
+  Health checks are control-plane inputs with data-plane consequences. They must be cheap, bounded,
+  independently schedulable, and hard to fail because of ordinary request overload.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Probe</th>
+        <th>Question</th>
+        <th>Failure action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Startup</td>
+        <td>Has initialization completed enough for normal probes?</td>
+        <td>Wait or restart after a deliberately long startup bound</td>
+      </tr>
+      <tr>
+        <td>Liveness</td>
+        <td>Is this process irrecoverably unable to make local progress?</td>
+        <td>Restart after repeated failures</td>
+      </tr>
+      <tr>
+        <td>Readiness</td>
+        <td>Should this instance receive new traffic now?</td>
+        <td>Drain from routing but keep the process running</td>
+      </tr>
+      <tr>
+        <td>Deep diagnostic</td>
+        <td>Which dependency or subsystem is degraded?</td>
+        <td>Observe and troubleshoot, not necessarily restart</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Liveness should usually test local progress, not every remote dependency. If a shared database
+  fails, restarting every caller adds connection storms and removes otherwise useful degraded
+  capacity. Readiness can consider local overload, but simultaneous removal of many instances can
+  overload those left. Use failure and success thresholds, minimum ready capacity, draining, and
+  rate-limited membership changes. Keep probe traffic outside the saturated user queue when
+  possible, but do not let it falsely report health while the process does no useful work.
+</p>
+
+<h3 id="draining">Graceful drain</h3>
+<ol>
+  <li>Stop advertising readiness for new ordinary work.</li>
+  <li>Keep liveness true while the process drains.</li>
+  <li>Stop accepting new long-lived streams and tell clients to reconnect elsewhere.</li>
+  <li>Wait for in-flight work within a bounded termination grace period.</li>
+  <li>Cancel or persist unfinished work according to its contract.</li>
+  <li>Close listeners and resource pools only after admission stops.</li>
+</ol>
+
+<h2 id="architecture"><span class="num">15.</span> End-to-end resilient inventory design</h2>
+<p class="lead">
+  Assume an online retailer receives 3,000 checkout reservation requests/s at peak. Each reservation
+  must not decrement stock twice, 99.9% should finish within 900 ms when healthy, and optional
+  product recommendations may disappear during overload.
+</p>
+
+<figure class="code">
+  <figcaption><b>Architecture and protection boundaries</b></figcaption>
+  <pre><code>Authenticated client
+       |
+       v
+Edge quota and abuse control
+       |
+       v
+Checkout API
+  | deadline propagation
+  | per-tenant admission
+  | optional recommendation brownout
+  v
+Inventory client bulkhead
+  | bounded waiters and concurrency
+  | one retry owner with budget
+  | circuit breaker
+  v
+Zone-local load balancer
+       |
+       +----- Inventory instance A -----+
+       +----- Inventory instance B -----+--&gt; sharded inventory database
+       +----- Inventory instance C -----+    plus idempotency outcomes
+
+Metrics, traces, change events, and audit logs cross every boundary.</code></pre>
+</figure>
+
+<h3 id="normal-flow">Normal reservation flow</h3>
+<ol>
+  <li>The client creates one unpredictable idempotency key per logical checkout action.</li>
+  <li>
+    The gateway authenticates the caller, enforces payload and tenant quotas, and sets a deadline.
+  </li>
+  <li>Checkout validates locally and removes optional work if brownout is active.</li>
+  <li>
+    The inventory bulkhead acquires a tenant and dependency permit or rejects without queueing.
+  </li>
+  <li>The client sends the remaining deadline and stable operation identity to inventory.</li>
+  <li>
+    Inventory atomically checks the prior outcome, verifies stock, changes stock, and stores
+    outcome.
+  </li>
+  <li>
+    Cancellation stops optional and read work, but a committing reservation finishes and reconciles.
+  </li>
+  <li>Every permit, timer, connection, and response body is released in cleanup.</li>
+</ol>
+
+<h3 id="capacity-reasoning">Capacity reasoning</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Quantity</th>
+        <th>Assumption</th>
+        <th>Reasoning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Original peak traffic</td>
+        <td>3,000 requests/s</td>
+        <td>Excludes retries and health probes</td>
+      </tr>
+      <tr>
+        <td>Retry budget</td>
+        <td>10% plus small burst</td>
+        <td>At most about 300 retry attempts/s in steady peak</td>
+      </tr>
+      <tr>
+        <td>Normal p99 dependency time</td>
+        <td>120 ms</td>
+        <td>Initial concurrency estimate is 3,300 * 0.12 = 396</td>
+      </tr>
+      <tr>
+        <td>Per-instance safe concurrency</td>
+        <td>50 from load tests</td>
+        <td>12 instances provide 600 slots before zone-loss policy</td>
+      </tr>
+      <tr>
+        <td>One-zone loss</td>
+        <td>4 of 12 instances unavailable</td>
+        <td>8 instances leave 400 tested slots, so retries must nearly stop</td>
+      </tr>
+      <tr>
+        <td>Queue</td>
+        <td>100 ms maximum wait, bounded by count and bytes</td>
+        <td>Absorbs short imbalance without hiding sustained overload</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  The 396-slot estimate uses p99 rather than average latency as a conservative first pass, but load
+  testing must validate the entire distribution and resource mix. With a zone lost, 400 slots leave
+  almost no headroom. The incident policy disables hedges, spends only a tiny retry budget, sheds
+  low-priority reservations, and ramps failover capacity slowly. Merely routing all 3,300 attempts/s
+  to the remaining fleet would operate at the edge of the measured limit with no safety margin.
+</p>
+
+<h3 id="protected-flow">Overload flow</h3>
+<figure class="code">
+  <figcaption><b>Controlled failure timeline</b></figcaption>
+  <pre><code>t0       inventory latency rises above baseline
+t0+5s    adaptive concurrency reduces new in-flight work
+t0+8s    queue reaches age threshold; new low-priority work gets 503 + pushback
+t0+10s   retry budget drains; only original idempotent attempts continue
+t0+12s   breaker opens for the affected shard after sufficient samples
+t0+15s   checkout removes recommendation and coupon fan-out
+t0+20s   operators pause batch reservations and confirm database pressure falls
+t0+40s   half-open probes begin with jitter and limited concurrency
+t0+60s   useful throughput is stable; admitted traffic ramps in small steps
+
+Users see some explicit rejections, but core capacity remains alive.</code></pre>
+</figure>
+
+<h3 id="client-example">Go client example: deadline, permit, and one retry owner</h3>
+<p>
+  The principle comes first: one call graph owns retry policy, every attempt shares one deadline,
+  and a semaphore limits dependency concurrency. The following approved-ecosystem sketch uses Go's
+  standard cancellation model. Production code also needs typed errors, response cleanup,
+  observability, jitter, and an aggregate retry budget.
+</p>
+
+<figure class="code">
+  <figcaption><b>Focused Go example</b></figcaption>
+  <pre><code>func Reserve(ctx context.Context, cmd Command) (Result, error) {
+    ctx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+    defer cancel()
+
+    select {
+    case inventoryPermits &lt;- struct{}{}:
+        defer func() { &lt;-inventoryPermits }()
+    case &lt;-ctx.Done():
+        return Result{}, ctx.Err()
+    default:
+        return Result{}, ErrOverloaded
+    }
+
+    first, err := callInventory(ctx, cmd)
+    if err == nil || !isRetryable(err) || !cmd.HasIdempotencyKey() {
+        return first, err
+    }
+
+    delay := time.Duration(rand.Int64N(int64(40 * time.Millisecond)))
+    timer := time.NewTimer(delay)
+    defer timer.Stop()
+
+    select {
+    case &lt;-timer.C:
+        return callInventory(ctx, cmd)
+    case &lt;-ctx.Done():
+        return Result{}, ctx.Err()
+    }
+}</code></pre>
+</figure>
+
+<h3 id="server-example">TypeScript server example: early overload rejection</h3>
+<p>
+  A server should reject before allocating expensive state. This example shows the mechanism without
+  defining resilience through a framework. An actual service must use atomic permit accounting,
+  trusted tenant identity, payload limits, structured logging, and disconnect cancellation.
+</p>
+
+<figure class="code">
+  <figcaption><b>Focused TypeScript example</b></figcaption>
+  <pre><code>async function handleReserve(request: Request): Promise&lt;Response&gt; {
+  const tenant = authenticateTenant(request);
+  const permit = limiter.tryAcquire(tenant);
+
+  if (!permit) {
+    return new Response("temporarily overloaded", {
+      status: 503,
+      headers: { "Retry-After": "1" }
+    });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() =&gt; controller.abort(), 300);
+
+  try {
+    const result = await reserveAtomically(request, controller.signal);
+    return Response.json(result);
+  } finally {
+    clearTimeout(timer);
+    permit.release();
+  }
+}</code></pre>
+</figure>
+
+<h2 id="security"><span class="num">16.</span> Security, privacy, abuse, and trust boundaries</h2>
+<p>
+  Resilience controls are security controls because attackers can intentionally consume the same
+  scarce resources as accidental overload. Authenticate before granting expensive capacity when
+  possible, but protect authentication itself because password hashing, token introspection, key
+  lookup, and policy checks can be expensive dependencies.
+</p>
+
+<ul>
+  <li>
+    Limit headers, body bytes, decompressed size, field counts, nesting, and streaming duration.
+  </li>
+  <li>
+    Apply per-principal, per-tenant, per-IP, and global controls with deliberate proxy trust rules.
+  </li>
+  <li>Do not trust a client-supplied priority header without authorization.</li>
+  <li>Bind idempotency keys to authenticated identity and command digest; use unguessable keys.</li>
+  <li>Rate-limit outcome lookup to prevent key probing and cross-tenant inference.</li>
+  <li>Keep overload responses free of internal host, capacity, topology, or tenant details.</li>
+  <li>
+    Fail closed for authorization and integrity decisions; use bounded stale only when policy
+    permits.
+  </li>
+  <li>
+    Reserve capacity for revocation, incident control, audit, and administrative recovery paths.
+  </li>
+  <li>Redact payloads and identifiers in retry, queue, trace, and idempotency telemetry.</li>
+  <li>
+    Protect emergency breaker, brownout, and limit overrides with least privilege and audit logs.
+  </li>
+</ul>
+
+<h3 id="fairness-abuse">Fairness under overload</h3>
+<p>
+  Global first-come, first-served allows one large tenant or botnet to crowd out everyone.
+  Hierarchical limits can reserve a global safety bound, allocate tenant shares, and permit
+  controlled borrowing of unused capacity. Decide whether fairness means equal users, paid quotas,
+  business criticality, or cost-weighted work. Normalize for operation cost so one expensive search
+  is not counted like one cheap health read. Never let commercial priority bypass integrity or
+  emergency controls.
+</p>
+
+<h2 id="observability"><span class="num">17.</span> Metrics, tracing, dashboards, and alerts</h2>
+<p class="lead">
+  Observe offered load, admitted load, useful completions, and rejected work separately. A service
+  can look busy while useful throughput collapses.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>Why it matters</th>
+        <th>Useful breakdown</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Original requests, retry attempts, hedge attempts</td>
+        <td>Shows amplification rather than hiding it in total traffic</td>
+        <td>Caller, dependency, operation, region</td>
+      </tr>
+      <tr>
+        <td>Attempt and end-to-end latency</td>
+        <td>Separates dependency time from user-visible time</td>
+        <td>p50, p95, p99, p99.9, outcome</td>
+      </tr>
+      <tr>
+        <td>In-flight work and concurrency limit</td>
+        <td>Reveals slow-failure saturation</td>
+        <td>Pool, tenant class, operation</td>
+      </tr>
+      <tr>
+        <td>Queue depth, bytes, wait, oldest age</td>
+        <td>Shows pressure and deadline risk</td>
+        <td>Priority and rejection reason</td>
+      </tr>
+      <tr>
+        <td>Admission, shed, degraded, and expired-before-start counts</td>
+        <td>Quantifies controlled loss</td>
+        <td>Reason, client, tenant class</td>
+      </tr>
+      <tr>
+        <td>Retry-budget tokens and exhausted decisions</td>
+        <td>Shows whether protection is active</td>
+        <td>Dependency and process</td>
+      </tr>
+      <tr>
+        <td>Breaker state, transitions, and half-open probes</td>
+        <td>Explains fast failures and recovery</td>
+        <td>Destination, method, cause</td>
+      </tr>
+      <tr>
+        <td>Cancellation propagation and work after deadline</td>
+        <td>Finds wasted computation</td>
+        <td>Hop and operation phase</td>
+      </tr>
+      <tr>
+        <td>Useful throughput and success after first attempt</td>
+        <td>Detects retry-dependent or collapsing service</td>
+        <td>Correct business outcome</td>
+      </tr>
+      <tr>
+        <td>CPU, memory, event-loop lag, pools, file descriptors</td>
+        <td>Locates the exhausted resource</td>
+        <td>Instance, zone, version</td>
+      </tr>
+      <tr>
+        <td>Readiness and liveness changes</td>
+        <td>Reveals capacity-removal feedback</td>
+        <td>Probe reason and fleet fraction</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="trace-fields">Trace one logical request across attempts</h3>
+<p>
+  Preserve one logical operation ID and create a child span for each attempt. Record attempt number,
+  original or retry or hedge, remaining deadline, selected destination, queue wait, permit wait,
+  server pushback, breaker state, cancellation, and final business outcome. Avoid high-cardinality
+  raw idempotency keys and tenant identifiers in metric labels. Use sampled, access-controlled
+  traces for detailed investigation.
+</p>
+
+<h3 id="alerts">Actionable alerts</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Alert</th>
+        <th>Example condition</th>
+        <th>Immediate question</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>User objective burn</td>
+        <td>Fast and slow burn on latency or availability SLO</td>
+        <td>Which user journey and failure domain are affected?</td>
+      </tr>
+      <tr>
+        <td>Retry storm</td>
+        <td>Retries exceed budget or rise while first-attempt success falls</td>
+        <td>Can retries be disabled at the owning layer?</td>
+      </tr>
+      <tr>
+        <td>Queue danger</td>
+        <td>Oldest age approaches the remaining deadline</td>
+        <td>Should intake be shed before queued work expires?</td>
+      </tr>
+      <tr>
+        <td>Fleet removal</td>
+        <td>Ready capacity falls faster than offered load</td>
+        <td>Are probes removing overloaded but recoverable instances?</td>
+      </tr>
+      <tr>
+        <td>Breaker spread</td>
+        <td>Many callers open for one dependency or shard</td>
+        <td>Is the root cause downstream or a bad client rollout?</td>
+      </tr>
+      <tr>
+        <td>Work after cancellation</td>
+        <td>Large CPU or query time continues beyond caller deadline</td>
+        <td>Where did cancellation propagation stop?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Alert on user harm and sustained dangerous pressure, not every breaker transition or rejected
+  request. Overload controls are expected to reject some work. A useful alert includes the affected
+  service objective, scope, recent changes, dashboard, and recovery playbook.
+</p>
+
+<h2 id="recovery-playbook">
+  <span class="num">18.</span> Recovery playbook for an overloaded dependency
+</h2>
+<p class="lead">
+  Recovery is a controlled reduction of offered work followed by a measured restoration of useful
+  capacity. Fix the deepest failing layer first and avoid changing many feedback loops at once.
+</p>
+
+<h3 id="stabilize">Phase 1: detect and stabilize</h3>
+<ol>
+  <li>Declare an incident owner and record a timeline of changes and actions.</li>
+  <li>
+    Confirm user impact, affected operations, regions, shards, tenants, and first failing layer.
+  </li>
+  <li>
+    Compare original traffic, retries, queue age, in-flight work, ready capacity, and completions.
+  </li>
+  <li>
+    Freeze deployments, rebalancing, large maintenance, and nonessential configuration changes.
+  </li>
+  <li>Stop or sharply reduce retries and hedges at the owning layer.</li>
+  <li>Pause batch, prefetch, backfill, analytics, and other low-priority producers.</li>
+  <li>Enter tested brownout mode and reject excess work early at upstream choke points.</li>
+  <li>
+    If instances crash-loop, reduce admitted traffic enough for a meaningful fleet fraction to live.
+  </li>
+</ol>
+
+<h3 id="repair">Phase 2: repair the limiting resource</h3>
+<ol>
+  <li>
+    Identify whether CPU, memory, locks, storage, connections, a hot key, or a recent change is
+    limiting.
+  </li>
+  <li>Revert the triggering release or configuration when evidence supports it.</li>
+  <li>Add capacity only if the dependency and its downstream resources can accept it safely.</li>
+  <li>
+    Quarantine a bad shard, query, tenant, or request shape when the scope is narrow and verified.
+  </li>
+  <li>
+    Keep readiness and liveness changes deliberate; do not restart every slow caller automatically.
+  </li>
+  <li>Verify useful throughput rises and queue age falls, not only CPU or error rate.</li>
+</ol>
+
+<h3 id="restore">Phase 3: restore gradually</h3>
+<ol>
+  <li>
+    Let instances start, establish pools, elect leaders, and warm critical caches under low traffic.
+  </li>
+  <li>Use a tiny, jittered half-open probe population to verify correctness and latency.</li>
+  <li>Ramp admitted traffic in steps while watching saturation and useful completions.</li>
+  <li>Restore interactive features before batch and background work.</li>
+  <li>Restore retry budgets last and confirm attempts do not multiply across layers.</li>
+  <li>
+    Reconcile ambiguous reservations and duplicate outcomes before declaring data recovery complete.
+  </li>
+</ol>
+
+<h3 id="learn">Phase 4: learn and harden</h3>
+<ol>
+  <li>Preserve evidence, causal timeline, trigger, feedback loops, and mitigation effects.</li>
+  <li>Write a blameless post-incident review with owners and due dates.</li>
+  <li>Add the incident workload to regression, overload, and chaos tests.</li>
+  <li>Adjust limits from measured capacity, including zone loss and cold recovery.</li>
+  <li>Remove temporary overrides, confirm audit records, and update the playbook.</li>
+</ol>
+
+<h2 id="production-practices"><span class="num">19.</span> Production and deployment practices</h2>
+<ul>
+  <li>Give every network call an explicit deadline derived from an end-to-end budget.</li>
+  <li>
+    Inventory library, proxy, mesh, broker, and application retries before choosing one owner.
+  </li>
+  <li>Keep retry, hedge, breaker, queue, and concurrency policies specific to operation cost.</li>
+  <li>
+    Store resilience policy as reviewed configuration with safe bounds, ownership, and change
+    history.
+  </li>
+  <li>Canary policy changes and compare original traffic, useful throughput, and tail latency.</li>
+  <li>
+    Roll out clients gradually because a client retry change can overload a healthy server fleet.
+  </li>
+  <li>Keep zone-local traffic by default and reserve measured cross-zone failover capacity.</li>
+  <li>
+    Warm caches, pools, JIT-compiled paths, and connections before advertising full readiness.
+  </li>
+  <li>Separate batch from serving work and make pausing every producer operationally simple.</li>
+  <li>
+    Document overload response codes, pushback, idempotency, and deadline semantics in contracts.
+  </li>
+  <li>
+    Keep control, health, and recovery traffic small and protected from ordinary tenant exhaustion.
+  </li>
+  <li>Rehearse rollback and brownout paths so rare code does not decay unnoticed.</li>
+</ul>
+
+<h3 id="configuration-rollout">Safe resilience-policy rollout</h3>
+<ol>
+  <li>Measure the current policy and name the problem the change should solve.</li>
+  <li>Validate bounds statically, such as maximum attempts and minimum deadline reserve.</li>
+  <li>Shadow-compute the new decision without enforcing it when practical.</li>
+  <li>Canary on a small client and server population across representative workloads.</li>
+  <li>Observe at least one peak and one dependency fault scenario.</li>
+  <li>Expand gradually with an automatic stop on objective burn or amplification.</li>
+  <li>Retain a fast, audited rollback that does not depend on the failing service.</li>
+</ol>
+
+<h3 id="cost-tradeoffs">Performance, scalability, and cost trade-offs</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Benefit</th>
+        <th>Latency or throughput cost</th>
+        <th>Financial or operational cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Extra headroom</td>
+        <td>Absorbs bursts and failure</td>
+        <td>Lower queueing at peak</td>
+        <td>Idle capacity during normal traffic</td>
+      </tr>
+      <tr>
+        <td>Retries</td>
+        <td>Recover some transient failures</td>
+        <td>Longer user tail and more dependency work</td>
+        <td>Compute, network, and downstream transaction cost</td>
+      </tr>
+      <tr>
+        <td>Hedging</td>
+        <td>Reduces independent tail delay</td>
+        <td>Earlier duplicate concurrency</td>
+        <td>Extra calls even when no error occurs</td>
+      </tr>
+      <tr>
+        <td>Bulkhead isolation</td>
+        <td>Predictable failure scope</td>
+        <td>Some pools idle while another rejects</td>
+        <td>More configuration and monitoring</td>
+      </tr>
+      <tr>
+        <td>Large queue</td>
+        <td>Absorbs longer bursts</td>
+        <td>Higher wait and stale work</td>
+        <td>Memory and incident recovery time</td>
+      </tr>
+      <tr>
+        <td>Graceful degradation</td>
+        <td>Preserves core availability</td>
+        <td>Lower result quality or fewer features</td>
+        <td>Product complexity and regular testing</td>
+      </tr>
+      <tr>
+        <td>Fine-grained limits</td>
+        <td>Fairness and cost-aware protection</td>
+        <td>Policy lookup on request path</td>
+        <td>Cardinality and governance overhead</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Measure cost per successful logical operation, not cost per attempt. A retry that eventually
+  succeeds can still triple database work. Include reserved failure capacity, rejected traffic, warm
+  standby, observability, data reconciliation, and operator time when comparing designs.
+</p>
+
+<h2 id="testing"><span class="num">20.</span> Testing strategy and chaos experiments</h2>
+<p class="lead">
+  Test until and beyond the capacity knee. A resilience mechanism is incomplete until its degraded
+  mode and recovery behavior are verified under realistic concurrency.
+</p>
+
+<h3 id="unit-tests">Unit and property tests</h3>
+<ul>
+  <li>
+    Use a controllable monotonic clock for deadline, backoff, jitter, and breaker transitions.
+  </li>
+  <li>Verify every retryable error and every explicitly non-retryable error.</li>
+  <li>Property-test that attempt count and elapsed time never exceed configured bounds.</li>
+  <li>Verify server pushback overrides local backoff only within the original deadline.</li>
+  <li>Test breaker minimum sample, rolling window, open, half-open, and jittered recovery.</li>
+  <li>Prove semaphore permits, response bodies, timers, and queue slots release on every exit.</li>
+  <li>Test admission priority, tenant fairness, brownout hysteresis, and fail-safe defaults.</li>
+  <li>Race duplicate idempotency keys and prove exactly one business effect is stored.</li>
+  <li>Reject reuse of an idempotency key with different authenticated actor or command digest.</li>
+</ul>
+
+<h3 id="integration-tests">Integration and protocol tests</h3>
+<ul>
+  <li>
+    Delay DNS, connect, TLS, response headers, body reads, and application processing separately.
+  </li>
+  <li>Break the connection before send, during send, after commit, and during response.</li>
+  <li>Verify remaining deadline and cancellation propagate through every service hop.</li>
+  <li>Return HTTP 429, 503, Retry-After, malformed pushback, and permanent errors.</li>
+  <li>Exercise real load-balancer readiness removal, drain, and reconnection behavior.</li>
+  <li>Test duplicate requests arriving simultaneously at different instances and zones.</li>
+  <li>Fill each pool and queue independently to prove bulkhead isolation.</li>
+  <li>Verify breaker and limit configuration remains compatible across rolling versions.</li>
+</ul>
+
+<h3 id="load-tests">Load, stress, spike, and soak tests</h3>
+<ul>
+  <li>
+    Ramp gradually to find the latency knee, maximum useful throughput, and exhausted resource.
+  </li>
+  <li>Jump instantly to peak to reveal cold-cache, connection, and admission behavior.</li>
+  <li>
+    Hold offered load above capacity and verify useful throughput remains stable while excess sheds.
+  </li>
+  <li>Run mixed cheap and expensive operations to test cost-aware fairness.</li>
+  <li>Run one noisy tenant beside normal tenants and measure isolation.</li>
+  <li>Soak below peak to expose leaks, slow queue growth, token drift, and breaker oscillation.</li>
+  <li>
+    Lose a zone at peak and verify the remaining capacity model rather than only failover routing.
+  </li>
+  <li>
+    Measure recovery time after load falls, including queue drain, cache warm-up, and retry decay.
+  </li>
+</ul>
+
+<h3 id="chaos-experiments">Chaos experiment catalog</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Experiment</th>
+        <th>Steady-state hypothesis</th>
+        <th>Injection</th>
+        <th>Abort condition</th>
+        <th>Evidence of success</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Slow inventory shard</td>
+        <td>Other shards meet objective</td>
+        <td>Add 800 ms to 10% of keys</td>
+        <td>Global SLO fast-burn or data error</td>
+        <td>Per-shard breaker and concurrency contain pressure</td>
+      </tr>
+      <tr>
+        <td>Lost success response</td>
+        <td>Reservation effect occurs once</td>
+        <td>Drop response after database commit</td>
+        <td>Duplicate decrement detected</td>
+        <td>Retry returns stored outcome for same key</td>
+      </tr>
+      <tr>
+        <td>Retry storm defense</td>
+        <td>Retries remain below budget</td>
+        <td>Return retriable failure to many clients</td>
+        <td>Attempts exceed dependency safe rate</td>
+        <td>Budget exhausts and original traffic stays measurable</td>
+      </tr>
+      <tr>
+        <td>Queue saturation</td>
+        <td>Memory and useful throughput stay bounded</td>
+        <td>Offer 150% load for five minutes</td>
+        <td>Memory or queue age exceeds safe bound</td>
+        <td>Early shedding replaces timeout accumulation</td>
+      </tr>
+      <tr>
+        <td>Probe starvation</td>
+        <td>Overload does not cause restart cascade</td>
+        <td>Saturate ordinary request workers</td>
+        <td>Ready fleet falls below recovery floor</td>
+        <td>Cheap probes remain responsive and readiness changes are bounded</td>
+      </tr>
+      <tr>
+        <td>Zone loss</td>
+        <td>Core checkout degrades but remains stable</td>
+        <td>Remove one zone at modeled peak</td>
+        <td>Remaining zone exceeds tested saturation</td>
+        <td>Brownout, shedding, and ramp policy preserve useful work</td>
+      </tr>
+      <tr>
+        <td>Cancellation leak</td>
+        <td>Abandoned work stops promptly</td>
+        <td>Disconnect clients during expensive queries</td>
+        <td>Resource use continues past cleanup bound</td>
+        <td>Child calls cancel and permits return</td>
+      </tr>
+      <tr>
+        <td>Cold recovery</td>
+        <td>Fleet warms without re-entering overload</td>
+        <td>Restart a controlled instance group</td>
+        <td>Origin or database pressure reaches danger limit</td>
+        <td>Slow-start traffic and caches warm within RTO</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Start in a representative test environment, then use a tiny production scope with explicit owner,
+  hypothesis, blast radius, observability, abort threshold, and rollback. Never inject an ambiguous
+  write fault without a verified reconciliation path. A chaos test that only confirms alerts is not
+  enough; verify user impact, containment, and recovery.
+</p>
+
+<h3 id="recovery-testing">Recovery testing</h3>
+<ul>
+  <li>
+    Start from a crash-loop with only 10% of instances ready and determine safe admitted traffic.
+  </li>
+  <li>Verify batch producers stay paused while interactive service recovers.</li>
+  <li>Test half-open probe coordination when thousands of clients share one dependency.</li>
+  <li>Warm pools and caches under stepwise traffic and measure pressure at every step.</li>
+  <li>Reconcile all ambiguous commands and prove no duplicate business effects remain.</li>
+  <li>Restore normal policy, remove overrides, and confirm alert and audit closure.</li>
+</ul>
+
+<h2 id="troubleshooting"><span class="num">21.</span> Troubleshooting decision table</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely mechanism</th>
+        <th>Evidence to inspect</th>
+        <th>Safer first action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Latency rises before errors</td>
+        <td>Slow dependency and queue growth</td>
+        <td>In-flight, queue age, downstream latency</td>
+        <td>Reduce concurrency and shed expired or low-priority work</td>
+      </tr>
+      <tr>
+        <td>Traffic exceeds user requests</td>
+        <td>Retry or hedge amplification</td>
+        <td>Attempt type, number, caller, logical operation</td>
+        <td>Disable retries at non-owning layers and drain budget</td>
+      </tr>
+      <tr>
+        <td>Healthy instances fall rapidly</td>
+        <td>Probe failure under overload</td>
+        <td>Probe latency, ready count, per-instance load</td>
+        <td>Reduce admitted load before removing more capacity</td>
+      </tr>
+      <tr>
+        <td>CPU low but requests time out</td>
+        <td>Blocked connections, locks, or external I/O</td>
+        <td>Pool use, wait states, lock and query traces</td>
+        <td>Bound waiters and inspect the deepest dependency</td>
+      </tr>
+      <tr>
+        <td>Memory rises with constant rate</td>
+        <td>Latency-driven concurrency or unbounded queue</td>
+        <td>Bytes per queued and in-flight request</td>
+        <td>Reject early and cancel obsolete work</td>
+      </tr>
+      <tr>
+        <td>Breaker repeatedly opens and closes</td>
+        <td>Recovery probes or thresholds oscillate</td>
+        <td>Sample counts, reopen timing, dependency pressure</td>
+        <td>Reduce half-open concurrency and add hysteresis or jitter</td>
+      </tr>
+      <tr>
+        <td>Duplicate reservation reports</td>
+        <td>Ambiguous retries without atomic deduplication</td>
+        <td>Idempotency identity, transaction and outcome records</td>
+        <td>Stop unsafe retries and reconcile before compensating</td>
+      </tr>
+      <tr>
+        <td>Recovery causes a second outage</td>
+        <td>Cold start or simultaneous traffic ramp</td>
+        <td>Cache misses, connection creation, ramp history</td>
+        <td>Drop traffic sharply, warm, then increase in steps</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="mistakes"><span class="num">22.</span> Common mistakes and safer corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>No explicit deadline</td>
+        <td>Resources remain held after results lose value</td>
+        <td>Derive and propagate an end-to-end deadline</td>
+      </tr>
+      <tr>
+        <td>One timeout reused for every retry</td>
+        <td>Total time exceeds user budget</td>
+        <td>Allocate attempt slices inside one deadline</td>
+      </tr>
+      <tr>
+        <td>Retry every 5xx or RPC error</td>
+        <td>Permanent and overload errors receive more load</td>
+        <td>Classify errors and operation semantics explicitly</td>
+      </tr>
+      <tr>
+        <td>Three retries at every layer</td>
+        <td>Attempts multiply across the call graph</td>
+        <td>Choose one retry owner and enforce aggregate budget</td>
+      </tr>
+      <tr>
+        <td>Exponential backoff without jitter</td>
+        <td>Clients remain synchronized</td>
+        <td>Use randomized capped backoff</td>
+      </tr>
+      <tr>
+        <td>Retry a write because it timed out</td>
+        <td>The first attempt may have committed</td>
+        <td>Use atomic idempotency or query the outcome</td>
+      </tr>
+      <tr>
+        <td>Hedge every slow request</td>
+        <td>Duplicate load worsens shared slowness</td>
+        <td>Hedge only measured independent tails under budget</td>
+      </tr>
+      <tr>
+        <td>One giant shared pool</td>
+        <td>One dependency or tenant consumes all capacity</td>
+        <td>Bulkhead by workload and failure domain</td>
+      </tr>
+      <tr>
+        <td>Unbounded queue for reliability</td>
+        <td>Overload becomes latency, stale work, and memory failure</td>
+        <td>Bound count, bytes, age, and priority</td>
+      </tr>
+      <tr>
+        <td>Rate limit without concurrency limit</td>
+        <td>Slow calls still accumulate</td>
+        <td>Control both arrival rate and simultaneous work</td>
+      </tr>
+      <tr>
+        <td>Deep liveness check</td>
+        <td>Shared dependency failure restarts all callers</td>
+        <td>Keep liveness local; expose deep diagnostics separately</td>
+      </tr>
+      <tr>
+        <td>Fail all readiness during overload</td>
+        <td>Load concentrates on fewer instances</td>
+        <td>Shed locally and coordinate minimum ready capacity</td>
+      </tr>
+      <tr>
+        <td>Fallback without cost analysis</td>
+        <td>The fallback dependency fails next</td>
+        <td>Prove fallback is safe, cheaper, and capacity-bounded</td>
+      </tr>
+      <tr>
+        <td>Scale callers during downstream overload</td>
+        <td>More callers create more dependency pressure</td>
+        <td>Scale the bottleneck or cap calls to it</td>
+      </tr>
+      <tr>
+        <td>Alert on every rejection</td>
+        <td>Expected safety behavior pages operators</td>
+        <td>Alert on user objective burn and sustained dangerous pressure</td>
+      </tr>
+      <tr>
+        <td>Restore all traffic at once</td>
+        <td>Cold caches and pools cause a second collapse</td>
+        <td>Warm and ramp traffic in measured stages</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="exercises"><span class="num">23.</span> Hands-on exercises and design scenarios</h2>
+
+<h3>Exercise 1: Retry policy review</h3>
+<p>
+  A mobile client, gateway, order service, and database driver each make three total attempts. Draw
+  the worst-case attempt tree. Expected reasoning: one action can cause 81 database attempts if four
+  layers each make three attempts. Choose one semantic owner, disable hidden retries elsewhere, keep
+  a shared deadline, and use an aggregate retry budget.
+</p>
+
+<h3>Exercise 2: Deadline allocator</h3>
+<p>
+  Allocate a 700 ms search deadline across gateway work, query parsing, three parallel shards,
+  ranking, and response transfer. Expected reasoning: parallel shards share a wall-clock slice
+  rather than adding their budgets; reserve final response time; pass remaining time; cancel
+  stragglers; and return partial results only if the contract marks them clearly and safely.
+</p>
+
+<h3>Exercise 3: Ambiguous payment outcome</h3>
+<p>
+  Inject a connection loss immediately after the payment database commits. Expected reasoning: the
+  client cannot infer failure from timeout. Use one authenticated idempotency key, atomic outcome
+  storage, an outcome-query API, duplicate-race tests, retention, and reconciliation. Do not issue
+  an automatic refund until the original outcome is known.
+</p>
+
+<h3>Exercise 4: Queue capacity</h3>
+<p>
+  A worker completes 800 jobs/s and receives 1,000 jobs/s for 90 seconds. Jobs average 20 KB and
+  must start within 10 seconds. Expected reasoning: backlog grows by 18,000 jobs and about 360 MB,
+  but the deadline allows only about 8,000 jobs at 800/s. A larger queue violates usefulness; shed,
+  pause the producer, or add verified capacity before the oldest age reaches 10 seconds.
+</p>
+
+<h3>Exercise 5: Concurrency estimation</h3>
+<p>
+  An API handles 5,000 requests/s at 80 ms average, then a dependency slows to 600 ms. Expected
+  reasoning: average in-flight work grows from about 400 to 3,000 if arrivals remain constant. Bound
+  dependency concurrency, reject before queues become useless, and measure tail latency and bytes,
+  not only the average.
+</p>
+
+<h3>Exercise 6: Health-check cascade</h3>
+<p>
+  During a database slowdown, readiness fails on half the API instances and liveness restarts them.
+  Expected reasoning: deep probes coupled caller health to dependency health; capacity removal and
+  cold restarts intensify overload. Keep liveness local, make readiness deliberate, shed traffic,
+  protect minimum ready capacity, and drain instead of restart where possible.
+</p>
+
+<h3>Exercise 7: Multi-tenant overload design</h3>
+<p>
+  One tenant sends expensive export requests while all tenants use interactive reads. Expected
+  reasoning: authenticate, assign cost weights, isolate export and interactive pools, enforce tenant
+  and global concurrency, persist exports only if asynchronous completion is contractual, reserve
+  control capacity, and test noisy-neighbor isolation.
+</p>
+
+<h3>Exercise 8: Recovery game day</h3>
+<p>
+  Start with 90% of inventory instances crash-looping under a retry storm. Expected reasoning:
+  freeze changes, stop retries and batch work, admit a very small critical fraction, stabilize and
+  warm the fleet, repair the trigger, ramp in steps, restore optional work, then retries, and
+  reconcile ambiguous writes. Record abort criteria and recovery time.
+</p>
+
+<h2 id="interview"><span class="num">24.</span> Interview questions and model answers</h2>
+
+<h3>1. What is the difference between a timeout and a deadline?</h3>
+<p>
+  A timeout is a maximum duration for one wait or attempt. A deadline is the absolute end of the
+  whole logical operation. A strong design propagates remaining deadline through queues, retries,
+  and child calls, so each hop cannot restart the user's entire budget.
+</p>
+<p><strong>Follow-up:</strong> What clock should measure elapsed time?</p>
+<p>
+  Use a monotonic clock locally. Across RPC boundaries, protocols can transmit remaining duration or
+  compensate for elapsed time to avoid relying on perfectly synchronized wall clocks.
+</p>
+
+<h3>2. Which failures should be retried?</h3>
+<p>
+  Retry only when the error can plausibly be transient, the operation is idempotent or deduplicated,
+  enough deadline remains, pushback permits it, and both attempt and aggregate retry budgets allow
+  it. Do not retry invalid input, permission failures, exhausted deadlines, or preconditions that
+  need a state change.
+</p>
+
+<h3>3. Why is a timed-out write ambiguous?</h3>
+<p>
+  The caller knows only that it did not receive a timely response. The server may never have
+  received the request, may still be processing it, or may have committed and lost the response.
+  Resolve this with stable operation identity, atomic outcome storage, and an outcome lookup or
+  reconciliation process.
+</p>
+
+<h3>4. Explain exponential backoff and jitter.</h3>
+<p>
+  Exponential backoff increases delay between attempts, reducing pressure during a persistent fault.
+  A cap keeps delay bounded. Jitter randomizes the schedule so clients that failed together do not
+  retry together. It does not make an unsafe or overloaded retry safe, so eligibility and budgets
+  still come first.
+</p>
+
+<h3>5. What is a retry budget?</h3>
+<p>
+  It is an aggregate limit on retries across many requests, often expressed as a small fraction of
+  original attempts over a window. Per-request attempt limits cannot stop millions of clients from
+  each making one retry. A budget drains as failures rise and prevents retries from consuming all
+  remaining capacity.
+</p>
+
+<h3>6. When is request hedging appropriate?</h3>
+<p>
+  For idempotent, relatively cheap operations whose tail delay is rare and independent across
+  replicas. Send a delayed second attempt near a measured tail percentile, choose another failure
+  domain, share the original deadline and budget, and cancel losers. Avoid it during shared
+  overload, expensive work, or ambiguous writes.
+</p>
+
+<h3>7. How does a circuit breaker work?</h3>
+<p>
+  Closed passes calls and measures eligible failures. Open fails fast for a cool-down. Half-open
+  admits a bounded probe set; sufficient success closes it and failure reopens it. Scope it by
+  dependency and operation, require a minimum sample, add jitter, and do not treat it as a
+  substitute for proactive concurrency control.
+</p>
+
+<h3>8. What is the bulkhead pattern?</h3>
+<p>
+  It partitions resources so one failure cannot consume everything, such as separate connection and
+  concurrency pools for checkout and analytics. The cost is stranded capacity and more operations.
+  The correct boundary follows workload priority, dependency, tenant, and failure domain.
+</p>
+
+<h3>9. Why does an unbounded queue reduce resilience?</h3>
+<p>
+  It hides sustained overload as growing wait. Requests can expire while queued, memory grows, and
+  recovery takes longer because obsolete work remains. Bound item count, bytes, age, and priority;
+  then reject, degrade, or slow producers when the bound is reached.
+</p>
+
+<h3>10. Backpressure versus load shedding?</h3>
+<p>
+  Backpressure asks upstream to reduce production and works only when the signal propagates and is
+  obeyed. Load shedding rejects or drops selected work when demand still exceeds safe capacity. A
+  system often needs both: slow controllable producers and shed uncontrollable excess.
+</p>
+
+<h3>11. Rate limit versus concurrency limit?</h3>
+<p>
+  A rate limit bounds starts per time and is useful for quotas and bursts. A concurrency limit
+  bounds simultaneous resource holders and responds directly to slow operations. At a constant
+  arrival rate, a tenfold latency increase can cause tenfold concurrency, so resilient services
+  usually need both.
+</p>
+
+<h3>12. How do you choose a concurrency limit?</h3>
+<p>
+  Load test representative work to find the useful-throughput and latency knee, then reserve
+  headroom for bursts and failures. Split by operation cost and dependency. A fixed limit is a safe
+  start; an adaptive controller may adjust within tested bounds using queueing delay and errors.
+</p>
+
+<h3>13. How can health checks create a cascade?</h3>
+<p>
+  If normal overload delays deep probes, instances become unready or restart. Their traffic moves to
+  fewer instances, which then fail too. Use cheap local liveness, separate readiness, thresholds,
+  minimum ready capacity, and early shedding. Do not restart every caller because a shared
+  dependency is down.
+</p>
+
+<h3>14. Why can adding replicas worsen an outage?</h3>
+<p>
+  Failover shifts traffic to remaining replicas that may lack headroom. New replicas may be cold and
+  create cache-fill or connection storms. More caller replicas can also amplify load on a fixed
+  database. Model capacity after failure, warm slowly, and limit downstream concurrency globally.
+</p>
+
+<h3>15. What makes a fallback safe?</h3>
+<p>
+  It preserves required correctness, authorization, and privacy; costs less than the primary path;
+  has its own capacity bound and deadline; clearly communicates degraded semantics; and is regularly
+  tested. Returning another tenant's cache, assuming a payment succeeded, or flooding the database
+  is not a fallback.
+</p>
+
+<h3>16. How would you detect a retry storm?</h3>
+<p>
+  Separate logical requests, first attempts, retries, and hedges. Look for attempts rising faster
+  than original traffic, retry-budget exhaustion, lower first-attempt success, growing dependency
+  load, and repeated attempts in traces. Mitigate by stopping retries at non-owning layers and
+  reducing offered load.
+</p>
+
+<h3>17. How do you recover a crash-looping overloaded service?</h3>
+<p>
+  Stop retries and nonessential producers, sharply reduce admitted traffic, repair or revert the
+  trigger, let a meaningful fraction of capacity start and warm, then ramp traffic in small measured
+  steps. Restore optional work and retry budgets last. Verify useful throughput and data
+  reconciliation, not only process health.
+</p>
+
+<h3>18. Design resilience for a checkout inventory call.</h3>
+<p>
+  Clarify latency, oversell, and availability promises. Use an end-to-end deadline, authenticated
+  idempotency key, atomic stored outcome, zone-aware routing, per-tenant and dependency concurrency,
+  a short bounded queue, one budgeted retry owner, a per-shard breaker, and explicit overload
+  responses. Degrade optional features, preserve audit evidence, monitor attempts and useful
+  throughput, test ambiguous commits and zone loss, and document staged recovery.
+</p>
+<p><strong>Follow-up:</strong> Would you serve stale inventory?</p>
+<p>
+  Stale inventory can be a browsing hint, but final reservation must validate authoritative stock.
+  The answer depends on the business cost of oversell and whether a pending order state is
+  supported.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">25.</span> Revision cheat sheet</h2>
+<ul>
+  <li>Resilience contains faults, preserves useful work, and enables controlled recovery.</li>
+  <li>Classify transient, permanent, partial, slow, ambiguous, and corrupt failures.</li>
+  <li>A timeout bounds one wait; a deadline bounds the whole operation.</li>
+  <li>Cancellation must propagate and application work must cooperate.</li>
+  <li>A timeout does not prove a write failed; use atomic idempotency or outcome lookup.</li>
+  <li>Retry only eligible operations and errors within attempt, time, and aggregate budgets.</li>
+  <li>Use capped exponential backoff with jitter and respect server pushback.</li>
+  <li>Retries at multiple layers multiply, so choose one semantic owner.</li>
+  <li>Hedging targets rare independent tail delay and must cancel losing attempts.</li>
+  <li>Circuit breaker states are closed, open, and half-open; probes must be bounded.</li>
+  <li>Bulkheads isolate pools, queues, tenants, workloads, and failure domains.</li>
+  <li>A fallback must be safe, cheaper, bounded, explicit, and exercised.</li>
+  <li>A queue absorbs a finite burst but cannot add sustained service capacity.</li>
+  <li>Bound queue count, bytes, age, priority, and tenant share.</li>
+  <li>Backpressure slows producers; load shedding rejects unavoidable excess.</li>
+  <li>Rate limits control starts; concurrency limits control simultaneous resource use.</li>
+  <li>Size capacity for zone loss and cold recovery, not only normal average load.</li>
+  <li>Protect useful throughput beyond the queueing knee by rejecting early.</li>
+  <li>Cheap local liveness and deliberate readiness avoid capacity-removal cascades.</li>
+  <li>Retries, replicas, caches, health checks, and autoscaling can amplify outages.</li>
+  <li>
+    Observe original load, attempts, useful completions, queues, limits, and rejection reasons.
+  </li>
+  <li>Recover by cutting load, repairing the deepest fault, warming, and ramping gradually.</li>
+  <li>Chaos tests need a hypothesis, narrow blast radius, abort rule, and recovery proof.</li>
+</ul>
+
+<h2 id="references"><span class="num">26.</span> Primary official references</h2>
+<ul>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9110.html">IETF RFC 9110: HTTP Semantics</a>
+    - safe and idempotent methods, 503 Service Unavailable, and Retry-After semantics.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc6585.html"
+      >IETF RFC 6585: Additional HTTP Status Codes</a
+    >
+    - 429 Too Many Requests and optional retry guidance.
+  </li>
+  <li>
+    <a href="https://grpc.io/docs/guides/deadlines/">gRPC official deadline guide</a>
+    - deadline selection, server cancellation, and deadline propagation.
+  </li>
+  <li>
+    <a href="https://grpc.io/docs/guides/cancellation/">gRPC official cancellation guide</a>
+    - cooperative cancellation and propagation through a call graph.
+  </li>
+  <li>
+    <a href="https://grpc.io/docs/guides/retry/">gRPC official retry guide</a>
+    - retry policy, throttling, backoff, and server pushback.
+  </li>
+  <li>
+    <a href="https://grpc.io/docs/guides/request-hedging/">gRPC official request hedging guide</a>
+    - delayed parallel attempts, throttling, deadlines, and cancellation.
+  </li>
+  <li>
+    <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+      >Amazon Builders' Library: Timeouts, retries, and backoff with jitter</a
+    >
+    - timeout selection, retry amplification, token budgets, backoff, and jitter.
+  </li>
+  <li>
+    <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/"
+      >Amazon Builders' Library: Using load shedding to avoid overload</a
+    >
+    - admission, overload rejection, fairness, and operating beyond capacity.
+  </li>
+  <li>
+    <a href="https://sre.google/sre-book/addressing-cascading-failures/"
+      >Google SRE Book: Addressing Cascading Failures</a
+    >
+    - resource exhaustion, retry amplification, queue control, degradation, and recovery.
+  </li>
+  <li>
+    <a href="https://sre.google/sre-book/handling-overload/">Google SRE Book: Handling Overload</a>
+    - client-side admission, request cost, and graceful overload behavior.
+  </li>
+  <li>
+    <a href="https://github.com/reactive-streams/reactive-streams-jvm"
+      >Reactive Streams official specification</a
+    >
+    - asynchronous demand, mandatory non-blocking backpressure, and bounded buffers.
+  </li>
+  <li>
+    <a href="https://kubernetes.io/docs/concepts/workloads/pods/probes/"
+      >Kubernetes official probe documentation</a
+    >
+    - startup, liveness, and readiness behavior plus cascading-failure cautions.
+  </li>
+  <li>
+    <a href="https://pkg.go.dev/context">Go standard library: context</a>
+    - request-scoped deadlines, cancellation signals, and propagation.
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Flow.html"
+      >Java SE Flow API</a
+    >
+    - standard Publisher, Subscriber, Subscription, and demand interfaces.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
