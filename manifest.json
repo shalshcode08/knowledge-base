@@ -128,6 +128,10 @@
         {
           "title": "Caching and Content Delivery",
           "path": "systemdesign/caching-content-delivery"
+        },
+        {
+          "title": "Distributed-Systems Fundamentals, Time, Ordering, and Consistency",
+          "path": "systemdesign/distributed-systems-time-ordering-consistency"
         }
       ]
     }
