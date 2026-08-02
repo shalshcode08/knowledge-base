@@ -136,6 +136,10 @@
         {
           "title": "Replication, Partitioning, Sharding, and Quorum Systems",
           "path": "systemdesign/replication-partitioning-sharding-quorum-systems"
+        },
+        {
+          "title": "Resilience, Retries, Backpressure, and Overload Control",
+          "path": "systemdesign/resilience-retries-backpressure-overload"
         }
       ]
     }
