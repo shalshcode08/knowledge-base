@@ -138,6 +138,10 @@
           "path": "systemdesign/replication-partitioning-sharding-quorum-systems"
         },
         {
+          "title": "Coordination, Consensus, Leader Election, Leases, and Distributed Locks",
+          "path": "systemdesign/coordination-consensus-leases-locks"
+        },
+        {
           "title": "Resilience, Retries, Backpressure, and Overload Control",
           "path": "systemdesign/resilience-retries-backpressure-overload"
         }
