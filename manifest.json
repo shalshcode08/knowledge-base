@@ -140,6 +140,10 @@
         {
           "title": "Resilience, Retries, Backpressure, and Overload Control",
           "path": "systemdesign/resilience-retries-backpressure-overload"
+        },
+        {
+          "title": "Distributed Transactions, Sagas, Outbox, and Reliable Workflows",
+          "path": "systemdesign/distributed-transactions-sagas-outbox-reliable-workflows"
         }
       ]
     }
