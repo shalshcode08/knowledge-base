@@ -140,6 +140,10 @@
         {
           "title": "Resilience, Retries, Backpressure, and Overload Control",
           "path": "systemdesign/resilience-retries-backpressure-overload"
+        },
+        {
+          "title": "Observability, SRE, Capacity Planning, and Incident Response",
+          "path": "systemdesign/observability-sre-capacity-planning-incident-response"
         }
       ]
     }
