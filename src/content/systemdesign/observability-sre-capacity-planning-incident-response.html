@@ -60,12 +60,17 @@
       </tr>
       <tr>
         <td>Incident</td>
-        <td>An event requiring coordinated response because service, security, or business risk exceeds normal handling</td>
+        <td>
+          An event requiring coordinated response because service, security, or business risk
+          exceeds normal handling
+        </td>
         <td>Every individual error or warning log</td>
       </tr>
       <tr>
         <td>Capacity</td>
-        <td>Sustainable work under explicit latency, correctness, safety, and failure assumptions</td>
+        <td>
+          Sustainable work under explicit latency, correctness, safety, and failure assumptions
+        </td>
         <td>The highest one-second benchmark result</td>
       </tr>
       <tr>
@@ -86,7 +91,9 @@
   </ol>
 </div>
 
-<h2 id="signal-model"><span class="num">01.</span> Signals: logs, metrics, traces, profiles, and events</h2>
+<h2 id="signal-model">
+  <span class="num">01.</span> Signals: logs, metrics, traces, profiles, and events
+</h2>
 <p class="lead">
   No single signal is sufficient. Each compresses reality differently and answers a different class
   of question.
@@ -142,8 +149,8 @@
   Emit a stable record with timestamp, severity, event name, service, version, environment,
   operation, outcome, duration, trace and span identifiers, and safe domain identifiers. Prefer
   fields such as <code>outcome="timeout"</code> over parsing prose. Keep a human-readable message,
-  but do not make it the only queryable data. Log once at the boundary that can add meaning. If
-  five layers log the same exception, volume rises while evidence does not.
+  but do not make it the only queryable data. Log once at the boundary that can add meaning. If five
+  layers log the same exception, volume rises while evidence does not.
 </p>
 
 <figure class="code">
@@ -208,14 +215,25 @@
 
 <h3 id="metric-types">Metrics and distributions</h3>
 <ul>
-  <li><strong>Counter:</strong> cumulative events, such as requests or failures. Calculate a rate over time.</li>
-  <li><strong>Gauge:</strong> a value that rises and falls, such as queue depth or active requests.</li>
-  <li><strong>Histogram:</strong> observations aggregated into buckets, count, and sum. It supports fleet aggregation and percentile estimates.</li>
-  <li><strong>Summary:</strong> client-side quantiles in some systems. Precomputed quantiles generally cannot be meaningfully averaged across instances.</li>
+  <li>
+    <strong>Counter:</strong> cumulative events, such as requests or failures. Calculate a rate over
+    time.
+  </li>
+  <li>
+    <strong>Gauge:</strong> a value that rises and falls, such as queue depth or active requests.
+  </li>
+  <li>
+    <strong>Histogram:</strong> observations aggregated into buckets, count, and sum. It supports
+    fleet aggregation and percentile estimates.
+  </li>
+  <li>
+    <strong>Summary:</strong> client-side quantiles in some systems. Precomputed quantiles generally
+    cannot be meaningfully averaged across instances.
+  </li>
 </ul>
 <p>
-  Use base units, explicit names, and semantic conventions. Initialize expected zero-valued series so
-  absence does not look like zero activity. Never average averages without their counts. A 2 ms
+  Use base units, explicit names, and semantic conventions. Initialize expected zero-valued series
+  so absence does not look like zero activity. Never average averages without their counts. A 2 ms
   average from 10 requests and a 200 ms average from 10,000 requests do not have equal weight.
 </p>
 
@@ -224,8 +242,8 @@
   A trace represents a distributed operation. A span represents one timed operation with a parent,
   start and end times, attributes, events, status, and resource identity. Parent-child edges model a
   call path. A span link models a causal relationship that is not a strict parent, such as a batch
-  consumer processing records produced by several traces. Record meaningful logical operations,
-  not every function. A database span should identify the database system and operation safely, but
+  consumer processing records produced by several traces. Record meaningful logical operations, not
+  every function. A database span should identify the database system and operation safely, but
   should not contain secrets or raw unbounded statements.
 </p>
 
@@ -248,8 +266,9 @@
   A correlation ID groups records chosen by the application. A trace ID identifies a distributed
   trace; a span ID identifies one operation inside it. They can coexist. Do not replace an existing
   valid trace context with a new ID at every hop. The W3C Trace Context recommendation defines the
-  <code>traceparent</code> and <code>tracestate</code> HTTP headers. Validate incoming values, create a
-  new trace when invalid, and treat caller-provided sampling flags as advice rather than authority.
+  <code>traceparent</code> and <code>tracestate</code> HTTP headers. Validate incoming values,
+  create a new trace when invalid, and treat caller-provided sampling flags as advice rather than
+  authority.
 </p>
 
 <figure class="code">
@@ -271,8 +290,8 @@ API gateway span S2
 
 <p>
   Propagate the remaining deadline and cancellation separately from trace context. Propagate only
-  allowlisted baggage. Baggage travels downstream and may cross an unexpected trust boundary, has
-  no built-in integrity guarantee, and does not automatically become a span attribute. Never place
+  allowlisted baggage. Baggage travels downstream and may cross an unexpected trust boundary, has no
+  built-in integrity guarantee, and does not automatically become a span attribute. Never place
   credentials, raw personal data, payment details, or authorization decisions in baggage. A tenant
   hint from an untrusted caller must not decide access control.
 </p>
@@ -282,12 +301,20 @@ API gateway span S2
   <li>Capture context when work is submitted, not when a pooled worker eventually starts it.</li>
   <li>Detach background work from an expired request when it has an independent lifecycle.</li>
   <li>For retries, preserve one logical trace but create a span for each physical attempt.</li>
-  <li>For fan-out, create sibling spans and retain cancellation. Do not reuse one mutable span concurrently.</li>
+  <li>
+    For fan-out, create sibling spans and retain cancellation. Do not reuse one mutable span
+    concurrently.
+  </li>
   <li>For queues, record producer, broker wait, consumer, message identity, attempt, and age.</li>
-  <li>For batch consumption, use links when one consumer operation represents multiple producer contexts.</li>
+  <li>
+    For batch consumption, use links when one consumer operation represents multiple producer
+    contexts.
+  </li>
 </ul>
 
-<h2 id="pipeline"><span class="num">03.</span> Telemetry pipeline, sampling, cardinality, and retention</h2>
+<h2 id="pipeline">
+  <span class="num">03.</span> Telemetry pipeline, sampling, cardinality, and retention
+</h2>
 <p class="lead">
   The telemetry path is another distributed system. It needs capacity, security, backpressure,
   failure visibility, and explicit loss behavior.
@@ -311,11 +338,11 @@ Metric store   Log store       Trace store      Profile store
 </figure>
 
 <p>
-  Prefer asynchronous bounded export so an unavailable backend cannot block business requests.
-  Track records accepted, exported, retried, refused, and dropped at every hop. Disk buffering can
-  bridge a short outage but creates persistence, encryption, cleanup, and full-disk risks. Decide
-  whether to drop oldest, newest, or low-priority telemetry when buffers fill. Business service
-  should usually continue while clearly reporting observability loss.
+  Prefer asynchronous bounded export so an unavailable backend cannot block business requests. Track
+  records accepted, exported, retried, refused, and dropped at every hop. Disk buffering can bridge
+  a short outage but creates persistence, encryption, cleanup, and full-disk risks. Decide whether
+  to drop oldest, newest, or low-priority telemetry when buffers fill. Business service should
+  usually continue while clearly reporting observability loss.
 </p>
 
 <h3 id="sampling">Head and tail sampling</h3>
@@ -367,17 +394,26 @@ Metric store   Log store       Trace store      Profile store
 
 <h3 id="cardinality">Cardinality is multiplicative</h3>
 <p>
-  Metric cardinality is the number of unique label combinations. With 8 routes, 5 status classes,
-  4 regions, 3 versions, and 20 tenants, one metric can create
-  <code>8 * 5 * 4 * 3 * 20 = 9,600</code> time series. Add an unbounded user ID or request ID and the
-  state can grow with traffic. High cardinality consumes SDK memory, network, storage, query CPU,
-  and dashboard time.
+  Metric cardinality is the number of unique label combinations. With 8 routes, 5 status classes, 4
+  regions, 3 versions, and 20 tenants, one metric can create
+  <code>8 * 5 * 4 * 3 * 20 = 9,600</code> time series. Add an unbounded user ID or request ID and
+  the state can grow with traffic. High cardinality consumes SDK memory, network, storage, query
+  CPU, and dashboard time.
 </p>
 <ul>
-  <li>Metrics: use bounded dimensions such as normalized route, status class, region, and version.</li>
-  <li>Traces and logs: keep request-level identity where policy allows and retention is controlled.</li>
-  <li>Never label metrics with raw URL paths, timestamps, stack traces, message IDs, or user IDs.</li>
-  <li>Set SDK and backend cardinality limits, then alert on overflow rather than silently trusting partial series.</li>
+  <li>
+    Metrics: use bounded dimensions such as normalized route, status class, region, and version.
+  </li>
+  <li>
+    Traces and logs: keep request-level identity where policy allows and retention is controlled.
+  </li>
+  <li>
+    Never label metrics with raw URL paths, timestamps, stack traces, message IDs, or user IDs.
+  </li>
+  <li>
+    Set SDK and backend cardinality limits, then alert on overflow rather than silently trusting
+    partial series.
+  </li>
 </ul>
 
 <h3 id="retention">Retention and telemetry tiers</h3>
@@ -537,10 +573,19 @@ exclude only:
 
 <h3 id="windows">Window choices</h3>
 <ul>
-  <li><strong>Rolling window:</strong> every moment covers the preceding duration. It avoids a reset boundary but changes continuously.</li>
-  <li><strong>Calendar window:</strong> aligns with reporting or billing, but behavior near month boundaries can be misleading.</li>
+  <li>
+    <strong>Rolling window:</strong> every moment covers the preceding duration. It avoids a reset
+    boundary but changes continuously.
+  </li>
+  <li>
+    <strong>Calendar window:</strong> aligns with reporting or billing, but behavior near month
+    boundaries can be misleading.
+  </li>
   <li><strong>Request-based budget:</strong> weights every eligible request equally.</li>
-  <li><strong>Time-based budget:</strong> counts good time slices and can hide severe low-volume failures.</li>
+  <li>
+    <strong>Time-based budget:</strong> counts good time slices and can hide severe low-volume
+    failures.
+  </li>
 </ul>
 
 <h3 id="budget-math">Error-budget math</h3>
@@ -558,9 +603,8 @@ Time intuition only, if traffic and impact were uniform:
 <p>
   Request-based objectives do not literally grant a fixed number of outage minutes. A five-minute
   failure during peak traffic consumes more budget than one during quiet traffic. Error budgets are
-  decision tools: when healthy, teams may accept measured release risk; when rapidly depleted,
-  teams prioritize reliability, reduce change risk, or stop risky launches under a pre-agreed
-  policy.
+  decision tools: when healthy, teams may accept measured release risk; when rapidly depleted, teams
+  prioritize reliability, reduce change risk, or stop risky launches under a pre-agreed policy.
 </p>
 
 <h2 id="availability"><span class="num">06.</span> Availability math and dependency objectives</h2>
@@ -602,8 +646,8 @@ Time intuition only, if traffic and impact were uniform:
   Independence is often false. Replicas may share power, network, identity, configuration, release,
   certificate, storage, or operator error. Measure common-mode failure and place capacity across
   real failure domains. A service should not promise an objective that its critical serial
-  dependencies make mathematically implausible. Negotiate dependency objectives, timeouts,
-  support, maintenance, and overload behavior, then preserve end-to-end budget for application work.
+  dependencies make mathematically implausible. Negotiate dependency objectives, timeouts, support,
+  maintenance, and overload behavior, then preserve end-to-end budget for application work.
 </p>
 
 <p>
@@ -636,8 +680,8 @@ At a sustained 14x burn, a 28-day budget is consumed in:
   A short window detects severe new failures quickly but is noisy. A long window is stable but slow.
   Multi-window, multi-burn-rate alerting combines them. A page might require both a high burn in a
   one-hour window and confirmation in a five-minute window. A lower-burn ticket can use a six-hour
-  and thirty-minute pair. Exact thresholds follow the objective, response speed, traffic volume,
-  and team's tested ability to act.
+  and thirty-minute pair. Exact thresholds follow the objective, response speed, traffic volume, and
+  team's tested ability to act.
 </p>
 
 <div class="tbl">
@@ -691,8 +735,12 @@ At a sustained 14x burn, a 28-day budget is consumed in:
 <ul>
   <li>Place bucket boundaries around SLO thresholds and known latency modes.</li>
   <li>Use the same mergeable boundaries across instances when aggregating classic histograms.</li>
-  <li>Keep enough resolution near the threshold. A 100 to 500 ms bucket cannot resolve a 250 ms SLO.</li>
-  <li>Do not average instance p99 values. Aggregate distributions, then calculate a fleet percentile.</li>
+  <li>
+    Keep enough resolution near the threshold. A 100 to 500 ms bucket cannot resolve a 250 ms SLO.
+  </li>
+  <li>
+    Do not average instance p99 values. Aggregate distributions, then calculate a fleet percentile.
+  </li>
   <li>Ensure the query window has enough observations. p99 from 20 requests is unstable.</li>
   <li>Track client and server duration separately to reveal network and queueing gaps.</li>
 </ul>
@@ -701,10 +749,10 @@ At a sustained 14x burn, a 28-day budget is consumed in:
 <p>
   If an operation waits for all 50 independent subrequests and each has a 1% probability of being
   slow, the probability that at least one is slow is
-  <code>1 - 0.99^50</code>, about 39.5%. Independence is only an approximation, but the lesson holds:
-  wide fan-out makes component tail behavior become common end-to-end behavior. Reduce fan-out,
-  batch, cache, use partial results where semantically safe, set deadlines, and observe the slowest
-  child span.
+  <code>1 - 0.99^50</code>, about 39.5%. Independence is only an approximation, but the lesson
+  holds: wide fan-out makes component tail behavior become common end-to-end behavior. Reduce
+  fan-out, batch, cache, use partial results where semantically safe, set deadlines, and observe the
+  slowest child span.
 </p>
 
 <h2 id="queueing"><span class="num">09.</span> Saturation, queueing, and Little's Law</h2>
@@ -740,9 +788,9 @@ implied mean time = 800 / 800 = 1 second</code></pre>
 <p>
   A queue absorbs a finite burst but adds no sustained service capacity. If arrivals are 1,200 per
   second and service capacity is 1,000 per second, backlog grows by 200 every second. After one
-  minute, 12,000 requests wait. At 1,000 completions per second, the newest request already has about
-  12 seconds of queueing ahead of it, even before processing. Bound count, bytes, age, tenant share,
-  and priority. Reject early when the result cannot meet its deadline.
+  minute, 12,000 requests wait. At 1,000 completions per second, the newest request already has
+  about 12 seconds of queueing ahead of it, even before processing. Bound count, bytes, age, tenant
+  share, and priority. Reject early when the result cannot meet its deadline.
 </p>
 
 <h3 id="bottleneck-law">Bottleneck capacity</h3>
@@ -763,7 +811,9 @@ implied mean time = 800 / 800 = 1 second</code></pre>
 <h3 id="workload-model">1. Model workload shape</h3>
 <ul>
   <li>Current average, p95 interval, daily peak, event peak, and peak-to-average ratio.</li>
-  <li>Reads, writes, payload bytes, fan-out, cache hit ratio, tenant skew, and expensive routes.</li>
+  <li>
+    Reads, writes, payload bytes, fan-out, cache hit ratio, tenant skew, and expensive routes.
+  </li>
   <li>Steady, burst, seasonal, launch, replay, recovery, and background workloads.</li>
   <li>Regions and zones, dependency limits, connection counts, data growth, and retention.</li>
   <li>Correctness and latency objectives that define the capacity boundary.</li>
@@ -866,7 +916,10 @@ These are service-demand floors, not deployable capacity.</code></pre>
   <li>Forecast per workload and resource driver, not only total requests.</li>
   <li>Produce expected, high, and stress scenarios with documented assumptions.</li>
   <li>Convert the forecast into an exhaustion date using the tested safe limit and reserve.</li>
-  <li>Subtract procurement, migration, validation, rollout, and rollback lead time to get a decision date.</li>
+  <li>
+    Subtract procurement, migration, validation, rollout, and rollback lead time to get a decision
+    date.
+  </li>
   <li>Compare predictions with actuals and recalibrate demand coefficients regularly.</li>
 </ol>
 
@@ -888,7 +941,9 @@ These are service-demand floors, not deployable capacity.</code></pre>
   </p>
 </div>
 
-<h2 id="experiments"><span class="num">12.</span> Load, stress, soak, scalability, chaos, and recovery tests</h2>
+<h2 id="experiments">
+  <span class="num">12.</span> Load, stress, soak, scalability, chaos, and recovery tests
+</h2>
 <div class="tbl">
   <table>
     <thead>
@@ -984,16 +1039,26 @@ Recovery proof:
 </figure>
 
 <h2 id="dashboards"><span class="num">13.</span> Dashboards and actionable alerts</h2>
-<p class="lead">
-  A dashboard supports a decision. An alert demands a specific human response.
-</p>
+<p class="lead">A dashboard supports a decision. An alert demands a specific human response.</p>
 
 <h3 id="dashboard-layers">Dashboard layers</h3>
 <ol>
-  <li><strong>Service overview:</strong> SLO attainment, current burn, traffic, tail latency, errors, saturation, deployments, and regions.</li>
-  <li><strong>Dependency view:</strong> caller-observed rate, duration, errors, deadlines, retries, and breaker or limit state.</li>
-  <li><strong>Resource view:</strong> CPU, memory, garbage collection, connections, queue wait, disk, network, and per-instance skew.</li>
-  <li><strong>Capacity view:</strong> forecast, safe limits, failure reserve, lead time, cost per good operation, and backlog drain time.</li>
+  <li>
+    <strong>Service overview:</strong> SLO attainment, current burn, traffic, tail latency, errors,
+    saturation, deployments, and regions.
+  </li>
+  <li>
+    <strong>Dependency view:</strong> caller-observed rate, duration, errors, deadlines, retries,
+    and breaker or limit state.
+  </li>
+  <li>
+    <strong>Resource view:</strong> CPU, memory, garbage collection, connections, queue wait, disk,
+    network, and per-instance skew.
+  </li>
+  <li>
+    <strong>Capacity view:</strong> forecast, safe limits, failure reserve, lead time, cost per good
+    operation, and backlog drain time.
+  </li>
 </ol>
 
 <p>
@@ -1032,7 +1097,9 @@ Recovery proof:
   <li>Alert meaning, likely impact, and checks that confirm or disprove it.</li>
   <li>Read-only diagnostic commands and dashboards first.</li>
   <li>Mitigations ordered by safety, reversibility, and expected time to effect.</li>
-  <li>Prerequisites, exact scope, verification, rollback, and audit requirements for every mutation.</li>
+  <li>
+    Prerequisites, exact scope, verification, rollback, and audit requirements for every mutation.
+  </li>
   <li>Escalation paths for application, platform, data, security, legal, and communications.</li>
   <li>Recovery validation, backlog handling, and post-incident tasks.</li>
 </ol>
@@ -1045,15 +1112,29 @@ Recovery proof:
 
 <h3 id="readiness-checklist">On-call readiness checklist</h3>
 <ul>
-  <li>Primary and secondary rotations have sustainable staffing, handoff, and escalation coverage.</li>
-  <li>Responders can access dashboards and audited emergency controls without sharing credentials.</li>
+  <li>
+    Primary and secondary rotations have sustainable staffing, handoff, and escalation coverage.
+  </li>
+  <li>
+    Responders can access dashboards and audited emergency controls without sharing credentials.
+  </li>
   <li>New responders shadow, lead a supervised incident, and pass game-day scenarios.</li>
-  <li>Every critical service has ownership, dependency contacts, severity rules, and communication templates.</li>
-  <li>Pager load, sleep interruption, response time, toil, burnout risk, and follow-up completion are reviewed.</li>
-  <li>Monitoring and paging paths are tested independently of the production system they observe.</li>
+  <li>
+    Every critical service has ownership, dependency contacts, severity rules, and communication
+    templates.
+  </li>
+  <li>
+    Pager load, sleep interruption, response time, toil, burnout risk, and follow-up completion are
+    reviewed.
+  </li>
+  <li>
+    Monitoring and paging paths are tested independently of the production system they observe.
+  </li>
 </ul>
 
-<h2 id="incident-response"><span class="num">15.</span> Incident command, severity, and communication</h2>
+<h2 id="incident-response">
+  <span class="num">15.</span> Incident command, severity, and communication
+</h2>
 <p class="lead">
   During a serious incident, separate coordination, technical work, and communication so responders
   can think and act safely.
@@ -1097,11 +1178,24 @@ Recovery proof:
 
 <h3 id="roles">Incident roles</h3>
 <ul>
-  <li><strong>Incident commander:</strong> owns priorities, roles, decision cadence, escalation, and declaring recovery.</li>
-  <li><strong>Operations lead:</strong> directs technical investigation and mitigation workstreams.</li>
-  <li><strong>Communications lead:</strong> sends accurate, audience-appropriate updates on schedule.</li>
-  <li><strong>Scribe:</strong> records timestamps, evidence, hypotheses, decisions, changes, owners, and outcomes.</li>
-  <li><strong>Subject experts:</strong> investigate bounded questions and report concise evidence to operations lead.</li>
+  <li>
+    <strong>Incident commander:</strong> owns priorities, roles, decision cadence, escalation, and
+    declaring recovery.
+  </li>
+  <li>
+    <strong>Operations lead:</strong> directs technical investigation and mitigation workstreams.
+  </li>
+  <li>
+    <strong>Communications lead:</strong> sends accurate, audience-appropriate updates on schedule.
+  </li>
+  <li>
+    <strong>Scribe:</strong> records timestamps, evidence, hypotheses, decisions, changes, owners,
+    and outcomes.
+  </li>
+  <li>
+    <strong>Subject experts:</strong> investigate bounded questions and report concise evidence to
+    operations lead.
+  </li>
 </ul>
 
 <h3 id="response-loop">Response state machine</h3>
@@ -1120,11 +1214,19 @@ Recovery proof:
 <h3 id="first-fifteen">First fifteen minutes</h3>
 <ol>
   <li>Acknowledge, verify the page from an independent signal, and assess actual user impact.</li>
-  <li>Open one incident record and channel; state severity, scope, commander, and next update time.</li>
+  <li>
+    Open one incident record and channel; state severity, scope, commander, and next update time.
+  </li>
   <li>Freeze risky changes if they could expand impact. Preserve security and audit evidence.</li>
-  <li>Compare current behavior with recent deployments, configuration, traffic, and dependency events.</li>
-  <li>Choose a reversible mitigation based on evidence, with an owner and expected observation time.</li>
-  <li>Escalate early when data integrity, security, legal duties, or multiple teams are involved.</li>
+  <li>
+    Compare current behavior with recent deployments, configuration, traffic, and dependency events.
+  </li>
+  <li>
+    Choose a reversible mitigation based on evidence, with an owner and expected observation time.
+  </li>
+  <li>
+    Escalate early when data integrity, security, legal duties, or multiple teams are involved.
+  </li>
 </ol>
 
 <h3 id="communications">Communication template</h3>
@@ -1202,10 +1304,15 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 <ul>
   <li>Order in-flight requests rose 3.4 times while useful throughput remained flat.</li>
   <li>Order queue wait rose before inventory latency, placing the first pressure in the caller.</li>
-  <li>Inventory attempt rate is 1.7 times order rate, while original logical request rate is unchanged.</li>
+  <li>
+    Inventory attempt rate is 1.7 times order rate, while original logical request rate is
+    unchanged.
+  </li>
   <li>Inventory CPU is 42%, but its database pool is full and waiter p99 exceeds 1 second.</li>
   <li>Database CPU and query execution remain normal; connection count reaches its safety cap.</li>
-  <li>One zone receives 46% of traffic because slow connections distort least-connections routing.</li>
+  <li>
+    One zone receives 46% of traffic because slow connections distort least-connections routing.
+  </li>
 </ul>
 
 <p>
@@ -1228,7 +1335,10 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
   <li>Disable the hidden inventory retry at the order client for the affected operation.</li>
   <li>Reduce admission concurrency to stop new work from extending queues.</li>
   <li>Roll back the new order version gradually while watching the edge SLI and pool wait.</li>
-  <li>Do not increase database connections blindly: the database is healthy and a larger pool could transfer overload to it.</li>
+  <li>
+    Do not increase database connections blindly: the database is healthy and a larger pool could
+    transfer overload to it.
+  </li>
 </ol>
 
 <h3 id="case-recovery">7. Verify recovery</h3>
@@ -1318,17 +1428,34 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
   </table>
 </div>
 
-<h2 id="production"><span class="num">18.</span> Production architecture and deployment practices</h2>
+<h2 id="production">
+  <span class="num">18.</span> Production architecture and deployment practices
+</h2>
 <ul>
   <li>Instrument shared protocol libraries, then add domain events at application boundaries.</li>
   <li>Version telemetry schemas and preserve compatibility during rolling deployments.</li>
-  <li>Attach service name, version, environment, region, zone, and instance as resource identity.</li>
-  <li>Deploy collectors across failure domains and protect them with memory limits and bounded queues.</li>
+  <li>
+    Attach service name, version, environment, region, zone, and instance as resource identity.
+  </li>
+  <li>
+    Deploy collectors across failure domains and protect them with memory limits and bounded queues.
+  </li>
   <li>Keep the paging path independent enough to report a failure of the primary platform.</li>
-  <li>Use synthetic probes from relevant networks for DNS, TLS, routing, and critical user journeys.</li>
-  <li>Canary on user SLI, error-budget burn, resource demand, and telemetry health, not only process errors.</li>
-  <li>Make every deployment, flag, config, migration, autoscaling, and failover change queryable as an event.</li>
-  <li>Own dashboards, alerts, SLOs, capacity constraints, and runbooks in the same change lifecycle as code.</li>
+  <li>
+    Use synthetic probes from relevant networks for DNS, TLS, routing, and critical user journeys.
+  </li>
+  <li>
+    Canary on user SLI, error-budget burn, resource demand, and telemetry health, not only process
+    errors.
+  </li>
+  <li>
+    Make every deployment, flag, config, migration, autoscaling, and failover change queryable as an
+    event.
+  </li>
+  <li>
+    Own dashboards, alerts, SLOs, capacity constraints, and runbooks in the same change lifecycle as
+    code.
+  </li>
 </ul>
 
 <h3 id="telemetry-failure">When observability fails</h3>
@@ -1347,16 +1474,42 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 </p>
 
 <ul>
-  <li>Classify fields and prohibit credentials, session tokens, private keys, payment data, and raw request bodies by default.</li>
-  <li>Use allowlists and typed structured fields. Redact before export and test redaction with generated sensitive fixtures.</li>
-  <li>Authenticate and encrypt telemetry transport; authorize writes separately from queries and administration.</li>
-  <li>Apply least privilege by team, service, tenant, environment, and purpose. Audit searches and exports.</li>
-  <li>Treat incoming trace context and baggage as untrusted. Validate lengths and formats, and never use them for authorization.</li>
+  <li>
+    Classify fields and prohibit credentials, session tokens, private keys, payment data, and raw
+    request bodies by default.
+  </li>
+  <li>
+    Use allowlists and typed structured fields. Redact before export and test redaction with
+    generated sensitive fixtures.
+  </li>
+  <li>
+    Authenticate and encrypt telemetry transport; authorize writes separately from queries and
+    administration.
+  </li>
+  <li>
+    Apply least privilege by team, service, tenant, environment, and purpose. Audit searches and
+    exports.
+  </li>
+  <li>
+    Treat incoming trace context and baggage as untrusted. Validate lengths and formats, and never
+    use them for authorization.
+  </li>
   <li>Prevent log injection by structured encoding and control-character handling.</li>
-  <li>Rate limit tenant-controlled attributes and reject oversized headers to stop cardinality and storage abuse.</li>
-  <li>Separate security audit logs from debug sampling, with tamper evidence and required retention.</li>
-  <li>Protect incident channels, recordings, heap dumps, profiles, and postmortems, which can expose data and vulnerabilities.</li>
-  <li>Define deletion, residency, legal hold, breach response, and backup policies for every telemetry store.</li>
+  <li>
+    Rate limit tenant-controlled attributes and reject oversized headers to stop cardinality and
+    storage abuse.
+  </li>
+  <li>
+    Separate security audit logs from debug sampling, with tamper evidence and required retention.
+  </li>
+  <li>
+    Protect incident channels, recordings, heap dumps, profiles, and postmortems, which can expose
+    data and vulnerabilities.
+  </li>
+  <li>
+    Define deletion, residency, legal hold, breach response, and backup policies for every telemetry
+    store.
+  </li>
 </ul>
 
 <p>
@@ -1498,27 +1651,45 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 <ul>
   <li>Metric names, units, bounded labels, status classification, and zero initialization.</li>
   <li>Trace context validation, propagation, retry spans, and cancellation behavior.</li>
-  <li>Redaction and allowlist rules against secrets, Unicode, encoded values, and nested objects.</li>
+  <li>
+    Redaction and allowlist rules against secrets, Unicode, encoded values, and nested objects.
+  </li>
   <li>SLI eligibility and good-event classification at exact latency and status boundaries.</li>
   <li>Burn-rate calculations, missing data, counter resets, and low-volume cases.</li>
 </ul>
 
 <h3 id="integration-tests">Integration and contract tests</h3>
 <ul>
-  <li>Send one request across HTTP, message, and database boundaries; assert causal IDs and span relationships.</li>
+  <li>
+    Send one request across HTTP, message, and database boundaries; assert causal IDs and span
+    relationships.
+  </li>
   <li>Verify rolling deployment versions produce compatible telemetry and dashboards.</li>
-  <li>Stop the collector or backend; prove bounded application overhead and observable export loss.</li>
-  <li>Query a synthetic canary from the final store and validate end-to-end fields and redaction.</li>
-  <li>Exercise alert rules on recorded fixtures and verify grouping, routing, runbook links, and resolution.</li>
+  <li>
+    Stop the collector or backend; prove bounded application overhead and observable export loss.
+  </li>
+  <li>
+    Query a synthetic canary from the final store and validate end-to-end fields and redaction.
+  </li>
+  <li>
+    Exercise alert rules on recorded fixtures and verify grouping, routing, runbook links, and
+    resolution.
+  </li>
 </ul>
 
 <h3 id="system-tests">Load, fault, and recovery tests</h3>
 <ul>
   <li>Measure instrumentation overhead and pipeline capacity at expected and stress traffic.</li>
-  <li>Inject slow dependency, retry amplification, one-zone loss, clock skew, queue backlog, and exporter failure.</li>
+  <li>
+    Inject slow dependency, retry amplification, one-zone loss, clock skew, queue backlog, and
+    exporter failure.
+  </li>
   <li>Prove pages arrive within the required detection time and identify user impact.</li>
   <li>Execute the runbook with a responder who did not author it.</li>
-  <li>Restore service, drain backlog, reconcile durable effects, and verify SLI plus pipeline stability.</li>
+  <li>
+    Restore service, drain backlog, reconcile durable effects, and verify SLI plus pipeline
+    stability.
+  </li>
 </ul>
 
 <h2 id="exercises"><span class="num">23.</span> Hands-on exercises and expected reasoning</h2>
@@ -1530,9 +1701,9 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 <p>
   <strong>Expected reasoning:</strong> Choose the user-visible edge as the main measurement point;
   define valid authenticated attempts as eligible; distinguish a safely replayed idempotent result
-  from a duplicate effect; set a latency threshold from user need; specify rolling window and traffic
-  segments; name exclusions before incidents; preserve a separate correctness invariant for no
-  double charge.
+  from a duplicate effect; set a latency threshold from user need; specify rolling window and
+  traffic segments; name exclusions before incidents; preserve a separate correctness invariant for
+  no double charge.
 </p>
 
 <h3 id="exercise-two">Exercise 2: Capacity for zone loss</h3>
@@ -1541,11 +1712,11 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
   Instances need 8 minutes to warm. Size the minimum failure capacity and explain reserve.
 </p>
 <p>
-  <strong>Expected reasoning:</strong> After one-zone loss, two zones each carry 4,500 RPS, requiring
-  18 ready instances per surviving zone. That is a mathematical floor. Add reserve for instance
-  failure, forecast error, rollout, warm-up, and skew. Pre-provision enough capacity to bridge eight
-  minutes because autoscaling cannot help immediately. Verify the database and other dependencies at
-  9,000 RPS under failure, not only the stateless tier.
+  <strong>Expected reasoning:</strong> After one-zone loss, two zones each carry 4,500 RPS,
+  requiring 18 ready instances per surviving zone. That is a mathematical floor. Add reserve for
+  instance failure, forecast error, rollout, warm-up, and skew. Pre-provision enough capacity to
+  bridge eight minutes because autoscaling cannot help immediately. Verify the database and other
+  dependencies at 9,000 RPS under failure, not only the stateless tier.
 </p>
 
 <h3 id="exercise-three">Exercise 3: Explain misleading evidence</h3>
@@ -1555,9 +1726,9 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 </p>
 <p>
   <strong>Expected reasoning:</strong> The trace store is intentionally biased and its raw fraction
-  does not estimate fleet error rate. Use the pre-sampling metric for the SLI. Traces explain example
-  failures. If known inclusion probabilities and weights are available, statistical estimation may
-  be possible, but the naive ratio remains wrong.
+  does not estimate fleet error rate. Use the pre-sampling metric for the SLI. Traces explain
+  example failures. If known inclusion probabilities and weights are available, statistical
+  estimation may be possible, but the naive ratio remains wrong.
 </p>
 
 <h3 id="exercise-four">Exercise 4: Incident simulation</h3>
@@ -1605,8 +1776,8 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 <h3>3. Explain burn rate.</h3>
 <p>
   Burn rate is observed bad fraction divided by the SLO's allowed bad fraction. A rate of 1 consumes
-  budget exactly at the sustainable pace; 10 consumes it ten times faster. Pair a stable long
-  window with a responsive short window so pages are both significant and timely.
+  budget exactly at the sustainable pace; 10 consumes it ten times faster. Pair a stable long window
+  with a responsive short window so pages are both significant and timely.
 </p>
 <p><strong>Follow-up:</strong> Why not page whenever error rate exceeds 1%?</p>
 <p>
@@ -1630,8 +1801,8 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 <h3>5. Apply Little's Law to a service.</h3>
 <p>
   In stable conditions, average in-system work equals average throughput times average time in the
-  defined system. At 2,000 requests per second and 200 ms mean time, expect about 400 in flight.
-  A rising in-flight count at flat throughput implies increasing time or an unstable queue. The law
+  defined system. At 2,000 requests per second and 200 ms mean time, expect about 400 in flight. A
+  rising in-flight count at flat throughput implies increasing time or an unstable queue. The law
   uses averages and does not directly predict tails.
 </p>
 <p><strong>Follow-up:</strong> Can it size a connection pool exactly?</p>
@@ -1707,17 +1878,28 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
 
 <h2 id="cheat-sheet"><span class="num">25.</span> Revision cheat sheet</h2>
 <ul>
-  <li>Monitoring checks known conditions; observability supports new questions from emitted evidence.</li>
-  <li>Metrics aggregate, logs record facts, traces show causal paths, profiles show resource hot spots, and events show changes.</li>
+  <li>
+    Monitoring checks known conditions; observability supports new questions from emitted evidence.
+  </li>
+  <li>
+    Metrics aggregate, logs record facts, traces show causal paths, profiles show resource hot
+    spots, and events show changes.
+  </li>
   <li>Use stable structured fields and correlate with trace and span identifiers.</li>
   <li>Validate W3C trace context and treat baggage as untrusted, non-authoritative data.</li>
   <li>The telemetry pipeline needs bounded buffers, loss metrics, security, and capacity.</li>
-  <li>Head sampling decides early; tail sampling uses completed-trace evidence but costs memory and delay.</li>
+  <li>
+    Head sampling decides early; tail sampling uses completed-trace evidence but costs memory and
+    delay.
+  </li>
   <li>Never calculate fleet error rate from biased tail-sampled traces.</li>
   <li>Metric cardinality multiplies across labels; keep unbounded IDs out of metrics.</li>
   <li>RED means rate, errors, duration. USE means utilization, saturation, errors.</li>
   <li>Golden signals are latency, traffic, errors, and saturation.</li>
-  <li>An SLI measures behavior, an SLO sets a target, an SLA is an agreement, and an error budget is allowed not-good service.</li>
+  <li>
+    An SLI measures behavior, an SLO sets a target, an SLA is an agreement, and an error budget is
+    allowed not-good service.
+  </li>
   <li>Define good event, eligible population, measurement point, target, and window.</li>
   <li>Serial dependency availability multiplies only under the stated simplified assumptions.</li>
   <li>Burn rate equals observed bad fraction divided by allowed bad fraction.</li>
@@ -1733,7 +1915,9 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
   <li>Page only when urgent human action can improve an important outcome.</li>
   <li>A runbook includes diagnosis, scoped mitigation, verification, rollback, and escalation.</li>
   <li>Incident command separates coordination, operations, communication, and record keeping.</li>
-  <li>Mitigate harm before proving a complete root cause, using reversible evidence-driven changes.</li>
+  <li>
+    Mitigate harm before proving a complete root cause, using reversible evidence-driven changes.
+  </li>
   <li>Declare recovery only after SLI, correctness, backlog, and telemetry are stable.</li>
   <li>Blameless postmortems analyze systems and still assign owned, verifiable actions.</li>
 </ul>
@@ -1829,7 +2013,8 @@ Next update: 10:35 UTC, or sooner if impact changes materially.</code></pre>
     - current incident-response recommendations integrated with cybersecurity risk management.
   </li>
   <li>
-    <a href="https://docs.oracle.com/en/java/javase/24/jfapi/flight-recorder-api-programmers-guide.pdf"
+    <a
+      href="https://docs.oracle.com/en/java/javase/24/jfapi/flight-recorder-api-programmers-guide.pdf"
       >Oracle Java Flight Recorder API Programmer's Guide</a
     >
     - continuous low-overhead runtime event recording and profiling configuration.
