@@ -215,14 +215,14 @@
   <figcaption><b>Durable handoff timeline</b></figcaption>
   <pre><code>Producer       Broker leader       Replica        Consumer       Database
    | PUT m           |                |               |              |
-   |---------------->| append         |               |              |
+   |----------------&gt;| append         |               |              |
    |                 | replicate m    |               |              |
-   |                 |--------------->| persist       |              |
+   |                 |---------------&gt;| persist       |              |
    | ack accepted    |&lt;---------------|               |              |
    |&lt;----------------|                |               |              |
-   |                 | deliver m      |-------------->| begin        |
+   |                 | deliver m      |--------------&gt;| begin        |
    |                 |                |               | write effect |
-   |                 |                |               |------------->|
+   |                 |                |               |-------------&gt;|
    |                 |                |               | commit       |
    |                 | ack m          |&lt;--------------|              |</code></pre>
 </figure>
@@ -327,7 +327,7 @@
 
 <figure class="code">
   <figcaption><b>Consumer state machine</b></figcaption>
-  <pre><code>JOINING -> ASSIGNED -> FETCHING -> PROCESSING -> COMMITTING
+  <pre><code>JOINING -&gt; ASSIGNED -&gt; FETCHING -&gt; PROCESSING -&gt; COMMITTING
    ^          |                         |              |
    |          +----- lease lost -------+--------------+
    +-------------------- REVOKED / REBALANCING -------+</code></pre>
@@ -593,13 +593,13 @@ acknowledge message only after COMMIT succeeds</code></pre>
 <figure class="code">
   <figcaption><b>Order analytics pipeline</b></figcaption>
   <pre><code>order events
-  -> validate envelope
-  -> assign event timestamp
-  -> key by merchantId
-  -> five-minute tumbling window
-  -> aggregate accepted value and failure count
-  -> join merchant risk tier
-  -> emit dashboard metric and anomaly event</code></pre>
+  -&gt; validate envelope
+  -&gt; assign event timestamp
+  -&gt; key by merchantId
+  -&gt; five-minute tumbling window
+  -&gt; aggregate accepted value and failure count
+  -&gt; join merchant risk tier
+  -&gt; emit dashboard metric and anomaly event</code></pre>
 </figure>
 
 <h3 id="time-models">Event time, processing time, and ingestion time</h3>
@@ -831,7 +831,7 @@ async def handle(message):
   if (prior?.terminal) return;
 
   const policy = await preferences.authorize(job.tenantId, job.recipient, job.channel);
-  if (!policy.allowed || Date.now() >= job.expiresAt) {
+  if (!policy.allowed || Date.now() &gt;= job.expiresAt) {
     await outcomes.recordTerminal(job.messageId, "suppressed");
     return;
   }
@@ -950,7 +950,7 @@ replicated_write_rate = ingress_bytes_per_second * replication_factor
 retained_bytes = ingress_bytes_per_second * retention_seconds / compression_ratio
 consumer_read_rate = ingress_bytes_per_second * number_of_full-stream_groups
 catch_up_time = backlog_bytes / spare_consumer_bytes_per_second
-required_service_rate >= peak_arrival_rate / target_utilization</code></pre>
+required_service_rate &gt;= peak_arrival_rate / target_utilization</code></pre>
 </figure>
 
 <p>
