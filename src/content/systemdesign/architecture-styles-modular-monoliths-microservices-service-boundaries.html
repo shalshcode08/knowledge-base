@@ -1,0 +1,2158 @@
+<h1>
+  Architecture Styles, Modular Monoliths, Microservices, and Service Boundaries - Complete Notes
+</h1>
+<p class="subtitle">
+  A language-neutral guide to choosing architecture constraints, finding cohesive business
+  boundaries, building a disciplined modular monolith, distributing only when the evidence justifies
+  it, and evolving an order platform without creating a distributed monolith.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> Mental model and precise terminology</h2>
+<p class="lead">
+  Architecture is the set of boundaries and dependency rules that make change safe enough for a
+  system's expected lifetime.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a busy restaurant. A layered view separates the dining room, kitchen, and storeroom. A
+    modular view separates ordering, cooking, inventory, and billing responsibilities. A
+    microservice view gives some responsibilities their own building, staff, stock, and operating
+    schedule. Separate buildings can open independently and isolate a fire, but every handoff now
+    needs transport, a protocol, security, tracking, and recovery. Distribution is useful only when
+    those benefits repay that permanent coordination cost.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Precise meaning</th>
+        <th>Common confusion</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Architecture style</td>
+        <td>
+          A family of systems sharing constraints on elements, responsibilities, and relationships
+        </td>
+        <td>It is not a product, deployment platform, folder template, or complete design</td>
+      </tr>
+      <tr>
+        <td>Layer</td>
+        <td>
+          A logical responsibility level, such as presentation, application, domain, or persistence
+        </td>
+        <td>A layer need not run in a separate process or network tier</td>
+      </tr>
+      <tr>
+        <td>Module</td>
+        <td>A named capability with an explicit public interface and hidden implementation</td>
+        <td>A directory is not a module if every other directory can reach its internals</td>
+      </tr>
+      <tr>
+        <td>Component</td>
+        <td>A replaceable implementation unit with a defined interface</td>
+        <td>The word alone says nothing about its process or deployment boundary</td>
+      </tr>
+      <tr>
+        <td>Service</td>
+        <td>A network-addressable capability with an explicit contract and operational identity</td>
+        <td>It is not automatically small, independent, or a microservice</td>
+      </tr>
+      <tr>
+        <td>Bounded context</td>
+        <td>A boundary inside which a domain model and its words have one consistent meaning</td>
+        <td>It is a modeling boundary, not automatically one service</td>
+      </tr>
+      <tr>
+        <td>Aggregate</td>
+        <td>A consistency boundary whose invariants are enforced through one root</td>
+        <td>It is usually too small to become a service by itself</td>
+      </tr>
+      <tr>
+        <td>Monolith</td>
+        <td>An application deployed as one principal unit, commonly one process or artifact</td>
+        <td>It does not imply bad structure, one machine, or no background workers</td>
+      </tr>
+      <tr>
+        <td>Modular monolith</td>
+        <td>One deployment containing strongly enforced, capability-oriented modules</td>
+        <td>It is not a temporary failure to adopt microservices</td>
+      </tr>
+      <tr>
+        <td>Microservice</td>
+        <td>
+          An independently deployable service owning a cohesive business capability and its data
+        </td>
+        <td>Small source code size or one container does not establish independence</td>
+      </tr>
+      <tr>
+        <td>SOA</td>
+        <td>
+          Service-oriented architecture organizes capabilities behind reusable service contracts
+        </td>
+        <td>It is a broad family, not simply an older spelling of microservices</td>
+      </tr>
+      <tr>
+        <td>Coupling</td>
+        <td>
+          The degree to which changing or operating one unit requires knowledge or change elsewhere
+        </td>
+        <td>Asynchronous messaging changes coupling forms but does not remove coupling</td>
+      </tr>
+      <tr>
+        <td>Cohesion</td>
+        <td>
+          How strongly a unit's responsibilities belong together and change for related reasons
+        </td>
+        <td>Putting code in one repository does not create domain cohesion</td>
+      </tr>
+      <tr>
+        <td>Independent deployment</td>
+        <td>One unit can release safely without a coordinated release of its consumers</td>
+        <td>
+          Separate pipelines are insufficient when contracts or schemas require lockstep changes
+        </td>
+      </tr>
+      <tr>
+        <td>Data ownership</td>
+        <td>One authority controls writes, invariants, schema evolution, and supported access</td>
+        <td>Other services reading the same tables makes ownership ambiguous</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>Architecture style and deployment topology are different axes</strong>
+  <p>
+    Hexagonal architecture describes dependency direction inside an application. Microservices
+    describe independently deployable network boundaries. Event-driven architecture describes an
+    interaction style. A serverless platform describes execution and operations. A system can use
+    hexagonal modules inside a modular monolith, publish events to workers, and deploy some adapters
+    on serverless compute. Treat the styles as composable constraints, not competing brand names.
+  </p>
+</div>
+<h2 id="problem"><span class="num">01.</span> The problem architecture solves</h2>
+<p class="lead">
+  The goal is not the maximum number of boxes. The goal is sustainable correctness under change,
+  load, failure, and team growth.
+</p>
+
+<p>
+  Every system begins with assumptions. This guide's running example is an order platform with
+  catalog browsing, checkout, payment authorization, inventory reservation, fulfillment, and
+  notification. Assume 300 requests per second at normal peak, 1,500 requests per second during
+  campaigns, 30 checkout commands per second, a team growing from 8 to 45 engineers, a requirement
+  to protect payment data, and a need to change catalog features much more often than fulfillment.
+  These facts may justify different boundaries later. They do not justify starting with six remote
+  services on day one.
+</p>
+
+<h3 id="architecture-forces">Forces a design must balance</h3>
+<ul>
+  <li><strong>Correctness:</strong> where invariants and transactions can be enforced.</li>
+  <li><strong>Change:</strong> which concepts evolve together and which teams need autonomy.</li>
+  <li>
+    <strong>Runtime:</strong> latency, throughput, scaling shape, isolation, and availability.
+  </li>
+  <li>
+    <strong>Operations:</strong> deployments, alerts, debugging, recovery, and on-call ownership.
+  </li>
+  <li>
+    <strong>Security:</strong> identities, trust boundaries, secrets, data classification, and
+    audit.
+  </li>
+  <li>
+    <strong>Economics:</strong> engineering time, infrastructure, licenses, data transfer, and
+    waste.
+  </li>
+  <li>
+    <strong>Reversibility:</strong> how safely a wrong boundary can be moved, joined, or split.
+  </li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>A boundary decision is an evidence loop</b></figcaption>
+  <pre><code>observe change patterns, load, incidents, and ownership friction
+                         |
+                         v
+identify one painful dependency or failure domain
+                         |
+                         v
+propose the smallest boundary rule that addresses it
+                         |
+                         v
+measure delivery speed, correctness, latency, cost, and recovery
+                         |
+             keep, adjust, merge, or split</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Architecture creates constraints, not guarantees</strong>
+  <p>
+    A database-per-service diagram does not guarantee ownership if teams still join each other's
+    schemas. An event broker does not guarantee decoupling if producers must coordinate every schema
+    change with all consumers. A module rule does not help if reflection, shared mutable globals, or
+    direct SQL bypass it. Verify architecture in code, pipelines, permissions, and operations.
+  </p>
+</div>
+
+<h2 id="coupling-cohesion">
+  <span class="num">02.</span> Cohesion, coupling, and dependency direction
+</h2>
+
+<h3 id="cohesion">Cohesion means belonging together</h3>
+<p>
+  Place behavior together when it enforces the same business rules, uses the same language, changes
+  for the same reasons, and has one accountable owner. Checkout price calculation and order-total
+  validation are cohesive. Sending a marketing email merely happens after checkout and belongs to a
+  different capability. Temporal sequence alone does not create cohesion.
+</p>
+
+<h3 id="coupling-forms">Coupling has several forms</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Coupling</th>
+        <th>Example</th>
+        <th>How to expose it</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Source</td>
+        <td>Consumer imports the provider's internal class</td>
+        <td>Module dependency checks and public-package rules</td>
+      </tr>
+      <tr>
+        <td>Contract</td>
+        <td>Consumer depends on field names, status codes, or event semantics</td>
+        <td>Versioned schemas, compatibility checks, and consumer tests</td>
+      </tr>
+      <tr>
+        <td>Temporal</td>
+        <td>Payment must be reachable while checkout waits</td>
+        <td>Dependency SLOs, timeout trees, and failure-path tests</td>
+      </tr>
+      <tr>
+        <td>Data</td>
+        <td>Two services update the same order row</td>
+        <td>Database grants, ownership catalog, and query audit</td>
+      </tr>
+      <tr>
+        <td>Behavioral</td>
+        <td>A caller assumes inventory reservations last 15 minutes</td>
+        <td>Semantic contract examples and invariant documentation</td>
+      </tr>
+      <tr>
+        <td>Operational</td>
+        <td>All services must release together or share one capacity pool</td>
+        <td>Deployment history, blast-radius review, and resource isolation</td>
+      </tr>
+      <tr>
+        <td>Organizational</td>
+        <td>Every order change waits for another team's approval</td>
+        <td>Ownership maps, lead-time data, and escalation history</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Loose coupling does not mean no knowledge. A consumer must know a useful contract. The goal is to
+  depend on a small, stable meaning instead of volatile implementation details. Prefer dependencies
+  that point toward stable business policies. Make forbidden dependencies mechanically impossible
+  where practical.
+</p>
+
+<h2 id="layered"><span class="num">03.</span> Layered and N-tier architecture</h2>
+<p class="lead">
+  Layers separate kinds of work; tiers place some layers in separate runtime or network locations.
+</p>
+
+<figure class="code">
+  <figcaption><b>Strict layered dependency direction</b></figcaption>
+  <pre><code>HTTP / UI layer       parses transport, authenticates, formats response
+        |
+application layer    coordinates use cases and transaction boundaries
+        |
+domain layer         owns business concepts, policies, and invariants
+        |
+data access layer    maps durable state through defined interfaces</code></pre>
+</figure>
+
+<p>
+  A closed layer calls only the next layer. An open layer may skip levels, which can reduce ceremony
+  but weakens isolation. A three-tier deployment might run web, application, and database tiers on
+  different hosts. A single process can still have four logical layers. Network placement changes
+  failure and latency; logical layering alone does not.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Strength</th>
+        <th>Risk</th>
+        <th>Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Familiar responsibilities and straightforward request flow</td>
+        <td>One feature change touches every horizontal layer</td>
+        <td>Group code by capability, then layer within each capability</td>
+      </tr>
+      <tr>
+        <td>Centralized cross-cutting behavior</td>
+        <td>A giant service layer becomes procedural and domain-poor</td>
+        <td>Put invariants in domain objects and policies</td>
+      </tr>
+      <tr>
+        <td>Replaceable persistence boundary</td>
+        <td>Database records leak into UI and become the public model</td>
+        <td>Map at boundaries and expose purpose-specific contracts</td>
+      </tr>
+      <tr>
+        <td>Easy initial deployment</td>
+        <td>A physical middle tier adds a network hop without autonomy</td>
+        <td>Separate tiers only for security, scaling, or ownership evidence</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Layered architecture suits conventional business systems with stable workflows and one coordinated
+  release. It becomes painful when horizontal technical teams own presentation, logic, and data
+  separately, because every feature crosses three queues. Vertical capability ownership usually
+  reduces handoffs.
+</p>
+
+<h2 id="hexagonal-clean"><span class="num">04.</span> Hexagonal and clean architecture</h2>
+<p class="lead">
+  Business policy stays in the center; technology reaches it through ports implemented by adapters.
+</p>
+
+<figure class="code">
+  <figcaption><b>Ports and adapters</b></figcaption>
+  <pre><code>inbound adapters                     outbound adapters
+HTTP controller ---\               /--- PostgreSQL repository
+queue consumer ------&gt; use-case ports &lt;---- payment HTTP client
+CLI command --------/      |        \--- event publisher
+                       domain model
+
+Dependency rule: adapters depend inward; the domain does not import adapters.</code></pre>
+</figure>
+
+<p>
+  An inbound port expresses what the application can do, such as <code>PlaceOrder</code>. An
+  outbound port expresses what the application needs, such as <code>ReserveInventory</code> or
+  <code>OrderRepository</code>. HTTP, a queue, PostgreSQL, and a payment gateway are adapters. Clean
+  architecture describes a similar inward dependency rule with concentric policy boundaries. The
+  names differ across literature, but the useful test is concrete: can domain policy run in a unit
+  test without a server, database, broker, or framework container?
+</p>
+
+<figure class="code">
+  <figcaption><b>Language-neutral application port</b></figcaption>
+  <pre><code>interface PlaceOrder:
+    execute(command, request_id) -&gt; PlaceOrderResult
+
+interface OrderStore:
+    find(order_id) -&gt; Order?
+    save(order, expected_version)
+
+execute(command, request_id):
+    existing = requestLog.find(request_id)
+    if existing: return existing.result
+    order = Order.create(command.lines, pricingPolicy)
+    orderStore.save(order, expected_version = NONE)
+    outbox.append(OrderPlaced.v1(order.summary))
+    return accepted(order.id)</code></pre>
+</figure>
+
+<p>
+  The pattern improves testability and protects policy from volatile infrastructure. It does not
+  justify an interface for every class. Add a port where ownership, volatility, test substitution,
+  or a real technology boundary exists. Too many one-method wrappers hide the actual flow and create
+  maintenance without isolation.
+</p>
+
+<h2 id="modular-monolith"><span class="num">05.</span> Modular monoliths</h2>
+<p class="lead">
+  A modular monolith keeps local-call simplicity while treating capability boundaries as real
+  architecture.
+</p>
+
+<figure class="code">
+  <figcaption><b>Order platform as one deployment</b></figcaption>
+  <pre><code>order-platform process
++---------------------------------------------------------------+
+| catalog     ordering      payments      inventory      notify |
+| public API  public API    public API    public API     API     |
+| internal    internal      internal      internal       internal|
+| tables      tables        tables        tables         tables  |
++---------------------------------------------------------------+
+         in-process commands and published module events
+
+One artifact, one rollout, one runtime failure domain
+Separate models, APIs, schema ownership, and code ownership</code></pre>
+</figure>
+
+<h3 id="module-rules">Rules that make it genuinely modular</h3>
+<ol>
+  <li>Organize top-level code by business capability, not only by technical layer.</li>
+  <li>Each module publishes a small API. Internal packages are inaccessible to other modules.</li>
+  <li>
+    A module is the only writer of its tables. Cross-module reads use APIs or explicit projections.
+  </li>
+  <li>Cross-module calls point one way or pass through an application workflow to avoid cycles.</li>
+  <li>
+    Module events are immutable facts with documented semantics, even when delivered in process.
+  </li>
+  <li>Architecture tests fail builds on forbidden imports or schema access.</li>
+  <li>Ownership, telemetry, and change history are reported by module.</li>
+</ol>
+
+<h3 id="modular-transaction">Local transactions are an advantage</h3>
+<p>
+  If ordering and inventory still share one transactional database, one local transaction may
+  enforce a truly local cross-module invariant. Use that advantage deliberately. Do not pretend a
+  network exists by serializing every internal call. Instead, record which transaction crosses a
+  proposed boundary. That list is evidence about whether the boundary is wrong or whether a later
+  split will require a saga, reservation, or changed invariant.
+</p>
+
+<figure class="code">
+  <figcaption><b>TypeScript module surface, not an internal class leak</b></figcaption>
+  <pre><code>// ordering/public.ts
+export type PlaceOrder = Readonly&lt;{
+  requestId: string;
+  customerId: string;
+  lines: ReadonlyArray&lt;{ sku: string; quantity: number }&gt;;
+}&gt;;
+
+export interface OrderingApi {
+  place(command: PlaceOrder): Promise&lt;{ orderId: string; status: "accepted" }&gt;;
+}
+
+// inventory/internal/stock-row.ts is not exported.
+// Ordering receives availability through InventoryApi, never by importing StockRow.</code></pre>
+</figure>
+
+<h3 id="monolith-deploy">Scaling and deployment</h3>
+<p>
+  A monolith can run many stateless replicas behind a load balancer. It can have queue workers built
+  from the same repository and database replicas for read load. Its constraint is deployment and
+  runtime granularity, not a single machine. The main inefficiency is coarse scaling: if image
+  rendering uses 80 percent of CPU but ordering uses little, every full replica contains both. First
+  consider moving rendering to a worker process. A service split is only one option.
+</p>
+
+<h3 id="modular-fit">When it is usually the best starting point</h3>
+<ul>
+  <li>The domain is still being discovered and boundaries are likely to move.</li>
+  <li>One or a few teams can coordinate a release without material delay.</li>
+  <li>Most workflows need simple local transactions and low latency.</li>
+  <li>The whole workload fits one practical scaling and availability envelope.</li>
+  <li>
+    The organization does not yet have mature service ownership, telemetry, and deployment
+    automation.
+  </li>
+</ul>
+
+<h2 id="microservices"><span class="num">06.</span> Microservices</h2>
+<p class="lead">
+  Microservices trade local simplicity for independent change, ownership, scaling, and failure
+  isolation across carefully chosen business boundaries.
+</p>
+
+<h3 id="microservice-constraints">Useful constraints</h3>
+<ul>
+  <li>One accountable team owns the service from design through on-call recovery.</li>
+  <li>The service models a cohesive business capability in its own language.</li>
+  <li>It exposes explicit network contracts and hides implementation details.</li>
+  <li>It controls writes and migrations for its data.</li>
+  <li>It can be built, tested, deployed, rolled back, and scaled independently.</li>
+  <li>It tolerates downstream latency, duplicate delivery, partial failure, and version skew.</li>
+</ul>
+
+<p>
+  These properties matter more than line count. A 70,000-line pricing service can be a coherent
+  microservice. Twenty 1,000-line CRUD services sharing tables and a release train form a
+  distributed monolith. Independence is an observed capability, not a naming convention.
+</p>
+
+<h3 id="distribution-tax">The distribution tax</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Local operation</th>
+        <th>Distributed replacement</th>
+        <th>New failure mechanics</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Function call</td>
+        <td>HTTP, RPC, or message</td>
+        <td>Timeout, partial response, retry, duplicate, schema mismatch</td>
+      </tr>
+      <tr>
+        <td>Object reference</td>
+        <td>Identifier plus remote lookup or event snapshot</td>
+        <td>Missing, stale, unauthorized, or deleted reference</td>
+      </tr>
+      <tr>
+        <td>Database transaction</td>
+        <td>Saga, reservation, outbox, and reconciliation</td>
+        <td>Intermediate states, compensation failure, ambiguous outcome</td>
+      </tr>
+      <tr>
+        <td>Stack trace</td>
+        <td>Correlated logs, metrics, traces, and events</td>
+        <td>Lost context, sampling gaps, clock skew, cardinality cost</td>
+      </tr>
+      <tr>
+        <td>In-process identity</td>
+        <td>Workload identity and authorization</td>
+        <td>Certificate, secret, policy, and confused-deputy failures</td>
+      </tr>
+      <tr>
+        <td>One test process</td>
+        <td>Contract, component, integration, and environment tests</td>
+        <td>Version matrix, unavailable dependencies, flaky shared environments</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warn">
+  <strong>When distribution is unjustified</strong>
+  <p>
+    Do not split because microservices appear modern, because the system may grow someday, or
+    because each database table looks like a service. If release contention, scaling asymmetry,
+    ownership conflict, security isolation, or reliability blast radius is not measurable, the split
+    buys a certain tax for a speculative benefit. Strengthen module boundaries and collect evidence
+    first.
+  </p>
+</div>
+<h2 id="soa"><span class="num">07.</span> Service-oriented architecture</h2>
+<p>
+  Service-oriented architecture, or SOA, is the broad idea of exposing business capabilities through
+  interoperable service contracts. Traditional enterprise SOA often uses fewer, coarser services,
+  centralized governance, shared canonical messages, and integration middleware. Microservices are
+  one more decentralized service-oriented style, emphasizing bounded business ownership, independent
+  deployment, decentralized data, and team autonomy.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Concern</th>
+        <th>Traditional SOA tendency</th>
+        <th>Microservice tendency</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Service size</td>
+        <td>Enterprise capability or reusable integration service</td>
+        <td>Team-owned bounded business capability</td>
+      </tr>
+      <tr>
+        <td>Governance</td>
+        <td>Central standards and shared schemas</td>
+        <td>Guardrails with local technology and release choices</td>
+      </tr>
+      <tr>
+        <td>Integration</td>
+        <td>Often mediated by an enterprise service bus</td>
+        <td>Smart endpoints with simpler gateways or brokers</td>
+      </tr>
+      <tr>
+        <td>Data</td>
+        <td>Enterprise models and shared systems are common</td>
+        <td>Service-owned models and databases are preferred</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  These are tendencies, not definitions. A centralized transformation bus can become a bottleneck
+  when it owns business behavior that no domain team owns. Equally, duplicating routing, security,
+  and telemetry in every microservice wastes effort. Centralize platform capabilities that are truly
+  uniform, but keep domain decisions with the team and service that own the domain.
+</p>
+
+<h2 id="event-driven"><span class="num">08.</span> Event-driven architecture</h2>
+<p class="lead">
+  Producers publish facts about completed state transitions; consumers react without a direct
+  request-time dependency on the producer.
+</p>
+
+<figure class="code">
+  <figcaption><b>Order event fan-out</b></figcaption>
+  <pre><code>Ordering transaction
+    |-- save order
+    '-- save OrderPlaced.v1 to outbox
+                 |
+                 v
+              broker
+            /    |     \
+     inventory  analytics  notification
+       reserve    count       email
+
+Producer does not wait for every consumer.
+Each consumer owns offset, retry, deduplication, and recovery.</code></pre>
+</figure>
+
+<p>
+  Events can improve temporal decoupling, fan-out, buffering, and independent consumer scaling. They
+  introduce eventual consistency, duplicate delivery, ordering scopes, replay, schema evolution,
+  poison messages, and harder end-to-end reasoning. A command states an intent for one owner, such
+  as
+  <code>ReserveStock</code>. An event states an observed fact, such as
+  <code>InventoryReserved</code>. Naming a command <code>StockShouldBeReserved</code> and
+  broadcasting it does not make it an event.
+</p>
+
+<h3 id="event-coupling">Event coupling still exists</h3>
+<ul>
+  <li><strong>Semantic coupling:</strong> consumers interpret the producer's meaning.</li>
+  <li><strong>Schema coupling:</strong> consumers parse fields and types.</li>
+  <li>
+    <strong>Ordering coupling:</strong> a consumer may require events for one order in sequence.
+  </li>
+  <li><strong>Availability coupling:</strong> recovery may require broker retention and replay.</li>
+  <li><strong>Volume coupling:</strong> a producer traffic spike becomes consumer lag.</li>
+</ul>
+
+<p>
+  Publish stable business facts, include event identity, subject identity, occurrence time, schema
+  version, trace context, and producer identity, and avoid exposing internal database rows. Use an
+  outbox when state and event publication must agree. Consumers must be idempotent and able to
+  rebuild projections from a documented starting point or snapshot.
+</p>
+
+<h2 id="web-queue-worker"><span class="num">09.</span> Web-queue-worker</h2>
+<p>
+  A web front end handles interactive requests, places long or resource-heavy work on a durable
+  queue, and one or more workers process it outside the request. It is excellent for a relatively
+  simple domain with image conversion, report generation, email delivery, imports, or batch work.
+</p>
+
+<figure class="code">
+  <figcaption><b>File-processing request</b></figcaption>
+  <pre><code>client -POST /files-&gt; web -store metadata + outbox-&gt; database
+  |                         |
+  |                         '--publish FileProcessingRequested-&gt; queue
+  '&lt;-202 Accepted + job URI                                      |
+              |                                                  v
+              '--GET /jobs/{id} &lt;-- status store &lt;-- worker converts file</code></pre>
+</figure>
+
+<p>
+  Return <code>202 Accepted</code> only after durable acceptance. Give the client a job identifier
+  and status resource. Bound message size, execution time, retries, and queue age. Workers
+  acknowledge only after durable success, extend visibility carefully for long jobs, and tolerate
+  redelivery. Route permanent failures to quarantine with a reason and operator workflow. Autoscale
+  from queue age and processing time, not depth alone.
+</p>
+
+<div class="warn">
+  <strong>The dual-write trap</strong>
+  <p>
+    If the web process commits metadata and crashes before enqueueing, the file remains forever
+    pending. If it enqueues first and the transaction rolls back, the worker sees nonexistent data.
+    Save an outbox row in the metadata transaction, publish it later, and reconcile old pending
+    jobs.
+  </p>
+</div>
+
+<h2 id="serverless"><span class="num">10.</span> Serverless architecture</h2>
+<p>
+  Serverless means the platform assumes more responsibility for provisioning, scaling, patching, and
+  charging for execution or consumed capacity. Functions, managed queues, event routers, databases,
+  and workflows are common building blocks. Code still runs on servers, and the team still owns
+  correctness, security, configuration, dependencies, limits, telemetry, and cost.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Good fit</th>
+        <th>Design consequence</th>
+        <th>Warning sign</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Bursty event processing with low idle utilization</td>
+        <td>Concurrency can grow rapidly, so protect databases and vendors</td>
+        <td>Unbounded fan-out overwhelms a fixed connection pool</td>
+      </tr>
+      <tr>
+        <td>Small independently triggered handlers</td>
+        <td>Make handlers idempotent and externalize durable state</td>
+        <td>Hidden workflow state lives in temporary memory</td>
+      </tr>
+      <tr>
+        <td>Managed integration and scheduled jobs</td>
+        <td>Model retries, dead letters, and platform limits explicitly</td>
+        <td>Default retry silently duplicates an external charge</td>
+      </tr>
+      <tr>
+        <td>Rapid product experiments</td>
+        <td>Use infrastructure definitions and local contract tests</td>
+        <td>Console-only resources cannot be reproduced or audited</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Consider cold-start tail latency, maximum duration and payload, concurrency quotas, regional
+  availability, runtime version, observability gaps, egress, and per-invocation pricing. A
+  long-lived high-throughput service may cost less and behave more predictably on continuously
+  provisioned compute. Serverless changes the operating model, not the need for coherent service
+  boundaries.
+</p>
+
+<h2 id="style-selection"><span class="num">11.</span> Comparing and composing styles</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Style</th>
+        <th>Primary boundary</th>
+        <th>Strong fit</th>
+        <th>Main cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Layered</td>
+        <td>Technical responsibility</td>
+        <td>Stable request-response business systems</td>
+        <td>Features cross horizontal layers</td>
+      </tr>
+      <tr>
+        <td>Hexagonal or clean</td>
+        <td>Policy versus technology</td>
+        <td>Rich domain rules and replaceable adapters</td>
+        <td>Abstraction ceremony if applied mechanically</td>
+      </tr>
+      <tr>
+        <td>Modular monolith</td>
+        <td>Capability inside one deployment</td>
+        <td>Growing domain with limited operational scale</td>
+        <td>Coarse deployment and runtime isolation</td>
+      </tr>
+      <tr>
+        <td>Microservices</td>
+        <td>Independent capability and owner</td>
+        <td>Multiple autonomous teams and asymmetric demands</td>
+        <td>Distributed correctness and operational overhead</td>
+      </tr>
+      <tr>
+        <td>SOA</td>
+        <td>Reusable enterprise capability</td>
+        <td>Integration across heterogeneous systems</td>
+        <td>Central governance or middleware bottlenecks</td>
+      </tr>
+      <tr>
+        <td>Event-driven</td>
+        <td>Fact publication and reaction</td>
+        <td>Fan-out, buffering, streams, and asynchronous workflows</td>
+        <td>Eventual consistency and replay complexity</td>
+      </tr>
+      <tr>
+        <td>Web-queue-worker</td>
+        <td>Interactive versus background work</td>
+        <td>Simple web system with heavy or long jobs</td>
+        <td>Queue lifecycle and dual-write handling</td>
+      </tr>
+      <tr>
+        <td>Serverless</td>
+        <td>Managed event-triggered execution</td>
+        <td>Bursty or low-duty-cycle workloads</td>
+        <td>Limits, cold starts, cost variability, and lock-in</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="fitness-functions">Turn architectural intent into fitness functions</h3>
+<p>
+  A fitness function is an automated or routinely reviewed check that tells whether the system still
+  has a desired property. Examples include no import from another module's internal namespace, no
+  cross-service database grant, backward-compatible API schemas, a maximum checkout dependency
+  count, independent deploy success rate, per-service recovery objectives, and a latency budget.
+  Architecture diagrams that disagree with these checks are historical illustrations, not controls.
+</p>
+
+<h2 id="boundary-discovery"><span class="num">12.</span> Discovering service boundaries</h2>
+<p class="lead">
+  Find boundaries from business language, invariants, change patterns, ownership, and runtime needs,
+  then validate them with real workflows.
+</p>
+
+<h3 id="business-capabilities">Decompose by business capability</h3>
+<p>
+  A business capability is an outcome the organization must perform, such as price merchandise,
+  accept an order, authorize payment, reserve stock, or arrange shipment. Capability boundaries are
+  more stable than user-interface screens and database entities. A checkout page touches catalog,
+  promotions, ordering, payments, and inventory; making the page one service would couple unrelated
+  models. A <code>CustomerService</code>, <code>OrderService</code>, and
+  <code>OrderLineService</code>
+  split derived from nouns often creates chatty CRUD services with weak behavior.
+</p>
+
+<h3 id="bounded-contexts">Bounded contexts and context mapping</h3>
+<p>
+  The word <em>product</em> means sellable description and price in Catalog, an SKU and available
+  quantity in Inventory, and a historical line snapshot in Ordering. Forcing one enterprise Product
+  model couples all three. Let each bounded context own its model and translate at the boundary.
+  Record relationships such as upstream/downstream, customer/supplier, conformist, shared kernel,
+  published language, or anti-corruption layer. The label matters less than making influence and
+  translation explicit.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Evidence</th>
+        <th>Suggests keeping together</th>
+        <th>Suggests separating</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Invariant</td>
+        <td>Must be atomically true at command completion</td>
+        <td>Temporary divergence has a safe business process</td>
+      </tr>
+      <tr>
+        <td>Language</td>
+        <td>Terms have one meaning and lifecycle</td>
+        <td>Same word means different things to specialists</td>
+      </tr>
+      <tr>
+        <td>Change history</td>
+        <td>Files and rules repeatedly change together</td>
+        <td>Capabilities release at unrelated rates</td>
+      </tr>
+      <tr>
+        <td>Ownership</td>
+        <td>One team owns the whole workflow effectively</td>
+        <td>Stable teams need autonomy with minimal handoff</td>
+      </tr>
+      <tr>
+        <td>Scale</td>
+        <td>Similar resources and traffic shape</td>
+        <td>One capability needs distinct CPU, memory, or geographic placement</td>
+      </tr>
+      <tr>
+        <td>Reliability</td>
+        <td>Shared fate is acceptable and recovery is coordinated</td>
+        <td>One failure must not consume another capability's budget</td>
+      </tr>
+      <tr>
+        <td>Security</td>
+        <td>Same data classification and trust level</td>
+        <td>Payment, health, tenant, or regulated data needs tighter isolation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="aggregates">Aggregates define immediate consistency</h3>
+<p>
+  An Order aggregate might enforce positive quantities, one currency, and a valid status transition.
+  Inventory stock is a different aggregate because global stock contention and reservation lifecycle
+  differ. A service may own many aggregates. Avoid a service per aggregate, which creates remote
+  calls for ordinary behavior, and avoid one aggregate spanning services, which makes its invariants
+  impossible to enforce locally.
+</p>
+
+<h3 id="boundary-workshop">A repeatable boundary workshop</h3>
+<ol>
+  <li>List actors, commands, business events, policies, read models, and external systems.</li>
+  <li>Draw one end-to-end timeline, including declines, timeouts, cancellation, and recovery.</li>
+  <li>Group facts and rules that share language, invariants, and experts.</li>
+  <li>Mark every synchronous dependency and every transaction crossing a proposed group.</li>
+  <li>Overlay code change history, team ownership, load, data classification, and incidents.</li>
+  <li>Challenge every remote boundary by modeling it as an in-process module first.</li>
+  <li>Document decision, assumptions, rejected alternatives, measures, and a review date.</li>
+</ol>
+
+<h2 id="ownership"><span class="num">13.</span> Domain, team, and data ownership</h2>
+<p>
+  A service boundary needs one team able to make and operate changes. Shared ownership often means
+  no ownership during an incident. Team boundaries should follow capabilities where possible, while
+  a platform team supplies paved roads for build, deployment, identity, telemetry, and messaging. A
+  platform is a product with users and support, not a gatekeeping committee.
+</p>
+
+<h3 id="data-ownership">Database per service is an ownership rule</h3>
+<p>
+  The rule does not require one physical database server per service. Separate databases, schemas,
+  or accounts can share a cluster if permissions, migrations, resource limits, backup objectives,
+  and ownership remain clear. Only the owner writes its data. Other services call its API, consume
+  its events, or maintain a local projection. The physical arrangement can evolve without changing
+  that contract.
+</p>
+
+<h3 id="shared-database">Shared-database risks</h3>
+<ul>
+  <li>A consumer silently depends on private columns, indexes, or transaction timing.</li>
+  <li>One migration breaks many services and forces coordinated releases.</li>
+  <li>Cross-schema joins bypass authorization and business invariants.</li>
+  <li>Long queries, locks, or connection spikes create a shared failure domain.</li>
+  <li>Ownership of backup, retention, deletion, and incident response becomes unclear.</li>
+  <li>A compromised service account gains data unrelated to its capability.</li>
+</ul>
+
+<p>
+  A legacy shared database can be an explicit transitional state. Establish table ownership, revoke
+  new cross-owner writes, place owner APIs before tables, log remaining readers, build projections,
+  and migrate one dependency at a time. Pretending the dependency does not exist makes extraction
+  riskier.
+</p>
+
+<h2 id="communication"><span class="num">14.</span> Synchronous and asynchronous communication</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Synchronous request</th>
+        <th>Asynchronous message</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>When is it useful?</td>
+        <td>Caller needs an immediate answer to continue</td>
+        <td>Work can complete later or multiple consumers react</td>
+      </tr>
+      <tr>
+        <td>Availability effect</td>
+        <td>Dependency is on the request critical path</td>
+        <td>Broker and buffer can bridge temporary consumer failure</td>
+      </tr>
+      <tr>
+        <td>State model</td>
+        <td>Response reports current attempt outcome</td>
+        <td>Workflow exposes accepted, pending, completed, or failed state</td>
+      </tr>
+      <tr>
+        <td>Failure burden</td>
+        <td>Timeout, deadline, cancellation, retry, ambiguous response</td>
+        <td>Duplicate, ordering, lag, poison, replay, expiration</td>
+      </tr>
+      <tr>
+        <td>Typical contract</td>
+        <td>HTTP resource or RPC operation</td>
+        <td>Command or immutable event envelope</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Do not replace every call with an event. A product-detail request needs a response. Do not make
+  every step synchronous either. Email delivery need not reduce checkout availability. Trace the
+  user promise, decide which facts must be known before replying, and move only deferrable work off
+  the critical path.
+</p>
+
+<h2 id="edge-infrastructure">
+  <span class="num">15.</span> Gateways, BFFs, discovery, meshes, and sidecars
+</h2>
+<p class="lead">
+  Infrastructure can standardize communication mechanics, but it must not become the hidden owner of
+  domain behavior.
+</p>
+
+<h3 id="api-gateway">API gateway</h3>
+<p>
+  A gateway is an entry point that routes external traffic and may terminate TLS, authenticate,
+  enforce coarse authorization, limit rates, validate payload bounds, translate protocols, and emit
+  edge telemetry. It can hide internal topology and support gradual routing during migration. Keep
+  checkout policy, price calculation, and workflow state out of generic gateway configuration.
+</p>
+
+<h3 id="bff">Backend for frontend</h3>
+<p>
+  A backend-for-frontend, or BFF, is a client-specific edge service. A mobile BFF may reduce round
+  trips and payload size, while an operations BFF assembles richer administration data. It should
+  adapt and compose, not become the only home of business rules. Use separate BFFs only when client
+  needs and ownership differ materially. Otherwise one API creates less duplication.
+</p>
+
+<figure class="code">
+  <figcaption><b>External and internal request path</b></figcaption>
+  <pre><code>mobile app -TLS-&gt; edge gateway -&gt; mobile BFF -&gt; Ordering logical service
+                                                |
+                                  discover healthy endpoints
+                                                |
+                                client or proxy load balances
+                                                |
+                                   Ordering instance + sidecar
+
+Gateway: north-south policy and routing
+Service mesh: optional east-west transport policy and telemetry
+Application: business authorization, deadlines, and domain behavior</code></pre>
+</figure>
+
+<h3 id="service-discovery">Service discovery</h3>
+<p>
+  Instances are ephemeral, so callers need a stable logical name mapped to changing healthy
+  endpoints. Server-side discovery sends traffic to a stable proxy or virtual address. Client-side
+  discovery gives the caller an endpoint set and balancing policy. DNS and registries are common.
+  Discovery is normally eventually consistent, so clients still need connection timeouts, health
+  signals, endpoint draining, and retry rules. A stale endpoint must be an expected condition.
+</p>
+
+<h3 id="mesh-sidecar">Service mesh and sidecars</h3>
+<p>
+  A service mesh places service-to-service networking under a common data plane, often proxies near
+  workloads, controlled by a separate configuration plane. A sidecar is a companion process or
+  container sharing a workload lifecycle. It can provide mTLS, identity, discovery, balancing,
+  retries, traffic policy, and telemetry consistently across languages.
+</p>
+
+<p>
+  A mesh adds proxy hops, CPU and memory, certificate and policy lifecycles, control-plane failure
+  modes, configuration propagation delay, and another place where retries can amplify traffic. It
+  cannot infer business idempotency, choose a correct deadline, authorize an order transition, or
+  make a non-transactional workflow atomic. Adopt it when fleet scale and language diversity repay
+  its operation, not merely because services exist.
+</p>
+
+<h2 id="contracts"><span class="num">16.</span> Contracts, versioning, and compatibility</h2>
+<p class="lead">
+  Independent deployment is possible only when producers and consumers tolerate version skew.
+</p>
+
+<h3 id="contract-content">A contract is more than a schema</h3>
+<ul>
+  <li>Operation and resource meaning, preconditions, and authorization.</li>
+  <li>Field type, optionality, units, defaults, and validation limits.</li>
+  <li>Success, error, retry, idempotency, timeout, and cancellation semantics.</li>
+  <li>Ordering, delivery, retention, and replay rules for messages.</li>
+  <li>Rate, payload, concurrency, latency, and availability expectations.</li>
+  <li>Deprecation, support window, ownership, and incident contact.</li>
+</ul>
+
+<h3 id="api-evolution">Expand, migrate, contract</h3>
+<ol>
+  <li>Producer adds an optional field or new operation without changing old meaning.</li>
+  <li>Producer accepts both old and new request shapes.</li>
+  <li>Consumers migrate independently and report old-version traffic.</li>
+  <li>Owner announces deprecation and waits through the agreed support window.</li>
+  <li>Producer removes old behavior only after evidence shows no authorized consumer uses it.</li>
+</ol>
+
+<p>
+  Favor additive evolution. Consumers should ignore unknown fields where the format permits and not
+  infer meaning from undocumented enum exhaustiveness. Producers should not repurpose fields or
+  silently change units. A new major version is necessary when meaning cannot remain compatible, but
+  major versions also create parallel support cost. Version a contract, not every deployment.
+</p>
+
+<h3 id="consumer-contracts">Consumer-driven contracts</h3>
+<p>
+  Each consumer records the interactions and fields it relies on. Provider verification runs those
+  expectations against the candidate provider. This reveals whether a provider change breaks known
+  consumers without requiring a full shared environment. It does not prove business correctness,
+  performance, security, or behavior of unregistered consumers. Providers remain responsible for an
+  authoritative contract and for preventing consumers from demanding contradictory internals.
+</p>
+
+<figure class="code">
+  <figcaption><b>Compatible event evolution</b></figcaption>
+  <pre><code>OrderPlaced.v1
+event_id, occurred_at, order_id, customer_id, total_minor, currency
+
+Safe additive evolution:
++ optional sales_channel with documented default "unknown"
+
+Unsafe in-place evolution:
+- total_minor changes from integer minor units to decimal major units
+- currency disappears
+- event changes from "accepted order" to "paid order"
+
+Changed meaning requires a new event type or version and migration plan.</code></pre>
+</figure>
+
+<h2 id="evolution"><span class="num">17.</span> Staged evolution of the order platform</h2>
+
+<h3 id="stage-zero">Stage 0: establish evidence and module boundaries</h3>
+<p>
+  The initial eight-person team deploys one application. It creates Catalog, Ordering, Payments,
+  Inventory, Fulfillment, and Notification modules, each with a public API and owned schema. A
+  single relational database supplies local transactions. Module events run through an in-process
+  dispatcher after the transaction or through an outbox when delivery must survive a crash. Tests
+  forbid internal imports and cross-owner writes. Dashboards break down latency and errors by
+  module.
+</p>
+
+<h3 id="stage-one">Stage 1: separate asynchronous workers</h3>
+<p>
+  Image work and notification delivery consume most campaign CPU and have weak consistency needs.
+  Move them to queue workers while retaining their module ownership. The web deployment no longer
+  scales for email bursts. Persist job state, deduplicate messages, bound retries, and reconcile
+  stuck work. This solves asymmetric resource use without yet extracting core services.
+</p>
+
+<h3 id="stage-two">Stage 2: extract payments for security and ownership</h3>
+<p>
+  Payment handling now has a specialist team, restricted data, independent audit obligations, and a
+  vendor release cycle. These are concrete reasons to extract it. Define payment intent,
+  authorization, capture, refund, and idempotency contracts. Give the service its own credentials
+  and data. Ordering stores payment references and status, not sensitive instrument data.
+</p>
+
+<figure class="code">
+  <figcaption><b>Payment extraction request flow</b></figcaption>
+  <pre><code>1. Client -PlaceOrder(request_id)-&gt; Ordering
+2. Ordering commits order=PENDING_PAYMENT and OrderPlaced outbox record
+3. Workflow -Authorize(payment_id, amount, idempotency_key)-&gt; Payments
+4a. authorized -&gt; Ordering records payment reference and continues reservation
+4b. declined   -&gt; Ordering marks order PAYMENT_FAILED
+4c. timeout    -&gt; Ordering queries by idempotency key before retrying
+5. Reconciler resolves orders stuck beyond the state deadline
+
+No database transaction spans Ordering and Payments.
+Ambiguous outcomes are explicit states, not guessed failures.</code></pre>
+</figure>
+
+<h3 id="stage-three">Stage 3: extract inventory for scale and contention</h3>
+<p>
+  Inventory traffic and locking now dominate campaigns, and a dedicated team owns replenishment and
+  warehouse allocation. Create a reservation contract with expiry, confirmation, and release. The
+  service owns stock quantities. Ordering owns the business order and its workflow. A saga tracks
+  payment and reservation state. Reconciliation compares both authorities rather than sharing rows.
+</p>
+
+<h3 id="stage-four">Stage 4: selective independence, not automatic extraction</h3>
+<p>
+  Catalog may become independently deployed because read scale and release rate differ. Fulfillment
+  may remain a module if one team and one release continue to work well. Notification can remain a
+  worker. Architecture is now a hybrid. The success condition is lower lead time and controlled
+  failure, not whether every box has become a service.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Gate before extraction</th>
+        <th>Evidence</th>
+        <th>Required readiness</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Business boundary</td>
+        <td>Stable language, invariants, and owner</td>
+        <td>Public API, data map, and context translation</td>
+      </tr>
+      <tr>
+        <td>Independent benefit</td>
+        <td>Release, scale, security, or blast-radius pain</td>
+        <td>Metric that should improve after extraction</td>
+      </tr>
+      <tr>
+        <td>Distributed correctness</td>
+        <td>Cross-boundary workflows and ambiguous outcomes cataloged</td>
+        <td>Idempotency, outbox, state machine, reconciliation</td>
+      </tr>
+      <tr>
+        <td>Operations</td>
+        <td>Named team accepts on-call ownership</td>
+        <td>SLO, alerts, runbook, capacity, rollback, recovery test</td>
+      </tr>
+      <tr>
+        <td>Migration</td>
+        <td>Readers, writers, jobs, and historical data identified</td>
+        <td>Incremental routing, verification, rollback, retirement plan</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="strangler"><span class="num">18.</span> Strangler migration and anti-corruption layers</h2>
+<p>
+  A strangler migration places a routing seam around a legacy capability, implements selected
+  behavior in a new component, gradually moves traffic and data, and removes the old path only after
+  evidence. It reduces big-bang risk and lets product work continue. Choose a vertical business
+  slice, not only a shared utility, so ownership actually moves.
+</p>
+
+<figure class="code">
+  <figcaption><b>Migration state machine for one capability</b></figcaption>
+  <pre><code>DISCOVER dependencies and invariants
+   -&gt; SHADOW new reads, compare without serving
+   -&gt; CANARY selected tenants or operations
+   -&gt; PRIMARY new owner, retain controlled rollback
+   -&gt; VERIFY correctness, SLO, cost, and recovery
+   -&gt; RETIRE legacy writer, schema, route, and adapter
+
+Any unsafe mismatch -&gt; stop traffic shift, reconcile, and return to last safe state</code></pre>
+</figure>
+
+<h3 id="acl">Anti-corruption layer</h3>
+<p>
+  An anti-corruption layer translates a legacy or external model into the new bounded context's
+  language. For example, a legacy integer <code>payment_flag</code> might map to explicit Payment
+  states. Keep the translation beside the boundary and test it with historical edge cases. Do not
+  allow the legacy model to spread inward. Give the adapter an owner and removal criterion, or it
+  becomes permanent opaque middleware.
+</p>
+
+<h3 id="migration-data">Data migration mechanics</h3>
+<ol>
+  <li>Name one authoritative writer for each migration phase.</li>
+  <li>Backfill immutable snapshots with checkpoints and repeatable jobs.</li>
+  <li>Capture changes after the checkpoint through an outbox or change stream.</li>
+  <li>Compare counts, hashes, invariants, and sampled business results.</li>
+  <li>Switch reads gradually while monitoring stale and missing records.</li>
+  <li>Switch writes once, preserve idempotency, and rehearse rollback semantics.</li>
+  <li>Retire old credentials, jobs, routes, tables, and telemetry after the support window.</li>
+</ol>
+
+<div class="warn">
+  <strong>Avoid uncontrolled dual writes</strong>
+  <p>
+    Writing old and new databases in one request without a transactional protocol produces divergent
+    truth whenever one succeeds and the other fails. Prefer one authoritative write plus a durable
+    change feed. If temporary dual writing is unavoidable, assign operation IDs, record both
+    outcomes, reconcile continuously, and define which system wins each conflict.
+  </p>
+</div>
+
+<h2 id="distributed-monolith"><span class="num">19.</span> Distributed-monolith symptoms</h2>
+<p class="lead">
+  A distributed monolith pays network and operational costs while retaining monolithic coupling.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Failure it creates</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>All services deploy in one release train</td>
+        <td>One schema change blocks the entire fleet</td>
+        <td>Add compatibility windows or merge inseparable services</td>
+      </tr>
+      <tr>
+        <td>Shared tables and cross-service SQL</td>
+        <td>Invisible contracts, lock contention, and security bypass</td>
+        <td>Name an owner, expose API or projection, revoke access</td>
+      </tr>
+      <tr>
+        <td>Long synchronous call chains</td>
+        <td>Tail latency and availability multiply across dependencies</td>
+        <td>Move cohesive logic together, batch, or defer noncritical work</td>
+      </tr>
+      <tr>
+        <td>Entity services with CRUD-only APIs</td>
+        <td>Business operation requires chatty remote orchestration</td>
+        <td>Group behavior around business capability and invariant</td>
+      </tr>
+      <tr>
+        <td>One shared domain library</td>
+        <td>Library release coordinates every service</td>
+        <td>Share protocol primitives, not mutable business models</td>
+      </tr>
+      <tr>
+        <td>Central orchestrator owns every rule</td>
+        <td>Services become anemic remote data access</td>
+        <td>Put rules with domain owners and keep workflow explicit</td>
+      </tr>
+      <tr>
+        <td>No per-service SLO or on-call owner</td>
+        <td>Failures bounce between teams</td>
+        <td>Assign lifecycle ownership or reduce service count</td>
+      </tr>
+      <tr>
+        <td>Shared staging is required for every test</td>
+        <td>Slow, flaky feedback and environment contention</td>
+        <td>Executable contracts, local substitutes, and isolated integration tests</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="failure-chain">How a distributed monolith fails</h3>
+<figure class="code">
+  <figcaption><b>Checkout cascade</b></figcaption>
+  <pre><code>Catalog p99 150 ms
+  -&gt; Pricing p99 300 ms
+      -&gt; Customer p99 250 ms
+          -&gt; Inventory p99 600 ms
+              -&gt; Payment timeout 1,000 ms
+
+Checkout timeout: 2,000 ms
+Each layer retries twice with no shared deadline.
+One user request can create up to 3 x 3 x 3 x 3 x 3 downstream attempts.
+Queues and connection pools fill; health checks fail; replicas churn.</code></pre>
+</figure>
+
+<p>
+  Pass one end-to-end deadline, retry at one controlled layer only when safe, budget attempts, bound
+  concurrency, and shed excess load. More fundamentally, remove remote boundaries that merely split
+  one cohesive request. An architecture problem cannot always be repaired by a retry library.
+</p>
+
+<h2 id="transactions"><span class="num">20.</span> Data consistency and workflow ownership</h2>
+<p>
+  Each service performs local transactions on owned data. Cross-service work becomes an explicit
+  state machine. For an order, states might be <code>PENDING_PAYMENT</code>,
+  <code>PENDING_INVENTORY</code>, <code>CONFIRMED</code>, <code>REJECTED</code>, or
+  <code>REVIEW_REQUIRED</code>. Persist the next action, attempt identity, deadline, and last
+  observed result. Use an outbox for reliable commands or events, inbox deduplication for consumers,
+  and reconciliation for states that exceed their deadline.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Invariant</th>
+        <th>Owner and mechanism</th>
+        <th>Cross-boundary policy</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Order total equals accepted line snapshot</td>
+        <td>Ordering aggregate and local transaction</td>
+        <td>Catalog price is copied with source version</td>
+      </tr>
+      <tr>
+        <td>Available stock never drops below zero</td>
+        <td>Inventory atomic reservation</td>
+        <td>Ordering waits or rejects; it never edits stock</td>
+      </tr>
+      <tr>
+        <td>One authorization per payment intent</td>
+        <td>Payments unique idempotency key</td>
+        <td>Caller queries ambiguous outcomes before retry</td>
+      </tr>
+      <tr>
+        <td>Confirmed order has payment and reservation</td>
+        <td>Ordering workflow transition with recorded references</td>
+        <td>Saga compensates or sends unresolved state to review</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="production"><span class="num">21.</span> Production deployment and operations</h2>
+
+<h3 id="service-template">Minimum production service contract</h3>
+<ul>
+  <li>Named owner, repository, dependency inventory, data classification, and support channel.</li>
+  <li>Versioned artifact, reproducible build, signed provenance, and dependency scanning.</li>
+  <li>Configuration and secrets separated from the artifact with rotation procedures.</li>
+  <li>Resource requests, limits, autoscaling signal, capacity model, and failure headroom.</li>
+  <li>Readiness, liveness, startup, graceful draining, and bounded shutdown behavior.</li>
+  <li>
+    Compatibility-safe rollout, rollback limits, database migration strategy, and feature controls.
+  </li>
+  <li>SLIs, SLO, alerts, dashboard, traces, runbook, backup, restore, and recovery objective.</li>
+</ul>
+
+<p>
+  Independent deployment requires mixed versions to coexist. Deploy database expand changes before
+  code that uses them, then contract only after all readers have migrated. Drain instances before
+  stopping, stop accepting new work, finish or checkpoint bounded work, release leases, flush outbox
+  state, and close connections within the termination budget. A liveness probe should detect a stuck
+  process, not restart an instance merely because a downstream dependency is unavailable.
+</p>
+
+<h3 id="governance">Governance without central paralysis</h3>
+<p>
+  Set a small set of mandatory guardrails: supported identity and encryption, telemetry envelope,
+  vulnerability policy, contract registry, data classification, ownership metadata, and deployment
+  evidence. Offer approved templates and platform APIs. Let domain teams choose local internals
+  within those limits. Review cross-cutting exceptions through short architecture decision records
+  with owner, reason, consequences, expiry, and measurements.
+</p>
+
+<h3 id="service-catalog">Service catalog questions</h3>
+<ul>
+  <li>Who owns this service now, and who is paged?</li>
+  <li>What business capability, contracts, data, and critical dependencies does it own?</li>
+  <li>What are its SLO, recovery objectives, regions, and capacity limits?</li>
+  <li>Which consumers and event schemas exist, and which versions are deprecated?</li>
+  <li>Where are dashboard, runbook, deployment history, threat model, and decision records?</li>
+</ul>
+
+<h2 id="observability"><span class="num">22.</span> Observability and troubleshooting</h2>
+<p>
+  Observe user journeys and boundaries, not just host health. Carry a trace context and stable
+  business correlation identifier through synchronous calls and message envelopes. Never use the
+  correlation identifier as an authorization decision. Structured logs should include service,
+  version, environment, operation, outcome, latency, trace ID, and safe domain identifiers. Redact
+  tokens, payment data, secrets, and unnecessary personal data.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>Monolith view</th>
+        <th>Distributed view</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Traffic and errors</td>
+        <td>By route and module</td>
+        <td>By service, operation, caller, and version</td>
+      </tr>
+      <tr>
+        <td>Latency</td>
+        <td>Handler, transaction, pool, and module spans</td>
+        <td>End-to-end trace, hop budgets, network, and queue age</td>
+      </tr>
+      <tr>
+        <td>Saturation</td>
+        <td>CPU, memory, threads, connections, locks</td>
+        <td>Same plus per-service pools, broker lag, proxy, and quotas</td>
+      </tr>
+      <tr>
+        <td>Correctness</td>
+        <td>Invariant failures and rollback rate</td>
+        <td>Duplicates, stuck workflow states, reconciliation differences</td>
+      </tr>
+      <tr>
+        <td>Change</td>
+        <td>Module change failure and release lead time</td>
+        <td>Independent deploy rate, contract failures, version skew</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="troubleshooting-playbook">Troubleshooting a slow checkout</h3>
+<ol>
+  <li>Confirm the user-facing SLI, affected operations, tenants, regions, and versions.</li>
+  <li>
+    Follow traces from edge to dependencies and compare latency budget with actual critical path.
+  </li>
+  <li>Inspect saturation, pool waits, queue age, timeout, retry, and cancellation metrics.</li>
+  <li>Check recent deployment, schema, route, mesh, certificate, and feature changes.</li>
+  <li>Reduce load or disable noncritical work before adding retries or replicas blindly.</li>
+  <li>Verify workflow correctness and reconcile ambiguous attempts during recovery.</li>
+  <li>Record whether the boundary caused repeated operational coupling and revisit the design.</li>
+</ol>
+
+<h2 id="security"><span class="num">23.</span> Security, privacy, abuse, and trust boundaries</h2>
+<p class="lead">
+  Every process, service, queue, database account, gateway, sidecar, administrator, and external
+  integration is a trust boundary with an identity and limited authority.
+</p>
+
+<h3 id="identity-authz">Identity and authorization</h3>
+<p>
+  Authenticate users at the edge, but authorize sensitive business actions again at the service that
+  owns the resource. Authenticate workloads with short-lived identities where possible and encrypt
+  service traffic. Propagate only the user claims required for the operation, with audience and
+  expiry checks. A service using its own broad identity on behalf of a user can become a confused
+  deputy, so record actor, workload, tenant, purpose, and decision in the audit trail.
+</p>
+
+<h3 id="least-privilege">Least privilege by boundary</h3>
+<ul>
+  <li>Ordering can request an authorization but cannot read payment instrument secrets.</li>
+  <li>Notification receives a purpose-specific delivery address, not an entire customer record.</li>
+  <li>Analytics consumes minimized events and cannot call transactional write operations.</li>
+  <li>Each service account can access only owned schemas, topics, secrets, and object prefixes.</li>
+  <li>Administrative actions require stronger identity, reason capture, and immutable audit.</li>
+</ul>
+
+<h3 id="abuse-boundaries">Abuse and input boundaries</h3>
+<p>
+  Validate size, depth, count, encoding, and semantic constraints at every externally controlled
+  contract. Rate-limit by trustworthy identity and costly operation, not IP alone. Bound fan-out,
+  queue retention, decompression, file conversion, and downstream concurrency. Sign or authenticate
+  webhooks, reject replay with timestamp and unique delivery ID, and make handlers idempotent. Treat
+  broker messages as untrusted input because producer compromise and stale replay are possible.
+</p>
+
+<h3 id="privacy">Privacy and retention</h3>
+<p>
+  Service-owned copies make access fast but multiply deletion and retention obligations. Maintain a
+  data inventory and lawful purpose for each projection. Prefer opaque identifiers and minimized
+  event payloads. Encrypt transit and storage, rotate keys, constrain backups, and test deletion
+  propagation. A replay archive must not resurrect data after a valid deletion; use tombstones,
+  cryptographic erasure where suitable, or rebuild from a policy-compliant source.
+</p>
+
+<h2 id="performance"><span class="num">24.</span> Performance, capacity, scalability, and cost</h2>
+
+<h3 id="latency-composition">Latency and availability compose</h3>
+<p>
+  Sequential calls add latency. Parallel calls take roughly the slowest branch plus coordination.
+  Tail values do not combine by simply adding advertised p99 values, but every dependency adds
+  opportunities for a slow result. If a request requires five services, each at 99.9 percent
+  availability and failures were independent, the upper estimate is
+  <code>0.999^5 = 99.501 percent</code>. Shared infrastructure and correlated failures often make
+  the real result worse. Cache or defer noncritical data, reduce fan-out, and assign hop deadlines
+  from one end-to-end budget.
+</p>
+
+<h3 id="capacity-model">Capacity by resource and boundary</h3>
+<figure class="code">
+  <figcaption><b>Order path estimate</b></figcaption>
+  <pre><code>campaign checkout arrival = 120 requests/second
+average checkout service time = 0.25 second
+in-flight checkout work ~= 120 x 0.25 = 30 requests
+
+inventory calls per checkout = 1
+retry budget = at most 5 percent additional attempts
+planned inventory arrival ~= 126 requests/second
+
+If a worker processes 20 notifications/second and peak enqueue is 100/second,
+five workers only keep pace. Add failure headroom and scale from oldest-message age.</code></pre>
+</figure>
+
+<p>
+  Model CPU, memory, database connections, locks, network, payload size, storage growth, broker
+  partitions, vendor quotas, and failure capacity. Independent scaling pays off only if the service
+  owns the constrained resource. Splitting stateless code while all services contend for one
+  database does not remove the bottleneck.
+</p>
+
+<h3 id="cost-model">Cost model</h3>
+<ul>
+  <li>Baseline compute and replicas required for failure tolerance for every service.</li>
+  <li>
+    Load balancers, gateways, proxies, brokers, databases, telemetry, backups, and data transfer.
+  </li>
+  <li>Build pipelines, environments, contract infrastructure, patching, and incident response.</li>
+  <li>Developer cognitive load, local setup, cross-team coordination, and slower debugging.</li>
+  <li>
+    Opportunity benefit from faster independent delivery, fault containment, or right-sized scaling.
+  </li>
+</ul>
+
+<p>
+  A modular monolith often has lower fixed cost and more efficient local calls. Microservices can
+  lower marginal coordination or scaling cost once independent capabilities and teams are real.
+  Calculate total ownership cost and the value of the specific autonomy gained.
+</p>
+
+<h2 id="testing"><span class="num">25.</span> Testing boundaries, failure, and recovery</h2>
+<p class="lead">
+  Test the smallest unit that can prove a property, then add boundary tests for the risks introduced
+  by integration and distribution.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Test level</th>
+        <th>What it should prove</th>
+        <th>Order-platform example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Domain unit</td>
+        <td>Invariant and state transition without infrastructure</td>
+        <td>An order cannot confirm without payment and reservation references</td>
+      </tr>
+      <tr>
+        <td>Architecture</td>
+        <td>Dependency and ownership rules</td>
+        <td>Ordering cannot import Inventory internals or query its tables</td>
+      </tr>
+      <tr>
+        <td>Adapter integration</td>
+        <td>Mapping, transactions, constraints, and protocol behavior</td>
+        <td>Repository detects version conflict against a real database</td>
+      </tr>
+      <tr>
+        <td>Component</td>
+        <td>Service behavior with owned infrastructure and controlled substitutes</td>
+        <td>Payment timeout returns an explicit pending result and stores attempt state</td>
+      </tr>
+      <tr>
+        <td>Contract</td>
+        <td>Producer remains compatible with supported consumers</td>
+        <td>New OrderPlaced field is optional and old messages still parse</td>
+      </tr>
+      <tr>
+        <td>End-to-end</td>
+        <td>A few critical user journeys across deployed components</td>
+        <td>Place, pay, reserve, confirm, query, and cancel an order</td>
+      </tr>
+      <tr>
+        <td>Load and scalability</td>
+        <td>Capacity, tail latency, queues, pools, and scaling limits</td>
+        <td>Campaign peak plus one failed instance stays within SLO</td>
+      </tr>
+      <tr>
+        <td>Fault</td>
+        <td>Timeout, duplicate, reorder, pause, partition, and dependency loss</td>
+        <td>Lost payment response does not create a second authorization</td>
+      </tr>
+      <tr>
+        <td>Recovery</td>
+        <td>Restore, replay, reconciliation, rollback, and regional procedure</td>
+        <td>Rebuild notification projection without resending delivered emails</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="test-doubles">Use test doubles at owned contracts</h3>
+<p>
+  A fake should implement a documented contract, including errors, latency, pagination, and
+  idempotency, not expose provider internals. Keep a small suite against the real provider. Record
+  production examples safely and add them as compatibility fixtures. Shared environments are useful
+  for a few integration risks, but they must not be the only way a developer learns whether a change
+  is safe.
+</p>
+
+<h3 id="local-development">Local development</h3>
+<ul>
+  <li>Run one service or module with owned database and broker substitutes.</li>
+  <li>Provide versioned contract fixtures and deterministic seed data.</li>
+  <li>
+    Use a remote development environment only for dependencies impossible to reproduce safely.
+  </li>
+  <li>Make trace and message inspection available locally.</li>
+  <li>Provide one command for build, unit, integration, and contract checks.</li>
+  <li>Test mixed versions because production always contains version skew during rollout.</li>
+</ul>
+
+<h3 id="fault-campaign">Fault and recovery campaign</h3>
+<figure class="code">
+  <figcaption><b>One controlled experiment</b></figcaption>
+  <pre><code>Hypothesis:
+  If Payments loses 20 percent of responses for 10 minutes,
+  Ordering stays available for reads, creates no duplicate authorization,
+  and reconciles 99 percent of pending attempts within 15 minutes.
+
+Controls:
+  bounded tenant cohort, abort threshold, named commander, rollback ready
+
+Observe:
+  pending-state age, idempotency conflicts, retries, payment count,
+  checkout SLI, queue age, saturation, and reconciliation completion
+
+After:
+  verify business records, remove injection, document gaps, own follow-ups</code></pre>
+</figure>
+
+<h2 id="failure-scenarios">
+  <span class="num">26.</span> Failure scenarios, edge cases, and corrections
+</h2>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>Unsafe response</th>
+        <th>Safer design</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Provider releases a required response field</td>
+        <td>Deploy every consumer simultaneously</td>
+        <td>Add optional field, migrate consumers, then enforce later</td>
+      </tr>
+      <tr>
+        <td>Payment response is lost</td>
+        <td>Assume failure and submit a new payment ID</td>
+        <td>Query or retry with the same idempotency identity</td>
+      </tr>
+      <tr>
+        <td>Event is delivered twice</td>
+        <td>Rely on the broker to promise no duplicate</td>
+        <td>Deduplicate effect by event or business operation ID</td>
+      </tr>
+      <tr>
+        <td>Consumer is offline beyond retention</td>
+        <td>Resume from an expired offset</td>
+        <td>Restore snapshot, replay from a supported point, reconcile</td>
+      </tr>
+      <tr>
+        <td>Gateway is healthy but all backends are slow</td>
+        <td>Queue unlimited requests at the edge</td>
+        <td>Bound concurrency, honor deadlines, shed load, degrade safely</td>
+      </tr>
+      <tr>
+        <td>Service discovery returns removed endpoint</td>
+        <td>Treat it as data corruption</td>
+        <td>Expect staleness, timeout connect, drain, and retry safely</td>
+      </tr>
+      <tr>
+        <td>Sidecar config update is partial</td>
+        <td>Assume every proxy has one policy version</td>
+        <td>Design for skew, expose config version, stage policy rollout</td>
+      </tr>
+      <tr>
+        <td>Monolith instance crashes after commit</td>
+        <td>Assume in-process event listener ran</td>
+        <td>Use transactional outbox for required external effects</td>
+      </tr>
+      <tr>
+        <td>New service and legacy DB diverge in migration</td>
+        <td>Pick the larger value manually</td>
+        <td>Define authority, operation IDs, audit, and deterministic reconciliation</td>
+      </tr>
+      <tr>
+        <td>One tenant is a hot key</td>
+        <td>Scale every service uniformly</td>
+        <td>Tenant quotas, partitioning, isolation, and per-key concurrency</td>
+      </tr>
+      <tr>
+        <td>Shared library has a security issue</td>
+        <td>Wait for the next coordinated feature release</td>
+        <td>Inventory versions, automate patches, minimize shared business code</td>
+      </tr>
+      <tr>
+        <td>Compensation fails</td>
+        <td>Mark saga rolled back anyway</td>
+        <td>Persist unresolved state, retry safely, alert, and support human repair</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="common-mistakes">Common design mistakes</h3>
+<ul>
+  <li><strong>Premature split:</strong> prove modular boundaries and evidence first.</li>
+  <li><strong>Service per noun:</strong> group rules and outcomes by capability.</li>
+  <li><strong>Shared canonical domain model:</strong> translate between bounded contexts.</li>
+  <li><strong>Network inside a transaction:</strong> avoid holding locks across remote calls.</li>
+  <li>
+    <strong>Async by default:</strong> choose interaction from the user promise and failure model.
+  </li>
+  <li><strong>Business rules in gateway or mesh:</strong> keep domain policy with its owner.</li>
+  <li>
+    <strong>Event notification without source data:</strong> define how consumers obtain a stable
+    view.
+  </li>
+  <li>
+    <strong>Infinite backward compatibility:</strong> publish support windows and remove with
+    evidence.
+  </li>
+  <li>
+    <strong>Ignoring deletion and replay:</strong> make privacy lifecycle part of event design.
+  </li>
+  <li>
+    <strong>No merge strategy:</strong> accept that two wrongly split services may need to become
+    one.
+  </li>
+</ul>
+
+<h2 id="decision-method"><span class="num">27.</span> Architecture decision method</h2>
+<ol>
+  <li>
+    <strong>Clarify workload:</strong> users, operations, scale, latency, availability, privacy,
+    cost.
+  </li>
+  <li>
+    <strong>Model domain:</strong> commands, events, invariants, aggregates, contexts, external
+    systems.
+  </li>
+  <li>
+    <strong>Start simple:</strong> propose capability modules and one deployment unless evidence
+    differs.
+  </li>
+  <li>
+    <strong>Trace critical paths:</strong> mark synchronous hops, transactions, trust, and failure
+    states.
+  </li>
+  <li>
+    <strong>Evaluate forces:</strong> change coupling, ownership, scale, reliability, security, and
+    cost.
+  </li>
+  <li>
+    <strong>Choose styles per problem:</strong> internal dependency rule, deployment, interaction,
+    compute.
+  </li>
+  <li>
+    <strong>Design contracts:</strong> meaning, compatibility, idempotency, deadline, ownership,
+    support.
+  </li>
+  <li>
+    <strong>Design failure first:</strong> ambiguous outcomes, replay, overload, migration,
+    recovery.
+  </li>
+  <li>
+    <strong>Prove operations:</strong> SLO, capacity, telemetry, deploy, rollback, restore, and
+    on-call.
+  </li>
+  <li>
+    <strong>Record decision:</strong> assumptions, alternatives, consequences, fitness functions,
+    review date.
+  </li>
+</ol>
+
+<h2 id="exercises"><span class="num">28.</span> Hands-on exercises and design scenarios</h2>
+
+<h3 id="exercise-one">Exercise 1: find module boundaries</h3>
+<p>
+  Given catalog browsing, dynamic pricing, checkout, payment, warehouse stock, shipment, email, and
+  analytics, draw commands, facts, invariants, and owners. Propose modules before services.
+</p>
+<div class="key">
+  <strong>Expected reasoning</strong>
+  <p>
+    Catalog, Pricing, Ordering, Payments, Inventory, Fulfillment, Notification, and Analytics are
+    plausible contexts, but boundaries depend on experts and change. Ordering owns the order total
+    snapshot. Inventory owns stock. Payments owns authorization. Email and analytics react
+    asynchronously. Keep modules in one deployment until a specific autonomy or isolation need is
+    demonstrated.
+  </p>
+</div>
+
+<h3 id="exercise-two">Exercise 2: challenge a microservice proposal</h3>
+<p>
+  A team proposes Customer, Address, Order, OrderLine, Price, and Discount services because each is
+  a database table. Review the checkout flow and redesign it.
+</p>
+<div class="key">
+  <strong>Expected reasoning</strong>
+  <p>
+    The proposal decomposes entities, not capabilities. Checkout becomes chatty and cannot enforce
+    order invariants locally. Place order and line behavior in Ordering, copy the delivery address
+    and accepted price as historical snapshots, and ask Pricing for one quote contract when needed.
+    Customer profile remains separate only if its language, lifecycle, and owner are distinct.
+  </p>
+</div>
+
+<h3 id="exercise-three">Exercise 3: extract Payments</h3>
+<p>
+  Design the API, data owner, workflow states, idempotency, timeout recovery, audit, and rollout
+  from the modular monolith. State a rollback condition.
+</p>
+<div class="key">
+  <strong>Expected reasoning</strong>
+  <p>
+    Use payment-intent and authorization operations with stable idempotency keys. Ordering stores a
+    reference and explicit pending state. Payments owns vendor tokens and attempts. Shadow
+    historical queries, canary low-risk traffic, compare outcomes, and reconcile before expanding.
+    Stop rollout on duplicate authorization, unexplained divergence, or SLO breach. Rollback routing
+    must not create a second authoritative writer.
+  </p>
+</div>
+
+<h3 id="exercise-four">Exercise 4: choose sync or async</h3>
+<p>Decide how checkout obtains a price, reserves inventory, sends email, and feeds analytics.</p>
+<div class="key">
+  <strong>Expected reasoning</strong>
+  <p>
+    Checkout needs an accepted price before the promise, so a synchronous quote or local versioned
+    price projection is reasonable. Inventory depends on the promised semantics: reserve before
+    confirmation synchronously or expose pending confirmation asynchronously. Email and analytics
+    are deferrable events. Every choice states deadline, duplicate handling, and visible workflow
+    state.
+  </p>
+</div>
+
+<h3 id="exercise-five">Exercise 5: recover a distributed monolith</h3>
+<p>
+  Five services share one database, deploy together, and form a synchronous chain. Create a
+  three-month correction plan without a big-bang rewrite.
+</p>
+<div class="key">
+  <strong>Expected reasoning</strong>
+  <p>
+    Measure calls and table access, assign table and capability owners, stop new cross-writes, and
+    identify services that always change and fail together. Merge false splits or make them modules.
+    Introduce compatible contracts and local projections for valid boundaries. Shorten critical
+    chains, add one deadline, and service one ownership seam at a time.
+  </p>
+</div>
+
+<h2 id="interview"><span class="num">29.</span> Interview questions and model answers</h2>
+
+<h3 id="interview-monolith">1. Is a monolith less scalable than microservices?</h3>
+<p>
+  Not inherently. A stateless monolith can scale horizontally across many instances and use caches,
+  queues, and database scaling. Its limitation is granularity: all capabilities share an artifact
+  and usually a resource envelope. Microservices help when capabilities need meaningfully different
+  scaling, isolation, ownership, or release cadence. They can scale worse if remote chattiness and
+  shared databases dominate. A strong answer asks what resource is constrained and whether the split
+  owns it. <strong>Follow-up:</strong> How would you isolate one CPU-heavy capability without
+  extracting the whole domain? Move it to a bounded worker process and queue first.
+</p>
+
+<h3 id="interview-boundary">2. How do you choose a service boundary?</h3>
+<p>
+  Combine business language, invariants, aggregates, capability ownership, code change history, team
+  boundaries, scaling shape, failure isolation, and data classification. Model end-to-end success
+  and failure flows, then challenge the service as an in-process module. The boundary is credible
+  when it is cohesive internally, has a small contract externally, owns its data, and has one
+  operational owner. <strong>Follow-up:</strong> Is one bounded context always one service? No. It
+  can remain a module or be deployed as more than one runtime for workload reasons.
+</p>
+
+<h3 id="interview-modular">
+  3. What makes a modular monolith different from a traditional monolith?
+</h3>
+<p>
+  The deployment count may be identical. The difference is enforced capability boundaries: explicit
+  public APIs, hidden internals, owned tables, acyclic dependencies, module-level telemetry, and
+  architecture tests. A traditional layered monolith often allows any service or repository to reach
+  any model. <strong>Follow-up:</strong> Can a modular monolith use a queue? Yes. Deployment style
+  and interaction style are independent.
+</p>
+
+<h3 id="interview-data">4. Why should a microservice own its database?</h3>
+<p>
+  Independent schema evolution and invariant enforcement require one writer and supported access
+  paths. Shared tables create hidden contracts, security bypass, resource coupling, and coordinated
+  releases. Database per service is logical ownership, not necessarily one physical server. Other
+  services use APIs, events, or projections. <strong>Follow-up:</strong> How do you query across
+  services? Compose APIs for low-volume current data or maintain an event-fed read model for
+  frequent queries.
+</p>
+
+<h3 id="interview-communication">5. When should services communicate asynchronously?</h3>
+<p>
+  Use asynchronous communication when the caller can expose pending state, work is deferrable,
+  buffering protects a consumer, or several consumers react independently. It brings duplicates,
+  ordering, replay, lag, and eventual consistency. Use synchronous communication when an immediate
+  answer is necessary for the user promise. <strong>Follow-up:</strong> Does a broker remove
+  coupling? No. It reduces temporal and location coupling while retaining semantic, schema, volume,
+  and operational coupling.
+</p>
+
+<h3 id="interview-independent">6. How do you know services are independently deployable?</h3>
+<p>
+  Verify that a provider can release with old and new consumers running, owns its migrations, has no
+  shared release gate, passes compatibility checks, and can roll back within its data constraints.
+  Measure independent deploy rate and coordinated change frequency. Separate repositories or
+  pipelines do not prove it. <strong>Follow-up:</strong> What enables safe evolution? Additive
+  contracts, expand-migrate-contract changes, support windows, consumer verification, and traffic
+  evidence.
+</p>
+
+<h3 id="interview-mesh">7. What problem does a service mesh solve?</h3>
+<p>
+  A mesh standardizes service transport concerns such as workload identity, mTLS, discovery,
+  balancing, traffic policy, and telemetry across a fleet. It does not solve service boundaries,
+  business authorization, idempotency, or distributed transactions. It also adds proxy and
+  control-plane cost and failure modes. <strong>Follow-up:</strong> When would you avoid it? A
+  small, single-language fleet with adequate libraries may not repay the operational complexity.
+</p>
+
+<h3 id="interview-strangler">8. Explain a safe strangler migration.</h3>
+<p>
+  Put a route seam around one vertical capability, establish one authoritative writer, translate
+  models through an anti-corruption layer, backfill and capture changes, shadow and compare, canary,
+  then shift traffic. Reconcile continuously and keep a tested rollback that does not create two
+  truths. Retire old routes, jobs, credentials, and data only after evidence.
+  <strong>Follow-up:</strong>
+  Why avoid a big bang? It delays feedback and combines domain, data, contract, and operational
+  risk.
+</p>
+
+<h3 id="interview-distributed-monolith">9. What are signs of a distributed monolith?</h3>
+<p>
+  Lockstep deployment, shared tables, chatty synchronous chains, entity CRUD services, shared domain
+  libraries, central business orchestration, and no independent ownership are strong signs. The
+  system pays network failure costs but cannot change independently. <strong>Follow-up:</strong> Is
+  merging services a failure? No. It can restore cohesion and remove unjustified remote boundaries.
+</p>
+
+<h3 id="interview-architecture-choice">
+  10. Which architecture style would you choose for a new order system?
+</h3>
+<p>
+  State assumptions first. For a small team and uncertain domain, choose a capability-oriented
+  modular monolith, hexagonal boundaries for important adapters, and a queue worker for deferrable
+  notifications. Enforce data ownership and instrument modules. Extract only where team autonomy,
+  security isolation, scale, or blast radius becomes measurable. <strong>Follow-up:</strong> What
+  would trigger payment extraction? Specialist ownership, restricted data, audit isolation, vendor
+  release cadence, and an explicit workflow ready for ambiguous outcomes.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">30.</span> Revision cheat sheet</h2>
+<ul>
+  <li>
+    Architecture style defines constraints; technology and deployment do not define the style.
+  </li>
+  <li>Layers separate technical responsibilities; modules separate business capabilities.</li>
+  <li>Hexagonal and clean architecture point dependencies inward toward business policy.</li>
+  <li>
+    A modular monolith has one deployment but enforced APIs, data owners, and dependency rules.
+  </li>
+  <li>
+    Microservices require independent deployment, data ownership, team ownership, and failure
+    handling.
+  </li>
+  <li>Distribution is justified by measured autonomy, scale, isolation, or security needs.</li>
+  <li>High cohesion means related rules and change belong together.</li>
+  <li>
+    Coupling can be source, contract, temporal, data, behavioral, operational, or organizational.
+  </li>
+  <li>
+    A bounded context defines consistent language; an aggregate defines immediate consistency.
+  </li>
+  <li>Decompose by business capability, not table, screen, or technical layer.</li>
+  <li>Database per service is logical ownership and one supported writer.</li>
+  <li>Shared schemas create hidden contracts, security bypass, and coordinated releases.</li>
+  <li>Synchronous calls need deadlines, cancellation, idempotency, and bounded retry.</li>
+  <li>
+    Async messaging needs durable acceptance, deduplication, ordering scope, replay, and recovery.
+  </li>
+  <li>Gateways own edge policy; BFFs adapt client needs; domain services own business rules.</li>
+  <li>A mesh standardizes transport mechanics but cannot infer business correctness.</li>
+  <li>Independent deployment requires compatible contracts and mixed-version operation.</li>
+  <li>Prefer additive evolution and expand-migrate-contract removal.</li>
+  <li>Consumer-driven tests complement, but do not replace, authoritative provider contracts.</li>
+  <li>Strangler migration moves one vertical slice through shadow, canary, verify, and retire.</li>
+  <li>An anti-corruption layer translates models and must have an owner and exit criterion.</li>
+  <li>Avoid uncontrolled dual writes; use one authority plus durable change propagation.</li>
+  <li>Lockstep services with shared data and chatty calls form a distributed monolith.</li>
+  <li>
+    Cross-service invariants need explicit workflow state, outbox, idempotency, and reconciliation.
+  </li>
+  <li>
+    Observe user journeys, service boundaries, queue age, saturation, and stuck business states.
+  </li>
+  <li>Authorize at the data-owning service and minimize propagated identity and personal data.</li>
+  <li>
+    Model total cost, including baseline replicas, telemetry, environments, and cognitive load.
+  </li>
+  <li>
+    Test domain, architecture, adapters, contracts, load, faults, replay, restore, and recovery.
+  </li>
+  <li>
+    It is valid to keep a module, extract a service, or merge a wrong split based on evidence.
+  </li>
+</ul>
+
+<h2 id="references"><span class="num">31.</span> Primary official references</h2>
+<ul>
+  <li>
+    <a href="https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/"
+      >Microsoft Azure Architecture Center: Architecture styles</a
+    >
+    - definitions, constraints, and trade-offs for N-tier, web-queue-worker, microservices, and
+    event-driven styles.
+  </li>
+  <li>
+    <a
+      href="https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices"
+      >Microsoft Azure Architecture Center: Microservices architecture style</a
+    >
+    - capability decomposition, independent deployment, data ownership, gateways, and operational
+    challenges.
+  </li>
+  <li>
+    <a
+      href="https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/web-queue-worker"
+      >Microsoft Azure Architecture Center: Web-Queue-Worker architecture style</a
+    >
+    - front-end and worker separation, queue decoupling, scaling, and dual-write considerations.
+  </li>
+  <li>
+    <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/backends-for-frontends"
+      >Microsoft Azure Architecture Center: Backends for Frontends pattern</a
+    >
+    - client-specific API adaptation, ownership, performance, and operational trade-offs.
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/strangler-fig.html"
+      >AWS Prescriptive Guidance: Strangler fig pattern</a
+    >
+    - incremental migration, routing seams, applicability, and migration risks.
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/acl.html"
+      >AWS Prescriptive Guidance: Anti-corruption layer pattern</a
+    >
+    - translating semantics between bounded contexts during migration and integration.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9110.html">IETF RFC 9110: HTTP Semantics</a>
+    - stateless request-response semantics, intermediaries, methods, status codes, and idempotency.
+  </li>
+  <li>
+    <a href="https://spec.openapis.org/oas/">OpenAPI Initiative: OpenAPI Specification</a>
+    - machine-readable HTTP API descriptions and published specification versions.
+  </li>
+  <li>
+    <a href="https://github.com/cloudevents/spec">CNCF CloudEvents Specification</a>
+    - interoperable event context attributes, formats, protocol bindings, and current stable
+    release.
+  </li>
+  <li>
+    <a href="https://kubernetes.io/docs/concepts/services-networking/service/"
+      >Kubernetes documentation: Service</a
+    >
+    - stable logical endpoints, EndpointSlices, DNS discovery, and changing backend instances.
+  </li>
+  <li>
+    <a href="https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/"
+      >Kubernetes documentation: Sidecar containers</a
+    >
+    - companion containers, lifecycle, startup, and shutdown behavior.
+  </li>
+  <li>
+    <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/life_of_a_request.html"
+      >Envoy official documentation: Life of a Request</a
+    >
+    - proxy request flow and service-mesh transport responsibilities.
+  </li>
+  <li>
+    <a
+      href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/service_discovery"
+      >Envoy official documentation: Service discovery</a
+    >
+    - endpoint discovery, health checking, eventual consistency, and routing behavior.
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/ddl-priv.html"
+      >PostgreSQL documentation: Privileges</a
+    >
+    - database, schema, table, sequence, and function permissions used to enforce ownership
+    boundaries.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

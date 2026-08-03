@@ -140,6 +140,10 @@
         {
           "title": "Resilience, Retries, Backpressure, and Overload Control",
           "path": "systemdesign/resilience-retries-backpressure-overload"
+        },
+        {
+          "title": "Architecture Styles, Modular Monoliths, Microservices, and Service Boundaries",
+          "path": "systemdesign/architecture-styles-modular-monoliths-microservices-service-boundaries"
         }
       ]
     }
