@@ -156,6 +156,10 @@
         {
           "title": "Distributed Transactions, Sagas, Outbox, and Reliable Workflows",
           "path": "systemdesign/distributed-transactions-sagas-outbox-reliable-workflows"
+        },
+        {
+          "title": "Architecture Styles, Modular Monoliths, Microservices, and Service Boundaries",
+          "path": "systemdesign/architecture-styles-modular-monoliths-microservices-service-boundaries"
         }
       ]
     }
