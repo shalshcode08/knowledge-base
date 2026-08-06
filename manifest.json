@@ -148,6 +148,10 @@
         {
           "title": "Messaging, Event-Driven Architecture, and Stream Processing",
           "path": "systemdesign/messaging-event-driven-stream-processing"
+        },
+        {
+          "title": "Observability, SRE, Capacity Planning, and Incident Response",
+          "path": "systemdesign/observability-sre-capacity-planning-incident-response"
         }
       ]
     }
