@@ -134,6 +134,10 @@
           "path": "systemdesign/distributed-systems-time-ordering-consistency"
         },
         {
+          "title": "Replication, Partitioning, Sharding, and Quorum Systems",
+          "path": "systemdesign/replication-partitioning-sharding-quorum-systems"
+        },
+        {
           "title": "Coordination, Consensus, Leader Election, Leases, and Distributed Locks",
           "path": "systemdesign/coordination-consensus-leases-locks"
         },
