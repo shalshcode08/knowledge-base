@@ -152,6 +152,10 @@
         {
           "title": "Observability, SRE, Capacity Planning, and Incident Response",
           "path": "systemdesign/observability-sre-capacity-planning-incident-response"
+        },
+        {
+          "title": "Distributed Transactions, Sagas, Outbox, and Reliable Workflows",
+          "path": "systemdesign/distributed-transactions-sagas-outbox-reliable-workflows"
         }
       ]
     }

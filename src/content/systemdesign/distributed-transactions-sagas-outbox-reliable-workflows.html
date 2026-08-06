@@ -1,0 +1,2152 @@
+<h1>Distributed Transactions, Sagas, Outbox, and Reliable Workflows - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to preserving business invariants across independently failing services,
+  choosing between atomic commit and semantic recovery, building sagas and durable workflows,
+  publishing database changes reliably, and operating the complete design in production.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> Mental model and precise terminology</h2>
+<p class="lead">
+  A distributed business operation is not one large database transaction. It is a conversation among
+  owners of separate durable state, where every participant can succeed, fail, pause, or return an
+  ambiguous answer independently.
+</p>
+
+<div class="analogy">
+  <p>
+    Imagine arranging a conference. A venue, caterer, and speaker each control their own booking
+    record. There is no shared undo button. You either make all three promise and then confirm them
+    together, or you book them one at a time and define what to do if a later booking fails. A venue
+    cancellation is a new business action, perhaps with a fee, not time travel. Distributed
+    transactions have the same shape.
+  </p>
+</div>
+
+<p>
+  The core task is to preserve a stated business invariant despite partial failure. For an order,
+  the invariant might be: a confirmed order has one successful payment authorization and one valid
+  inventory reservation; every non-confirmed order eventually releases any reservation and voids or
+  refunds any payment it no longer needs. The word <em>eventually</em> is important. Intermediate
+  states are often visible, so the API, user experience, accounting, and operations model must
+  represent them honestly.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Precise meaning</th>
+        <th>Important boundary</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Local transaction</td>
+        <td>Atomic work committed by one transactional resource manager</td>
+        <td>Usually one database or one broker transaction, not one service call graph</td>
+      </tr>
+      <tr>
+        <td>Distributed transaction</td>
+        <td>One logical unit of work involving more than one independently committing resource</td>
+        <td>It needs an atomic commit protocol or application-level recovery</td>
+      </tr>
+      <tr>
+        <td>Atomic commit</td>
+        <td>All enlisted participants commit or all abort</td>
+        <td>It decides commitment, but does not remove application bugs or network uncertainty</td>
+      </tr>
+      <tr>
+        <td>Saga</td>
+        <td>A durable sequence of local transactions with recovery actions</td>
+        <td>It provides semantic recovery, not database isolation across the whole sequence</td>
+      </tr>
+      <tr>
+        <td>Compensation</td>
+        <td>A business action that counteracts a completed action</td>
+        <td>It need not restore the exact earlier bytes or erase an audit record</td>
+      </tr>
+      <tr>
+        <td>Orchestrator</td>
+        <td>A component that owns workflow state and chooses the next command</td>
+        <td>It coordinates; each service still owns and validates its data</td>
+      </tr>
+      <tr>
+        <td>Choreography</td>
+        <td>Participants react to events and collectively advance the flow</td>
+        <td>The process definition is distributed across subscriptions</td>
+      </tr>
+      <tr>
+        <td>Transactional outbox</td>
+        <td>A message record stored atomically beside the business change that caused it</td>
+        <td>A separate relay publishes it, normally with at-least-once behavior</td>
+      </tr>
+      <tr>
+        <td>Inbox</td>
+        <td>A durable record of consumed message identity and processing result</td>
+        <td>It suppresses duplicate effects only within its retention and identity scope</td>
+      </tr>
+      <tr>
+        <td>Durable execution</td>
+        <td>Workflow progress is persisted so execution resumes after process failure</td>
+        <td>External effects still need idempotency because a completion can be lost</td>
+      </tr>
+      <tr>
+        <td>Reconciliation</td>
+        <td>Comparison of authoritative records to detect and repair divergence</td>
+        <td>It is a required safety net, not an excuse for an unreliable primary flow</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The durable-intent rule</strong>
+  <p>
+    Before a process sends a command whose result matters, it must durably know why it is sending
+    it. Before it treats a result as complete, it must durably record that result. Every repeated
+    command must carry stable identity, and every uncertain result must be queried or reconciled.
+  </p>
+</div>
+
+<h2 id="problem"><span class="num">01.</span> Atomicity boundaries and the dual-write problem</h2>
+<p class="lead">
+  A local commit cannot atomically include an unrelated database, broker, HTTP service, email
+  provider, or payment network unless all resources participate in one supported commit protocol.
+</p>
+
+<h3 id="local-acid">What local ACID does and does not promise</h3>
+<p>
+  Inside one database transaction, atomicity makes a group of writes visible together or not at all.
+  Consistency means valid application and database rules move data between valid states. Isolation
+  constrains interference from concurrent transactions. Durability preserves a committed result
+  according to the database's durability policy. These properties end at that resource's transaction
+  boundary. An HTTP call made from inside a database transaction is not automatically rolled back
+  when the database rolls back.
+</p>
+
+<figure class="code">
+  <figcaption><b>The impossible uncoordinated dual write</b></figcaption>
+  <pre><code>BEGIN database transaction
+  INSERT order(id = O-701, status = 'CREATED')
+COMMIT
+
+PUBLISH OrderCreated(O-701)
+
+Crash after COMMIT, before PUBLISH:
+  order exists, event is missing
+
+If PUBLISH happens first and the database commit then fails:
+  event exists, order is missing
+
+Reversing the two operations only reverses the failure window.</code></pre>
+</figure>
+
+<p>
+  The same problem appears when a service updates two independent databases, charges a card and
+  creates an order, writes an object and metadata, or acknowledges a message before its database
+  commit. A process-level mutex, synchronized block, or try/catch cannot make two durable systems
+  commit atomically. A database callback that runs after commit also has a crash window.
+</p>
+
+<h3 id="ambiguous-outcomes">A timeout produces knowledge, not rollback</h3>
+<figure class="code">
+  <figcaption><b>Ambiguous payment result</b></figcaption>
+  <pre><code>Order service              Payment service               Payment database
+     | authorize K-91 ----------&gt;|                              |
+     |                            | insert authorization K-91 --&gt;|
+     |                            |&lt;------------- commit success |
+     |                            | send APPROVED                 |
+     |       connection lost X---|                              |
+     | timeout: UNKNOWN           |                              |
+
+UNKNOWN is not DECLINED. The safe next action is query(K-91) or retry(K-91),
+where K-91 identifies the same authorization attempt.</code></pre>
+</figure>
+
+<div class="warn">
+  <strong>Never map transport failure to business failure</strong>
+  <p>
+    A deadline, broken connection, broker redelivery, or crashed worker says that the observer did
+    not obtain a result. It does not prove that the remote effect did not commit. Store the state as
+    unknown or pending, preserve the operation identity, and resolve it through an idempotent retry,
+    outcome query, provider callback, or reconciliation job.
+  </p>
+</div>
+
+<h3 id="choice-overview">Three broad consistency tools</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Tool</th>
+        <th>Best fit</th>
+        <th>Cost or limitation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One local transaction</td>
+        <td>Data can share an owner and transactional store</td>
+        <td>May require changing boundaries or accepting one failure domain</td>
+      </tr>
+      <tr>
+        <td>Two-phase commit</td>
+        <td>All resources support the protocol and short atomicity is mandatory</td>
+        <td>Coordination, prepared-state locks, recovery complexity, limited participants</td>
+      </tr>
+      <tr>
+        <td>Saga plus reliable messaging</td>
+        <td>Independent owners, long-running work, or external side effects</td>
+        <td>Temporary inconsistency, domain-specific compensation, more visible states</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="two-phase-commit"><span class="num">02.</span> Two-phase commit from first principles</h2>
+<p class="lead">
+  Two-phase commit, or 2PC, separates a participant's durable promise from the coordinator's final
+  decision so all prepared participants can reach the same commit or abort outcome.
+</p>
+
+<h3 id="two-pc-roles">Roles and durable records</h3>
+<ul>
+  <li>The application begins one global transaction with a globally unique transaction ID.</li>
+  <li>The transaction manager or coordinator tracks enlisted resource managers.</li>
+  <li>Each resource manager executes local work on behalf of the global transaction.</li>
+  <li>Coordinator and participants persist enough log state to recover after a crash.</li>
+  <li>A read-only participant can vote read-only and leave before phase two.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Normal two-phase commit timeline</b></figcaption>
+  <pre><code>Coordinator                 Inventory DB                 Payment DB
+    | BEGIN global G-18           |                           |
+    | do work -------------------&gt; |                           |
+    | do work ----------------------------------------------&gt; |
+    | PREPARE? ------------------&gt; |                           |
+    |                             | force PREPARED to log     |
+    | &lt;---------------------- YES |                           |
+    | PREPARE? ---------------------------------------------&gt; |
+    |                                                         | force PREPARED
+    | &lt;------------------------------------------------- YES  |
+    | force COMMIT decision to coordinator log                |
+    | COMMIT G-18 --------------&gt; |                           |
+    | COMMIT G-18 ------------------------------------------&gt; |
+    | &lt;---------------------- ACK |                           |
+    | &lt;------------------------------------------------- ACK  |
+    | forget completed G-18       |                           |
+
+If any participant votes NO before the commit decision, the coordinator records
+ABORT and tells every prepared participant to roll back.</code></pre>
+</figure>
+
+<h3 id="prepared-state">Why prepare is a serious promise</h3>
+<p>
+  A YES vote means the participant has durably recorded everything needed to commit later and has
+  reserved the resources required to honor that promise. It can no longer unilaterally abort just
+  because its client disconnected. Depending on the resource, prepared state can retain row or
+  metadata locks, transaction identifiers, undo information, and storage. This is why preparation
+  must be short-lived and operationally visible.
+</p>
+
+<h3 id="coordinator-failure">Coordinator and participant failure mechanics</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure point</th>
+        <th>Durable truth</th>
+        <th>Recovery behavior</th>
+        <th>Risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Before any YES vote</td>
+        <td>No global commit decision</td>
+        <td>Abort incomplete work</td>
+        <td>Ordinary retry and cleanup</td>
+      </tr>
+      <tr>
+        <td>Some participants prepared</td>
+        <td>Those participants promised an eventual decision</td>
+        <td>Coordinator recovers and decides abort unless commit was durably chosen</td>
+        <td>Prepared resources remain held while coordinator is unreachable</td>
+      </tr>
+      <tr>
+        <td>Commit decision logged, messages lost</td>
+        <td>Global outcome is commit</td>
+        <td>Coordinator repeatedly sends commit; participant recovery asks for outcome</td>
+        <td>Temporary mixed visibility while notification is incomplete</td>
+      </tr>
+      <tr>
+        <td>Participant crashes after YES</td>
+        <td>Participant log contains prepared state</td>
+        <td>On restart, recover in-doubt transaction and obtain coordinator decision</td>
+        <td>Cannot safely guess if decision is unknown</td>
+      </tr>
+      <tr>
+        <td>Permanent coordinator data loss</td>
+        <td>Participants may know only that they voted YES</td>
+        <td>Restore coordinator log or apply a documented heuristic decision</td>
+        <td>Heuristic commit or rollback can violate atomicity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Classic 2PC is blocking for a prepared participant that cannot learn the decision. Replicating the
+  coordinator reduces its failure probability but does not turn an unsupported participant into a
+  transactional one. Consensus and 2PC solve different decisions: consensus can replicate the
+  coordinator's state among coordinator nodes, while 2PC obtains one atomic outcome across resource
+  managers that executed different work.
+</p>
+
+<h3 id="postgres-two-pc">Concrete PostgreSQL operational example</h3>
+<figure class="code">
+  <figcaption><b>Prepared transaction lifecycle</b></figcaption>
+  <pre><code>BEGIN;
+UPDATE inventory SET reserved = reserved + 1 WHERE sku = 'SKU-8';
+PREPARE TRANSACTION 'order-O-701-inventory';
+
+-- Later, from any session after the coordinator decides:
+COMMIT PREPARED 'order-O-701-inventory';
+
+-- Or, if the global decision is abort:
+ROLLBACK PREPARED 'order-O-701-inventory';</code></pre>
+</figure>
+
+<p>
+  PostgreSQL stores prepared transaction state durably, and a later session completes it. Production
+  use requires a deliberately configured prepared-transaction limit, a durable coordinator, unique
+  IDs, monitoring of <code>pg_prepared_xacts</code>, an age alert, and a runbook that maps each ID
+  to a verified coordinator decision. An operator must not guess from application status alone.
+  <code>PREPARE TRANSACTION</code> is unrelated to a prepared SQL statement created by
+  <code>PREPARE</code>.
+</p>
+
+<h3 id="when-two-pc">When 2PC is reasonable and when it is not</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>Favors 2PC</th>
+        <th>Favors redesign or saga</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Participant support</td>
+        <td>Every resource exposes tested XA or equivalent</td>
+        <td>HTTP APIs, email, object stores, payment networks</td>
+      </tr>
+      <tr>
+        <td>Duration</td>
+        <td>Short machine operation</td>
+        <td>Minutes, days, or human approval</td>
+      </tr>
+      <tr>
+        <td>Consistency need</td>
+        <td>No intermediate state may be observed</td>
+        <td>Pending state and eventual recovery are acceptable</td>
+      </tr>
+      <tr>
+        <td>Ownership</td>
+        <td>One operational boundary and compatible resources</td>
+        <td>Independent teams and autonomous deployments</td>
+      </tr>
+      <tr>
+        <td>Failure budget</td>
+        <td>Prepared locks and coordinator recovery are acceptable</td>
+        <td>Availability during partitions matters more</td>
+      </tr>
+      <tr>
+        <td>Scale</td>
+        <td>Bounded participants and predictable latency</td>
+        <td>High fan-out or geographically distant participants</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Do not reject 2PC by slogan. First ask whether one database transaction can preserve the
+  invariant. If not, determine whether every participant truly supports atomic commit and whether
+  blocking and coupling fit the workload. A short database-to-broker XA transaction can be
+  appropriate in a controlled platform. A checkout that includes a card network and shipping partner
+  cannot rely on it.
+</p>
+
+<h2 id="sagas"><span class="num">03.</span> Sagas and semantic rollback</h2>
+<p class="lead">
+  A saga preserves a business outcome by committing a series of local steps and executing explicit
+  recovery actions when forward progress becomes impossible.
+</p>
+
+<h3 id="saga-step-types">Compensable, pivot, and retryable steps</h3>
+<ul>
+  <li>
+    <strong>Compensable step:</strong> a later command can counteract it, such as release inventory.
+  </li>
+  <li>
+    <strong>Pivot step:</strong> the point after which the workflow commits to forward completion.
+  </li>
+  <li>
+    <strong>Retryable step:</strong> an idempotent action after the pivot that should eventually
+    succeed.
+  </li>
+</ul>
+
+<p>
+  The labels describe business meaning, not an infrastructure feature. For one merchant, payment
+  authorization is compensable because it can be voided. Capturing funds may be the pivot because a
+  refund is financially distinct and incurs fees. Sending a marketing email is neither safely
+  reversible nor important enough to block order confirmation, so it belongs after confirmation as
+  best-effort retryable work.
+</p>
+
+<div class="key">
+  <strong>Compensation is not rollback</strong>
+  <p>
+    A refund does not erase a charge. It creates another ledger entry. Releasing inventory does not
+    restore the world to its earlier state if another order then takes the units. Canceling shipment
+    may incur a fee. Keep both actions, their reasons, actors, timestamps, and external references
+    in the audit history.
+  </p>
+</div>
+
+<h3 id="compensation-design">Design every forward step with its recovery contract</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Forward action</th>
+        <th>Recovery action</th>
+        <th>Required stored facts</th>
+        <th>Limit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Reserve 3 units</td>
+        <td>Release that reservation</td>
+        <td>Reservation ID, SKU, quantity, expiry</td>
+        <td>Release cannot recreate expired stock</td>
+      </tr>
+      <tr>
+        <td>Authorize payment</td>
+        <td>Void authorization</td>
+        <td>Provider authorization ID, amount, currency</td>
+        <td>A settled authorization may require refund</td>
+      </tr>
+      <tr>
+        <td>Capture payment</td>
+        <td>Issue refund</td>
+        <td>Capture ID, refundable balance, reason</td>
+        <td>Fees and settlement remain in audit</td>
+      </tr>
+      <tr>
+        <td>Create shipment</td>
+        <td>Cancel or intercept shipment</td>
+        <td>Carrier label ID, shipment state</td>
+        <td>Already delivered goods cannot be canceled</td>
+      </tr>
+      <tr>
+        <td>Send email</td>
+        <td>Usually none</td>
+        <td>Notification ID and template version</td>
+        <td>A retraction email cannot make it unread</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Capture compensation inputs when the forward step commits. Do not reconstruct a past price,
+  address, tax decision, or permission from mutable current data. Make compensation idempotent and
+  conditional on the resource still belonging to this saga. Compensation order is often reverse
+  order, but the domain can require another order or safe parallelism.
+</p>
+
+<h3 id="isolation-anomalies">Sagas do not provide transaction isolation</h3>
+<p>
+  While a saga is running, another operation can observe or change its intermediate data. Typical
+  anomalies include lost updates, dirty business reads, and nonrepeatable decisions. Database dirty
+  reads are not required for a dirty business read: a local reservation is committed and visible,
+  but the larger order can still compensate later.
+</p>
+
+<ul>
+  <li>
+    <strong>Semantic lock:</strong> mark an entity as pending and restrict conflicting actions.
+  </li>
+  <li><strong>Version check:</strong> update only if the version seen earlier still matches.</li>
+  <li>
+    <strong>Escrow or reservation:</strong> allocate a bounded right instead of changing final
+    ownership.
+  </li>
+  <li><strong>Commutative operation:</strong> represent deltas that can safely reorder.</li>
+  <li>
+    <strong>Reread before pivot:</strong> verify price, stock, policy, and customer state again.
+  </li>
+  <li><strong>Reorder steps:</strong> move high-risk changes closer to the pivot or after it.</li>
+</ul>
+
+<h2 id="orchestration-choreography"><span class="num">04.</span> Orchestration and choreography</h2>
+
+<h3 id="orchestration">Orchestration</h3>
+<p>
+  An orchestrator stores the workflow state, sends a command for the next step, consumes the result,
+  and chooses the next transition. It offers one readable process definition, explicit deadlines,
+  centralized recovery policy, and a natural place for operator controls. It must be durable and
+  horizontally recoverable, but it need not be a throughput bottleneck: instances can partition
+  workflow IDs while the state store serializes each workflow.
+</p>
+
+<h3 id="choreography">Choreography</h3>
+<p>
+  In choreography, an order event triggers inventory, an inventory event triggers payment, and later
+  events trigger confirmation or recovery. There is no component issuing every command. This can
+  keep a small, linear flow loosely coupled, but process state becomes implicit in event routes.
+  Cycles, hidden dependencies, duplicated policy, difficult timeouts, and unclear ownership grow
+  quickly as participants and branches increase.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Orchestration</th>
+        <th>Choreography</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Process definition</td>
+        <td>Explicit in orchestrator state machine</td>
+        <td>Distributed across consumers and subscriptions</td>
+      </tr>
+      <tr>
+        <td>Coupling</td>
+        <td>Orchestrator knows command contracts</td>
+        <td>Consumers know event contracts and implied sequence</td>
+      </tr>
+      <tr>
+        <td>Complex branching</td>
+        <td>Usually easier to reason about</td>
+        <td>Can become an event maze</td>
+      </tr>
+      <tr>
+        <td>Local autonomy</td>
+        <td>Participant decides how, orchestrator decides when</td>
+        <td>Participant reacts independently</td>
+      </tr>
+      <tr>
+        <td>Visibility</td>
+        <td>One workflow state and history</td>
+        <td>Requires correlation across event histories</td>
+      </tr>
+      <tr>
+        <td>Failure mode</td>
+        <td>Unavailable coordinator delays progress</td>
+        <td>Missing route or consumer silently stops flow</td>
+      </tr>
+      <tr>
+        <td>Best fit</td>
+        <td>Long, branching, timed, or regulated workflows</td>
+        <td>Few steps with stable event relationships</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A hybrid is common. The orchestrator controls order fulfillment, while independent analytics and
+  notification consumers react to business events without becoming required workflow participants.
+  Avoid an orchestrator that reads and writes every service database. It should send domain commands
+  through supported contracts; otherwise it removes service ownership and becomes a distributed
+  monolith controller.
+</p>
+
+<h2 id="state-machines"><span class="num">05.</span> Durable workflow state machines</h2>
+<p class="lead">
+  Reliability comes from persisted transitions, explicit states, and repeatable decisions, not from
+  keeping one worker or thread alive.
+</p>
+
+<h3 id="state-model">State model</h3>
+<figure class="code">
+  <figcaption><b>Order saga states and terminal outcomes</b></figcaption>
+  <pre><code>STARTED
+  -&gt; RESERVING_INVENTORY
+      -&gt; INVENTORY_RESERVED
+          -&gt; AUTHORIZING_PAYMENT
+              -&gt; PAYMENT_AUTHORIZED
+                  -&gt; CONFIRMING_ORDER
+                      -&gt; CONFIRMED                    terminal success
+
+Failure before confirmation:
+  -&gt; COMPENSATING_PAYMENT
+      -&gt; COMPENSATING_INVENTORY
+          -&gt; CANCELED                                terminal recovery
+
+Uncertain provider result:
+  -&gt; PAYMENT_OUTCOME_UNKNOWN
+      -&gt; AUTHORIZING_PAYMENT | PAYMENT_AUTHORIZED | MANUAL_REVIEW
+
+Repeated recovery failure:
+  -&gt; COMPENSATION_BLOCKED                            operator-owned</code></pre>
+</figure>
+
+<p>
+  Persist both coarse business state and step attempts. A useful transition row contains workflow
+  ID, current state, version, step name, attempt, command ID, input digest, scheduled time,
+  deadline, result, external reference, error class, and timestamps. Use an optimistic version or a
+  single workflow executor lease with fencing so two workers cannot advance the same instance
+  concurrently.
+</p>
+
+<h3 id="transition-algorithm">Atomic transition algorithm</h3>
+<figure class="code">
+  <figcaption><b>Language-neutral orchestrator pseudocode</b></figcaption>
+  <pre><code>ADVANCE(workflow_id, observed_event):
+  begin local transaction
+    workflow = lock_or_compare_version(workflow_id)
+
+    if observed_event.id is already consumed:
+      return stored transition result
+
+    validate event belongs to expected command and workflow state
+    next = transition_table(workflow.state, observed_event.outcome)
+
+    record consumed event ID
+    update workflow state, version, business facts, and audit history
+
+    if next has command:
+      insert outbox(command_id, workflow_id, next.command, next.deadline)
+  commit local transaction
+
+  relay publishes the command later</code></pre>
+</figure>
+
+<p>
+  The state transition, consumed-event marker, and next command intent share one local transaction.
+  A crash before commit leaves all three absent and redelivery retries the same transition. A crash
+  after commit leaves all three present, and duplicate consumption returns the stored result. The
+  relay can publish the command more than once, so the receiving service must deduplicate it.
+</p>
+
+<h3 id="timers-retries">Timers, retries, deadlines, and cancellation</h3>
+<ul>
+  <li>Persist wake-up time, never rely only on an in-memory timer.</li>
+  <li>
+    Use a monotonic clock for elapsed work inside a process and wall time for durable schedules.
+  </li>
+  <li>
+    Classify business rejection separately from transient technical failure and unknown outcome.
+  </li>
+  <li>Bound retry attempts, elapsed time, and aggregate retry load; add jitter.</li>
+  <li>Use stable command IDs across retries of the same logical effect.</li>
+  <li>
+    On cancel, define whether to stop future work, compensate completed work, or reject after pivot.
+  </li>
+  <li>
+    Late success after timeout is a valid event that the state machine must handle explicitly.
+  </li>
+</ul>
+
+<h3 id="durable-execution">Replay-based durable execution</h3>
+<p>
+  Some workflow engines persist a history of decisions, timers, signals, and activity results. After
+  a crash they replay that history through workflow code to reconstruct state, then schedule only
+  new work. Workflow decision code must therefore be deterministic for the recorded history.
+  Wall-clock reads, random values, unordered iteration, network calls, and version-dependent
+  branching must use engine-provided deterministic APIs or activities. Deploy workflow changes with
+  versioning or compatibility markers so old histories still replay.
+</p>
+
+<p>
+  Durable execution does not make an external payment exactly once. The worker can receive approval,
+  crash before recording it, and execute the activity again. Activity commands still require stable
+  idempotency identity, outcome lookup, heartbeats for long work, and cancellation semantics.
+</p>
+
+<h3 id="human-intervention">Human intervention is a first-class state</h3>
+<p>
+  A disputed payment, inconsistent provider records, expired compensation window, or legal approval
+  may require a person. Store <code>MANUAL_REVIEW</code> with reason code, evidence links, permitted
+  actions, deadline, and owner queue. An operator action must be authenticated, authorized, require
+  a comment for sensitive changes, use optimistic concurrency, and create an immutable audit event.
+  Never tell an operator to edit production rows until they look right.
+</p>
+
+<h2 id="outbox"><span class="num">06.</span> Transactional outbox</h2>
+<p class="lead">
+  The outbox converts an unsafe database-plus-broker dual write into one local database commit plus
+  a retryable delivery problem.
+</p>
+
+<h3 id="outbox-schema">Minimal outbox contract</h3>
+<figure class="code">
+  <figcaption><b>Business row and event intent in one transaction</b></figcaption>
+  <pre><code>BEGIN;
+
+UPDATE orders
+SET status = 'CONFIRMED', version = version + 1
+WHERE order_id = 'O-701' AND version = 7;
+
+INSERT INTO outbox_event (
+  event_id, aggregate_type, aggregate_id, aggregate_version,
+  event_type, schema_version, occurred_at, payload, trace_context
+) VALUES (
+  'E-9901', 'Order', 'O-701', 8,
+  'OrderConfirmed', 3, CURRENT_TIMESTAMP, :payload, :trace_context
+);
+
+COMMIT;</code></pre>
+</figure>
+
+<p>
+  The outbox row is immutable event intent. Use a globally unique event ID, aggregate ID as routing
+  key, per-aggregate version, explicit event and schema versions, occurrence time, tenant identity,
+  and a payload that contains the business fact consumers need. Do not publish a database row dump,
+  secret, card data, access token, or unbounded object. A trace context is useful but must not
+  replace business correlation IDs.
+</p>
+
+<h3 id="polling-relay">Polling publisher</h3>
+<figure class="code">
+  <figcaption><b>Concurrent safe polling pseudocode</b></figcaption>
+  <pre><code>repeat:
+  begin transaction
+    rows = select due unpublished outbox rows
+           ordered by created_at, event_id
+           limit batch_size
+           lock rows while allowing other relays to skip locked rows
+    mark rows with lease_owner and lease_until
+  commit
+
+  for row in rows:
+    publish(row.routing_key, row.event_id, row.payload)
+    if broker acknowledges:
+      mark row published if lease_owner still matches
+    else:
+      release or let lease expire; retry with backoff</code></pre>
+</figure>
+
+<p>
+  Never hold a database transaction open while waiting on a broker unless the design intentionally
+  uses a supported atomic resource transaction. Short leases let another relay recover abandoned
+  rows. A crash after broker acknowledgement but before marking the row published causes a
+  duplicate. That is safe only when consumers are idempotent. Deleting published rows can reduce
+  storage, but keep enough history or archive evidence to support replay, audit, and reconciliation.
+</p>
+
+<h3 id="cdc-relay">Change data capture relay</h3>
+<p>
+  A change data capture connector reads the database's committed change log and maps inserts from
+  the outbox table to broker messages. This avoids application polling and follows commit order as
+  exposed by the database log. It adds connector, log-retention, schema, offset, snapshot, and
+  operational concerns. If the connector is down, database logs or replication slots can grow until
+  retention limits or disk capacity become incidents.
+</p>
+
+<p>
+  Debezium's official outbox event router expects insert-oriented outbox records, exposes the unique
+  event ID in a header, and can use the aggregate ID as the message key. That key is important for
+  maintaining per-aggregate order in a partitioned broker. CDC still does not give every consumer
+  one global exactly-once effect. Connector restarts, broker retries, consumer crashes, and
+  downstream side effects retain duplicate windows.
+</p>
+
+<h3 id="outbox-ordering">Ordering rules</h3>
+<ul>
+  <li>State the required scope: per order, per account, per partition, or global.</li>
+  <li>
+    Route all events for one aggregate by stable aggregate ID when per-aggregate order matters.
+  </li>
+  <li>Include aggregate version so a consumer detects gaps, duplicates, and stale delivery.</li>
+  <li>Do not assume created timestamps form a total order across nodes.</li>
+  <li>
+    Multiple relay workers can reorder different aggregates safely if no cross-aggregate invariant
+    exists.
+  </li>
+  <li>A failed older event must not be skipped silently if later versions depend on it.</li>
+  <li>Repartitioning, retries, and dead-letter replays require explicit ordering tests.</li>
+</ul>
+
+<h2 id="inbox"><span class="num">07.</span> Inbox, deduplication, and idempotency</h2>
+<p class="lead">
+  At-least-once delivery becomes an effectively-once business effect when duplicate commands are
+  recognized and their effect and receipt are committed atomically.
+</p>
+
+<figure class="code">
+  <figcaption><b>Atomic inbox processing</b></figcaption>
+  <pre><code>PROCESS(message):
+  authenticate source and validate schema, size, tenant, and expiry
+
+  begin local transaction
+    prior = inbox.find(consumer_name, message.id)
+    if prior exists:
+      commit
+      acknowledge message
+      return prior.outcome
+
+    assert command identity is valid for message payload digest
+    outcome = apply domain transition with database constraints
+    insert inbox(consumer_name, message.id, digest, outcome, processed_at)
+    insert outbox events caused by outcome
+  commit
+
+  acknowledge message
+
+If the worker crashes before commit, redelivery repeats no committed effect.
+If it crashes after commit but before acknowledgement, inbox returns prior outcome.</code></pre>
+</figure>
+
+<h3 id="idempotency-key-design">Idempotency key design</h3>
+<ul>
+  <li>Generate the key at the boundary that knows one logical user intent.</li>
+  <li>Scope it by tenant, authenticated principal, operation, and target as appropriate.</li>
+  <li>Store a canonical request digest; reject the same key with different parameters.</li>
+  <li>Use a unique database constraint to resolve concurrent duplicates atomically.</li>
+  <li>Return the original durable outcome, including its business reference.</li>
+  <li>Retain keys longer than every client, broker, replay, and disaster-recovery retry window.</li>
+  <li>Redact or encrypt stored results that contain personal or financial information.</li>
+</ul>
+
+<h3 id="dedupe-limits">Deduplication limitations</h3>
+<p>
+  A finite inbox cannot suppress a duplicate delivered after its record expires. A message ID cannot
+  help if a producer gives each retry a new ID. An in-memory set disappears on restart and diverges
+  across replicas. A broker's duplicate suppression cannot cover a later database or HTTP side
+  effect. Where possible, strengthen idempotency with a domain invariant such as unique payment per
+  <code>(order_id, payment_attempt)</code> or one active reservation per command ID.
+</p>
+
+<h2 id="exactly-once"><span class="num">08.</span> Exactly-once claims and their boundaries</h2>
+<p class="lead">
+  Exactly once is meaningful only when the operation, scope, state stores, failure model, and
+  observation boundary are named.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Claim</th>
+        <th>What may be true</th>
+        <th>What remains outside</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Exactly-once producer</td>
+        <td>Broker deduplicates producer sequence retries in one session or epoch</td>
+        <td>Business command duplicated with a new identity</td>
+      </tr>
+      <tr>
+        <td>Transactional stream</td>
+        <td>Input offsets and output records commit atomically within supported broker scope</td>
+        <td>HTTP calls, email, or an unrelated database</td>
+      </tr>
+      <tr>
+        <td>Exactly-once workflow</td>
+        <td>Workflow decisions and recorded activity results replay once</td>
+        <td>An activity effect completed before its result was recorded</td>
+      </tr>
+      <tr>
+        <td>Effectively-once effect</td>
+        <td>Duplicates occur but idempotency yields one intended business result</td>
+        <td>Duplicate transport, metrics, logs, or attempts may remain visible</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Prefer the honest phrase: at-least-once transport with idempotent, deduplicated business effects.
+  Then document the key scope, retention, atomic store, and reconciliation method. This is more
+  useful than claiming global exactly once.
+</p>
+
+<h2 id="complete-design">
+  <span class="num">09.</span> Complete order, payment, and inventory design
+</h2>
+<p class="lead">
+  This design uses an orchestrated saga, service-owned databases, transactional outboxes, idempotent
+  commands, and reconciliation. It optimizes for reliable online checkout without requiring the card
+  network to join a database transaction.
+</p>
+
+<h3 id="requirements-assumptions">Requirements and assumptions</h3>
+<ul>
+  <li>An order contains one or more SKUs and one payment method token.</li>
+  <li>Peak accepted checkout rate is 2,000 orders per second, with bursts to 4,000.</li>
+  <li>Checkout returns an order ID quickly; final confirmation may take several seconds.</li>
+  <li>Inventory must never confirm more units than available under normal database correctness.</li>
+  <li>A confirmed order must have a valid reservation and payment authorization.</li>
+  <li>Inventory reservations expire after 15 minutes unless confirmed.</li>
+  <li>Payment provider requests can time out after committing.</li>
+  <li>Order, Inventory, and Payment services each own their database and deployment.</li>
+  <li>Per-order command and event order matters; global order across all orders does not.</li>
+  <li>Customer-visible states are Pending, Confirmed, Canceled, and Needs attention.</li>
+</ul>
+
+<h3 id="architecture">Components and ownership</h3>
+<figure class="code">
+  <figcaption><b>Production architecture and trust boundaries</b></figcaption>
+  <pre><code>Customer
+   |
+   | HTTPS + authenticated checkout + Idempotency-Key
+   v
+API Gateway -&gt; Order API -&gt; Order DB + Outbox
+                              |
+                              v
+                     replicated message broker
+                              |
+                 Order Workflow Orchestrator
+                     |                    |
+          ReserveInventory command    AuthorizePayment command
+                     |                    |
+                     v                    v
+             Inventory Service       Payment Service -&gt; tokenized provider API
+             Inventory DB+Inbox      Payment DB+Inbox
+                     |                    |
+                     +------ result events ------+
+                              |
+                      Orchestrator DB+Outbox
+
+Control plane: operator console -&gt; workflow administration API
+Evidence plane: immutable audit sink, metrics, traces, reconciliation reports
+
+Each service database is private. Services communicate through authenticated
+contracts, not by querying another service's tables.</code></pre>
+</figure>
+
+<h3 id="order-data">Essential records</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Owner</th>
+        <th>Record</th>
+        <th>Key fields and invariant</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Order</td>
+        <td>Order</td>
+        <td>order ID, customer, immutable priced lines, total, currency, status, version</td>
+      </tr>
+      <tr>
+        <td>Orchestrator</td>
+        <td>Workflow instance</td>
+        <td>
+          workflow ID, order ID, state, version, deadlines, command IDs, participant references
+        </td>
+      </tr>
+      <tr>
+        <td>Inventory</td>
+        <td>Reservation</td>
+        <td>reservation ID, command ID unique, SKU quantities, status, expires at</td>
+      </tr>
+      <tr>
+        <td>Inventory</td>
+        <td>Stock counters</td>
+        <td>available and reserved never negative; update atomically with reservation</td>
+      </tr>
+      <tr>
+        <td>Payment</td>
+        <td>Payment attempt</td>
+        <td>attempt ID, command ID unique, amount, currency, provider key/reference, status</td>
+      </tr>
+      <tr>
+        <td>Every participant</td>
+        <td>Inbox and outbox</td>
+        <td>message identity, digest, result; event identity, aggregate version, publish state</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="happy-path">Happy-path sequence</h3>
+<figure class="code">
+  <figcaption><b>Checkout through confirmation</b></figcaption>
+  <pre><code>1. Client -&gt; Order: CreateOrder(checkout key C-12)
+2. Order transaction:
+     insert order O-701 in PENDING
+     insert OrderCreated event E-1
+   return 202 Accepted with O-701
+
+3. Orchestrator consumes E-1 transactionally:
+     create workflow W-701 in RESERVING_INVENTORY
+     insert ReserveInventory command I-CMD-1
+
+4. Inventory consumes I-CMD-1 transactionally:
+     verify inbox has no I-CMD-1
+     conditionally reserve requested units as reservation R-33
+     insert inbox outcome and InventoryReserved event E-2
+
+5. Orchestrator consumes E-2 transactionally:
+     store R-33, set AUTHORIZING_PAYMENT
+     insert AuthorizePayment command P-CMD-1
+
+6. Payment consumes P-CMD-1:
+     use P-CMD-1 as provider idempotency key
+     persist APPROVED with provider authorization A-55
+     insert PaymentAuthorized event E-3
+
+7. Orchestrator consumes E-3 transactionally:
+     store A-55, set CONFIRMING_ORDER
+     insert ConfirmOrder command O-CMD-1
+
+8. Order consumes O-CMD-1 transactionally:
+     require PENDING and matching workflow
+     set CONFIRMED
+     insert OrderConfirmed event E-4
+
+9. Orchestrator records CONFIRMED as terminal success.
+10. Inventory marks R-33 allocated; later fulfillment and notification react independently.</code></pre>
+</figure>
+
+<p>
+  Confirmation is the pivot in this example. Before it, reservation and authorization are
+  compensable. After it, fulfillment actions must move forward or enter a separately defined return
+  and refund workflow. The design revalidates reservation expiry and authorization validity before
+  confirmation. Notification does not belong on the critical consistency path.
+</p>
+
+<h3 id="inventory-rejection">Insufficient inventory path</h3>
+<ol>
+  <li>Inventory commits a rejected command outcome and emits <code>InventoryRejected</code>.</li>
+  <li>
+    The orchestrator moves directly to cancel because no previous side effect needs compensation.
+  </li>
+  <li>Order transitions from Pending to Canceled with reason <code>OUT_OF_STOCK</code>.</li>
+  <li>The client sees a durable business rejection, not a retryable technical error.</li>
+</ol>
+
+<h3 id="payment-decline">Payment decline path</h3>
+<ol>
+  <li>Payment stores a final declined outcome for <code>P-CMD-1</code>.</li>
+  <li>The orchestrator records the reason, then emits <code>ReleaseInventory(R-33)</code>.</li>
+  <li>Inventory changes only reservation R-33 from Held to Released and emits completion.</li>
+  <li>Order becomes Canceled only after release succeeds or enters a visible recovery state.</li>
+</ol>
+
+<h3 id="unknown-payment">Unknown payment path</h3>
+<p>
+  If the provider request times out, Payment records <code>OUTCOME_UNKNOWN</code>; it must not emit
+  Declined. A reconciliation worker queries the provider using the stable key or provider reference.
+  If approved, it stores approval and emits the normal result. If definitively absent, it can retry
+  authorization with the same logical key. If the provider cannot resolve the result before the
+  reservation expires, the workflow enters manual review or follows a preapproved risk policy.
+  Automatically issuing another authorization with a fresh key could double-authorize funds.
+</p>
+
+<h3 id="workflow-failure-matrix">End-to-end failure matrix</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Durable state</th>
+        <th>Automatic recovery</th>
+        <th>Alert threshold</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Order commits, relay crashes</td>
+        <td>Order and E-1 are both present</td>
+        <td>Relay lease expires and publishes E-1</td>
+        <td>Oldest unpublished outbox age exceeds SLO</td>
+      </tr>
+      <tr>
+        <td>Relay publishes E-1 twice</td>
+        <td>Same event ID appears twice</td>
+        <td>Orchestrator inbox returns existing W-701</td>
+        <td>Duplicate rate sharply exceeds baseline</td>
+      </tr>
+      <tr>
+        <td>Inventory worker crashes before local commit</td>
+        <td>No reservation and no inbox row</td>
+        <td>Broker redelivers I-CMD-1</td>
+        <td>Retry age or delivery count grows</td>
+      </tr>
+      <tr>
+        <td>Inventory crashes after commit before ack</td>
+        <td>R-33, inbox, and E-2 exist</td>
+        <td>Redelivery returns stored result</td>
+        <td>No page unless loop or latency breaches SLO</td>
+      </tr>
+      <tr>
+        <td>Payment response lost after provider approval</td>
+        <td>Local status may be Unknown; provider has A-55</td>
+        <td>Query provider with stable key, then record A-55</td>
+        <td>Unknown outcome age and amount exceed policy</td>
+      </tr>
+      <tr>
+        <td>Orchestrator down for ten minutes</td>
+        <td>Events wait durably; workflow records remain</td>
+        <td>Other instances or restarted worker resume</td>
+        <td>Workflow backlog and timer lateness breach objective</td>
+      </tr>
+      <tr>
+        <td>Reservation expires before authorization resolves</td>
+        <td>Reservation Expired, payment possibly Unknown</td>
+        <td>Resolve payment; void approval if found; cancel order</td>
+        <td>Immediate for confirmed or high-value mismatch</td>
+      </tr>
+      <tr>
+        <td>Release inventory repeatedly fails</td>
+        <td>Workflow CompensationBlocked, R-33 still Held</td>
+        <td>Bounded retry, then operator queue and reconciliation</td>
+        <td>Before reservation expiry or stock impact limit</td>
+      </tr>
+      <tr>
+        <td>Late PaymentAuthorized arrives after cancellation</td>
+        <td>Order Canceled, provider authorization exists</td>
+        <td>State table emits idempotent VoidPayment</td>
+        <td>If void fails or capture occurred</td>
+      </tr>
+      <tr>
+        <td>Event versions 8 then 10 arrive</td>
+        <td>Consumer detects missing version 9</td>
+        <td>Pause aggregate, fetch/replay gap or rebuild projection</td>
+        <td>Gap persists beyond delivery expectation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="recovery-jobs">Recovery and reconciliation jobs</h3>
+<ul>
+  <li>
+    <strong>Stuck workflow sweeper:</strong> finds nonterminal workflows past their next wake-up
+    time.
+  </li>
+  <li>
+    <strong>Outbox auditor:</strong> finds unpublished or unacknowledged rows older than the relay
+    objective.
+  </li>
+  <li>
+    <strong>Reservation sweeper:</strong> expires holds and emits an event using the same local
+    transaction.
+  </li>
+  <li>
+    <strong>Payment resolver:</strong> queries unknown provider results by stable payment key.
+  </li>
+  <li>
+    <strong>Cross-ledger reconciler:</strong> compares confirmed orders, reservations, and payment
+    records.
+  </li>
+  <li>
+    <strong>Provider settlement reconciler:</strong> matches provider reports to internal captures
+    and refunds.
+  </li>
+  <li>
+    <strong>Inbox retention job:</strong> removes dedupe records only after the documented
+    redelivery horizon.
+  </li>
+  <li>
+    <strong>History archival:</strong> moves completed workflow and outbox history under retention
+    policy.
+  </li>
+</ul>
+
+<p>
+  Reconciliation must be idempotent, paginated, checkpointed, rate-limited, observable, and safe to
+  resume. It should produce a discrepancy record before repairing. High-impact repair can require
+  approval. Never let a reconciliation job flood an unhealthy provider or silently rewrite financial
+  history.
+</p>
+
+<h2 id="practical-examples"><span class="num">10.</span> Focused implementation examples</h2>
+<p class="lead">
+  Framework APIs differ, but the correctness pattern stays the same: stable command identity plus
+  one local transaction for domain effect, inbox receipt, and outgoing intent.
+</p>
+
+<h3 id="java-outbox">Java and Spring-style local transaction</h3>
+<figure class="code">
+  <figcaption><b>Order creation and outbox insert share one transaction</b></figcaption>
+  <pre><code>@Transactional
+public OrderReceipt create(CreateOrder command, String idempotencyKey) {
+    return requests.find(command.customerId(), idempotencyKey)
+        .map(RequestRecord::receipt)
+        .orElseGet(() -&gt; {
+            Order order = orders.insert(Order.pending(command));
+            OutboxEvent event = OutboxEvent.orderCreated(order);
+            outbox.insert(event);
+            requests.insert(command.customerId(), idempotencyKey,
+                            command.digest(), order.receipt());
+            return order.receipt();
+        });
+}</code></pre>
+</figure>
+
+<p>
+  <code>@Transactional</code> is only the local database boundary. It does not include a later
+  broker publish. Concurrent duplicate keys need a database unique constraint and conflict handling,
+  not only the initial lookup. Production code validates that a reused key has the same command
+  digest.
+</p>
+
+<h3 id="go-consumer">Go-style inbox consumer</h3>
+<figure class="code">
+  <figcaption><b>Commit before broker acknowledgement</b></figcaption>
+  <pre><code>func HandleReserve(ctx context.Context, msg Message) error {
+    return db.WithTx(ctx, func(tx *Tx) error {
+        prior, found := tx.Inbox().Find("inventory-reserver", msg.ID)
+        if found {
+            return nil
+        }
+
+        reservation, err := tx.Inventory().Reserve(msg.CommandID, msg.Items)
+        if err != nil {
+            return err
+        }
+
+        tx.Inbox().Insert(msg.ID, msg.Digest, reservation.Result())
+        tx.Outbox().Insert(InventoryReserved(msg, reservation))
+        return nil
+    })
+}
+
+// The broker acknowledgement happens only after HandleReserve returns success.</code></pre>
+</figure>
+
+<p>
+  A context deadline stops waiting but does not prove the database rolled back. The transaction
+  helper must resolve commit errors according to the database driver contract. The broker adapter
+  acknowledges only after commit. A duplicate delivery returns success so the broker can remove it.
+</p>
+
+<h3 id="typescript-state-machine">TypeScript state transition table</h3>
+<figure class="code">
+  <figcaption><b>Illegal and late events are explicit</b></figcaption>
+  <pre><code>const transitions = {
+  RESERVING_INVENTORY: {
+    InventoryReserved: "AUTHORIZING_PAYMENT",
+    InventoryRejected: "CANCELING_ORDER",
+  },
+  AUTHORIZING_PAYMENT: {
+    PaymentAuthorized: "CONFIRMING_ORDER",
+    PaymentDeclined: "RELEASING_INVENTORY",
+    PaymentUnknown: "RESOLVING_PAYMENT",
+  },
+  CANCELED: {
+    PaymentAuthorized: "VOIDING_LATE_AUTHORIZATION",
+  },
+} as const;
+
+function decide(state: State, event: Event): Decision {
+  const next = transitions[state]?.[event.type];
+  if (!next) return quarantine("illegal transition", state, event);
+  return persistStateAndOutbox(next, commandFor(next));
+}</code></pre>
+</figure>
+
+<p>
+  Real code verifies workflow ID, expected command ID, payload digest, participant identity, and
+  current version. A terminal state is not permission to ignore every late event. A late approval
+  after cancellation creates an obligation to void funds.
+</p>
+
+<h2 id="production"><span class="num">11.</span> Production deployment and operations</h2>
+
+<h3 id="deployment">Deployment model</h3>
+<ul>
+  <li>Run relays and workflow workers with redundancy across failure domains.</li>
+  <li>
+    Partition work by stable workflow or aggregate key, but never depend on one permanent host.
+  </li>
+  <li>Use readiness to stop new assignments before shutdown and allow leases to expire safely.</li>
+  <li>Keep databases and brokers private; use authenticated, encrypted service connections.</li>
+  <li>
+    Back up workflow, inbox, outbox, and coordinator logs consistently with business databases.
+  </li>
+  <li>Test restore plus replay, not only backup creation.</li>
+  <li>Drain old workflow code only after every compatible history has completed or migrated.</li>
+</ul>
+
+<h3 id="schema-rollout">Compatible schema and workflow rollout</h3>
+<p>
+  Event contracts are long-lived because retained events, delayed messages, and old workflows can
+  outlive a deployment. Add optional fields first, keep readers tolerant of unknown fields, assign
+  schema versions, and test backward and forward compatibility. Never change the meaning of an
+  existing field silently. For a required semantic change, publish a new event version or type and
+  operate old and new consumers during migration.
+</p>
+
+<p>
+  Workflow state changes need expand-and-contract deployment. First deploy code that reads old and
+  new states, then migrate or naturally advance histories, then remove old handling after evidence
+  shows no old instance remains. Replay-based engines require deterministic version markers. Rolling
+  back application code without considering persisted workflow history can make recovery impossible.
+</p>
+
+<h3 id="disaster-recovery">Disaster recovery</h3>
+<p>
+  Define RPO and RTO for business state and workflow intent together. Restoring an order database to
+  10:00 and its outbox to 10:05 can publish events for orders that no longer exist. Restoring a
+  broker offset ahead of an inbox can skip required work; restoring it behind can create duplicates.
+  A safe plan names the source of truth, restores compatible checkpoints, expects redelivery,
+  preserves idempotency records, and runs reconciliation before reopening all traffic.
+</p>
+
+<h3 id="runbook">Stuck-workflow runbook</h3>
+<ol>
+  <li>Identify scope by state, age, tenant, participant, deployment, and failure domain.</li>
+  <li>Check broker lag, relay age, worker saturation, database health, and provider status.</li>
+  <li>Inspect one workflow history and correlate command ID, event ID, and external reference.</li>
+  <li>
+    Classify the outcome as business rejection, transient, permanent, unknown, or illegal
+    transition.
+  </li>
+  <li>Stop retry amplification or pause the affected step without losing durable messages.</li>
+  <li>Resolve external truth before replaying any ambiguous financial command.</li>
+  <li>
+    Resume, compensate, or send to authorized manual review through a recorded control action.
+  </li>
+  <li>Run scoped reconciliation and monitor the backlog drain rate and new failure rate.</li>
+  <li>Document the cause, affected invariants, customer impact, and permanent prevention.</li>
+</ol>
+
+<h2 id="observability">
+  <span class="num">12.</span> Observability, auditing, and troubleshooting
+</h2>
+<p class="lead">
+  Observe both transport health and business convergence. A broker can be green while thousands of
+  paid orders remain unconfirmed.
+</p>
+
+<h3 id="metrics">Core metrics</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Metric</th>
+        <th>Question answered</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Workflow</td>
+        <td>Started, completed, canceled, blocked by state and reason</td>
+        <td>Are business flows converging?</td>
+      </tr>
+      <tr>
+        <td>Workflow</td>
+        <td>End-to-end duration p50, p95, p99</td>
+        <td>How long do users wait, including retries?</td>
+      </tr>
+      <tr>
+        <td>Workflow</td>
+        <td>Oldest nonterminal age and timer lateness</td>
+        <td>Is durable work stuck?</td>
+      </tr>
+      <tr>
+        <td>Outbox</td>
+        <td>Unpublished count, oldest age, publish attempts</td>
+        <td>Can committed intent reach the broker?</td>
+      </tr>
+      <tr>
+        <td>Broker</td>
+        <td>Consumer lag, redelivery, dead-letter rate</td>
+        <td>Can consumers keep up and succeed?</td>
+      </tr>
+      <tr>
+        <td>Inbox</td>
+        <td>Duplicate hit rate and digest conflicts</td>
+        <td>Are retries normal or malformed?</td>
+      </tr>
+      <tr>
+        <td>Payment</td>
+        <td>Unknown outcomes by age, provider, amount</td>
+        <td>Is financial truth unresolved?</td>
+      </tr>
+      <tr>
+        <td>Compensation</td>
+        <td>Attempts, failures, blocked age, amount</td>
+        <td>Are recovery obligations completing?</td>
+      </tr>
+      <tr>
+        <td>Reconciliation</td>
+        <td>Scanned, mismatched, repaired, unresolved</td>
+        <td>Do authoritative systems agree?</td>
+      </tr>
+      <tr>
+        <td>2PC</td>
+        <td>Prepared transaction count and oldest age</td>
+        <td>Are resources blocked awaiting a decision?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="correlation">Logs and traces</h3>
+<p>
+  Structured logs should include workflow ID, order ID, command ID, event ID, causation ID,
+  correlation ID, attempt, current state, next state, tenant, result class, and safe external
+  reference. Propagate trace context through outbox messages, but create spans for queue wait,
+  relay, consumer processing, provider call, and state transition. Sampling must retain errors and
+  slow or blocked workflows. Do not use high-cardinality business IDs as metric labels; keep them in
+  logs and traces.
+</p>
+
+<h3 id="audit">Audit requirements</h3>
+<ul>
+  <li>Record who or what requested every financial and inventory action.</li>
+  <li>Preserve original and compensating actions as separate immutable facts.</li>
+  <li>Record workflow policy and code version used for each decision.</li>
+  <li>Timestamp receipt, decision, dispatch, participant completion, and operator action.</li>
+  <li>
+    Protect audit logs with access control, integrity monitoring, retention, and legal policy.
+  </li>
+  <li>Separate sensitive payloads from widely accessible operational metadata.</li>
+  <li>Support a customer or order timeline without exposing secrets or another tenant's data.</li>
+</ul>
+
+<h3 id="alerting">Useful alert examples</h3>
+<p>
+  Page on invariant risk and sustained inability to make progress: old unknown payments, blocked
+  compensation above a value threshold, oldest outbox age over the delivery objective, or a sharp
+  increase in nonterminal workflow age. Ticket lower-urgency duplicate-rate drift or isolated poison
+  messages. An alert on every retry creates noise; an alert on a growing backlog with no drain rate
+  describes user impact.
+</p>
+
+<h2 id="security"><span class="num">13.</span> Security, privacy, abuse, and trust boundaries</h2>
+
+<h3 id="service-trust">Authenticate every transition</h3>
+<p>
+  A broker is a transport, not proof that a message is authorized. Authenticate producers and
+  consumers with workload identity, authorize publish and subscribe permissions by topic or queue,
+  encrypt transport, rotate credentials, and restrict network paths. The participant validates the
+  command against its own business policy and tenant boundary. An orchestrator request is not
+  permission to bypass inventory or payment rules.
+</p>
+
+<h3 id="replay-abuse">Replay and idempotency abuse</h3>
+<ul>
+  <li>Bind an idempotency key to principal, tenant, operation, resource, and request digest.</li>
+  <li>
+    Reject expired messages and impossible future timestamps according to a documented skew window.
+  </li>
+  <li>Use unguessable message IDs, but do not treat uniqueness as authentication.</li>
+  <li>Protect command envelopes against tampering through authenticated channels or signatures.</li>
+  <li>Rate-limit new commands and repeated outcome queries separately.</li>
+  <li>Alert when one key arrives with multiple payload digests.</li>
+  <li>Do not let a caller choose another tenant's aggregate key or workflow ID.</li>
+</ul>
+
+<h3 id="data-minimization">Data minimization and privacy</h3>
+<p>
+  Events are copied into outboxes, broker replicas, consumer storage, logs, dead-letter queues,
+  backups, and analytics systems. Publish stable identifiers and necessary facts, not full customer
+  profiles. Use payment tokens, never raw card data. Encrypt sensitive payload fields when required,
+  control key access, set retention per copy, and design deletion or anonymization for immutable
+  event histories. A dead-letter queue needs the same protection as the source payload.
+</p>
+
+<h3 id="operator-security">Operator and recovery controls</h3>
+<p>
+  Separate read, retry, compensate, refund, override, and replay permissions. High-value refunds or
+  heuristic transaction decisions can require two-person approval. Every control request needs a
+  reason, ticket, actor, before-state, after-state, and idempotency key. Guard bulk replay by
+  tenant, date, event type, maximum count, and dry-run preview. Audit access to customer and payment
+  evidence.
+</p>
+
+<h3 id="threat-table">Threat and mitigation table</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Threat</th>
+        <th>Impact</th>
+        <th>Safer control</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Forged PaymentAuthorized event</td>
+        <td>Unpaid order ships</td>
+        <td>Producer ACL, authenticated envelope, expected command and amount validation</td>
+      </tr>
+      <tr>
+        <td>Cross-tenant idempotency collision</td>
+        <td>Outcome or data leaks</td>
+        <td>Tenant-scoped unique key and authorization checks</td>
+      </tr>
+      <tr>
+        <td>Outbox payload injection</td>
+        <td>Consumer exploit or routing abuse</td>
+        <td>Schema validation, typed serialization, fixed routing policy, size limits</td>
+      </tr>
+      <tr>
+        <td>Replay of old reserve command</td>
+        <td>Stock denial or duplicate hold</td>
+        <td>Inbox, command expiry, reservation invariant, authenticated caller</td>
+      </tr>
+      <tr>
+        <td>Poison message loop</td>
+        <td>Consumer capacity exhaustion</td>
+        <td>Bounded attempts, quarantine, alert, safe inspection tooling</td>
+      </tr>
+      <tr>
+        <td>Unauthorized manual refund</td>
+        <td>Financial loss</td>
+        <td>Least privilege, step-up approval, immutable audit, amount limit</td>
+      </tr>
+      <tr>
+        <td>Sensitive event copied to logs</td>
+        <td>Privacy or compliance breach</td>
+        <td>Allowlisted logging fields, redaction tests, restricted evidence store</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="performance"><span class="num">14.</span> Performance, capacity, scalability, and cost</h2>
+
+<h3 id="write-amplification">Count the durable work</h3>
+<p>
+  A three-step saga does more work than one local transaction. Each command can add an outbox
+  insert, broker record, inbox insert, domain update, result outbox insert, workflow transition,
+  indexes, and replicated log writes. If one order produces 8 messages and traffic peaks at 4,000
+  orders per second, the broker sees about 32,000 business messages per second before retries and
+  replicas. At an average 2 KB payload, raw ingress is about 64 MB/s before protocol and replication
+  overhead.
+</p>
+
+<h3 id="latency-budget">Latency budget</h3>
+<figure class="code">
+  <figcaption><b>Illustrative p95 confirmation budget</b></figcaption>
+  <pre><code>Order local commit + relay:          120 ms
+Workflow consume + reserve command:  80 ms
+Inventory process + result:         180 ms
+Workflow consume + payment command:  80 ms
+Payment provider authorization:     700 ms
+Workflow consume + confirm command:  80 ms
+Order confirmation + final event:   160 ms
+Scheduling and variance reserve:    600 ms
+                                      -------
+Target p95:                         2,000 ms</code></pre>
+</figure>
+
+<p>
+  Measure queue wait separately from processing. Batching improves throughput but increases the wait
+  for the oldest event. Poll intervals directly add outbox delivery latency. Long synchronous client
+  waits consume connections, so return a durable order ID and support polling, push notification, or
+  a bounded synchronous wait followed by Pending.
+</p>
+
+<h3 id="capacity-controls">Capacity and overload controls</h3>
+<ul>
+  <li>
+    Bound workflow activation, relay batches, in-flight provider calls, and per-tenant concurrency.
+  </li>
+  <li>
+    Partition by aggregate ID to preserve order and distribute load; watch hot tenants and hot SKUs.
+  </li>
+  <li>
+    Use backpressure from consumer lag and database saturation before queues become unbounded.
+  </li>
+  <li>
+    Reserve capacity for compensation, outcome resolution, and operator actions during incidents.
+  </li>
+  <li>Apply retry budgets so provider failure does not multiply every pending workflow attempt.</li>
+  <li>Use payload references for very large objects, with integrity and authorization checks.</li>
+  <li>Scale relays only until the database or broker becomes the bottleneck.</li>
+</ul>
+
+<h3 id="storage-retention">Storage and retention</h3>
+<p>
+  At 32,000 messages per second and 2 KB each, one raw day is roughly 5.5 TB before replication,
+  indexes, and compression. Real retention design separates broker replay retention, immutable
+  audit, compact workflow summaries, inbox dedupe horizon, and outbox cleanup. Partition high-volume
+  tables by time where supported, archive completed history, and test deletion without blocking live
+  writes. Retaining everything in the primary workflow database is expensive and slows maintenance.
+</p>
+
+<h3 id="cost-tradeoffs">Cost trade-offs</h3>
+<p>
+  Main cost drivers are replicated broker storage, database write amplification, cross-region
+  traffic, workflow history, CDC infrastructure, provider outcome queries, and operator effort.
+  Orchestration adds a durable store but can reduce incident diagnosis time. Choreography removes
+  one coordinator service but can increase observability and change-coordination cost. 2PC may
+  reduce compensation logic for a compatible short operation, while increasing latency and lock
+  risk.
+</p>
+
+<h2 id="testing"><span class="num">15.</span> Testing strategy</h2>
+
+<h3 id="unit-tests">Unit and model tests</h3>
+<ul>
+  <li>Test every allowed state-event pair and every illegal transition.</li>
+  <li>Test compensation choice for failures before, at, and after the pivot.</li>
+  <li>Test retry classification: business rejection, transient, permanent, and unknown.</li>
+  <li>Test idempotency key scope, digest mismatch, and concurrent duplicate decisions.</li>
+  <li>
+    Use property tests: terminal success implies payment plus reservation; cancellation eventually
+    releases both.
+  </li>
+  <li>Model-check small histories with duplicate, lost, late, and reordered messages.</li>
+</ul>
+
+<h3 id="integration-tests">Integration and contract tests</h3>
+<ul>
+  <li>Commit business state and outbox atomically in the real database.</li>
+  <li>Crash after publish and before marking published; verify consumer effect occurs once.</li>
+  <li>Crash consumer before commit and after commit before acknowledgement.</li>
+  <li>Run two consumers concurrently with the same command ID and verify one domain effect.</li>
+  <li>Validate event schemas against old and new producer and consumer versions.</li>
+  <li>Test CDC connector restart, offset recovery, snapshot behavior, and log retention.</li>
+  <li>
+    For 2PC, kill coordinator and participant at every protocol boundary and recover in-doubt
+    records.
+  </li>
+</ul>
+
+<h3 id="fault-tests">Fault, recovery, and chaos tests</h3>
+<ul>
+  <li>Inject delay, loss, duplication, reordering, partition, process crash, and clock skew.</li>
+  <li>Return provider success but drop its response to create an ambiguous payment.</li>
+  <li>Pause the orchestrator longer than a reservation lifetime and validate late-event policy.</li>
+  <li>Make compensation fail repeatedly and verify escalation without infinite retry.</li>
+  <li>Restore from backup with broker redelivery and verify inbox retention protects effects.</li>
+  <li>Replay a dead-letter range in dry-run and live modes with rate controls.</li>
+  <li>Prove reconciliation detects deliberately injected cross-service mismatches.</li>
+</ul>
+
+<h3 id="load-tests">Load and soak tests</h3>
+<p>
+  Measure accepted orders, completion throughput, workflow duration percentiles, outbox age, broker
+  lag, database transaction latency, provider concurrency, duplicate rate, and compensation
+  capacity. Stress until admission control activates. Soak beyond inbox cleanup, reservation expiry,
+  log rotation, CDC checkpoint, and partition maintenance intervals. Include a provider slowdown
+  because stable average traffic can still build an unbounded pending-work backlog.
+</p>
+
+<h3 id="test-oracle">Correctness oracle</h3>
+<figure class="code">
+  <figcaption><b>Post-test invariant scan</b></figcaption>
+  <pre><code>For every terminal workflow:
+  if state == CONFIRMED:
+    assert exactly one valid payment authorization
+    assert exactly one allocated inventory reservation
+    assert order status == CONFIRMED
+
+  if state == CANCELED:
+    assert no active reservation remains
+    assert no unvoided or unrefunded payment remains
+
+For every nonterminal workflow older than its objective:
+  assert an automatic wake-up or a named operator owner exists</code></pre>
+</figure>
+
+<h2 id="mistakes"><span class="num">16.</span> Common mistakes and safer corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mistake</th>
+        <th>Why it fails</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Update database, then publish</td>
+        <td>Crash loses the message</td>
+        <td>Business write and outbox insert in one transaction</td>
+      </tr>
+      <tr>
+        <td>Publish, then update database</td>
+        <td>Commit failure creates a false event</td>
+        <td>Use outbox or supported atomic commit</td>
+      </tr>
+      <tr>
+        <td>Acknowledge before database commit</td>
+        <td>Crash loses uncommitted work</td>
+        <td>Commit effect and inbox, then acknowledge</td>
+      </tr>
+      <tr>
+        <td>Use a new idempotency key on retry</td>
+        <td>Remote system sees a new operation</td>
+        <td>Keep one stable key for one logical intent</td>
+      </tr>
+      <tr>
+        <td>Treat timeout as decline</td>
+        <td>Effect may already have committed</td>
+        <td>Store Unknown and query or retry idempotently</td>
+      </tr>
+      <tr>
+        <td>Call compensation a rollback</td>
+        <td>External history and concurrent changes remain</td>
+        <td>Define business-specific counteraction and audit both</td>
+      </tr>
+      <tr>
+        <td>Put email before the pivot</td>
+        <td>Irreversible side effect blocks core outcome</td>
+        <td>Move optional notification after confirmation</td>
+      </tr>
+      <tr>
+        <td>Assume saga isolation</td>
+        <td>Intermediate state is committed and observable</td>
+        <td>Reservations, versions, semantic locks, rereads</td>
+      </tr>
+      <tr>
+        <td>Retry compensation forever</td>
+        <td>Load grows and problem becomes invisible</td>
+        <td>Bounded retry, alert, durable manual-review state</td>
+      </tr>
+      <tr>
+        <td>Use global ordering by timestamp</td>
+        <td>Clocks skew and parallel relays reorder</td>
+        <td>State required scope and use aggregate version</td>
+      </tr>
+      <tr>
+        <td>Delete inbox records too early</td>
+        <td>Old redelivery repeats the effect</td>
+        <td>Retention longer than all replay horizons</td>
+      </tr>
+      <tr>
+        <td>Let orchestrator write participant DBs</td>
+        <td>Breaks ownership and bypasses invariants</td>
+        <td>Send authenticated domain commands</td>
+      </tr>
+      <tr>
+        <td>Hide pending states from the API</td>
+        <td>Clients retry and create duplicate intent</td>
+        <td>Return durable ID and explicit Pending status</td>
+      </tr>
+      <tr>
+        <td>No reconciliation</td>
+        <td>Rare unknown failures accumulate silently</td>
+        <td>Compare authoritative records continuously</td>
+      </tr>
+      <tr>
+        <td>Manual SQL repair without audit</td>
+        <td>Creates unrepeatable, unauthorized history</td>
+        <td>Recorded, idempotent administration commands</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="decision-framework"><span class="num">17.</span> Decision framework</h2>
+<ol>
+  <li>Write the exact business invariant and acceptable intermediate states.</li>
+  <li>Name every durable resource and the owner of each write.</li>
+  <li>Ask whether ownership can be simplified into one local transaction.</li>
+  <li>If not, list which resources support a common atomic commit protocol.</li>
+  <li>Decide whether blocking, latency, participant coupling, and recovery fit 2PC.</li>
+  <li>For a saga, classify every step as compensable, pivot, retryable, or optional.</li>
+  <li>Define stable command identity and outcome-query behavior for ambiguous effects.</li>
+  <li>
+    Choose orchestration, choreography, or a hybrid based on process complexity and ownership.
+  </li>
+  <li>
+    Close every database-message dual write with outbox; close consumer duplicates with inbox.
+  </li>
+  <li>Define ordering scope, versioning, deadlines, late events, and cancellation.</li>
+  <li>Reserve capacity and operator paths for compensation and reconciliation.</li>
+  <li>Test failures at every commit, publish, acknowledgement, and external-call boundary.</li>
+</ol>
+
+<div class="key">
+  <strong>Prefer the smallest correctness mechanism that covers the invariant</strong>
+  <p>
+    Do not split one cohesive transaction merely to use a saga. Do not enlist an email service in an
+    atomic protocol. Keep tightly coupled data together when ownership allows it, coordinate only
+    what must be coordinated, and make every remaining boundary explicit and recoverable.
+  </p>
+</div>
+
+<h2 id="exercises"><span class="num">18.</span> Hands-on exercises and design scenarios</h2>
+
+<h3 id="exercise-one">Exercise 1: Find the dual-write window</h3>
+<p>
+  A notification service inserts a job, commits, publishes its ID, then marks the job queued. Draw a
+  crash at each boundary and redesign it. Expected reasoning: place job and outbox intent in one
+  transaction; relay with at-least-once delivery; consume with an inbox or a unique notification
+  key; model sending as Unknown if the provider response is lost.
+</p>
+
+<h3 id="exercise-two">Exercise 2: Classify travel steps</h3>
+<p>
+  Design flight hold, hotel booking, card capture, ticket issue, and email. Identify compensation
+  and pivot. Expected reasoning: holds are naturally compensable; booking cancellation may have
+  rules; capture could be pivot or compensable by refund depending on the business; ticket issue may
+  be irreversible; email is after the core outcome. Store cancellation policy and original
+  references.
+</p>
+
+<h3 id="exercise-three">Exercise 3: Late event</h3>
+<p>
+  PaymentAuthorized arrives 20 minutes after inventory expired and order canceled. Expected
+  reasoning: verify command identity, record the late event, issue an idempotent void or refund,
+  preserve canceled order status, alert if financial recovery fails, and add reconciliation
+  coverage.
+</p>
+
+<h3 id="exercise-four">Exercise 4: Polling versus CDC</h3>
+<p>
+  Compare a system with 50 events per second and a simple operations team to one with 100,000 events
+  per second and an existing CDC platform. Expected reasoning: polling is simpler and can be enough
+  at modest scale; CDC reduces query polling and follows the commit log but needs offset,
+  log-retention, schema, snapshot, and connector operations. Both need idempotent consumers.
+</p>
+
+<h3 id="exercise-five">Exercise 5: Capacity during provider outage</h3>
+<p>
+  Checkout continues at 2,000 per second while payment is unavailable for 30 minutes. Expected
+  reasoning: 3.6 million workflows accumulate, reservations can exhaust stock, retry traffic can
+  amplify load, and recovery needs provider capacity above arrival rate. Introduce admission policy,
+  retry budgets, reservation limits, visible Pending status, backlog storage sizing, and reserved
+  recovery capacity.
+</p>
+
+<h3 id="exercise-six">Exercise 6: 2PC recovery drill</h3>
+<p>
+  A coordinator crashes after both databases prepare but before one receives commit. Expected
+  reasoning: prepared participants must not guess; recover the durable coordinator decision, resend
+  idempotent commit, monitor prepared age and locks, and use a heuristic decision only under an
+  exceptional documented policy that acknowledges possible atomicity violation.
+</p>
+
+<h2 id="interview"><span class="num">19.</span> Interview questions and model answers</h2>
+
+<h3>1. Why is writing to a database and then a broker unsafe?</h3>
+<p>
+  They are two independent durable commits. A crash between them leaves business state without its
+  event. Reversing the order can leave an event for state that never committed. Use one supported
+  distributed transaction or commit an outbox row beside business state and relay it later.
+  <strong>Follow-up:</strong> Can the relay publish twice? Yes, after publish succeeds but before
+  the relay records success. Consumers must be idempotent.
+</p>
+
+<h3>2. Explain two-phase commit and why it can block.</h3>
+<p>
+  In phase one, each participant durably promises it can commit. If all vote yes, the coordinator
+  durably chooses commit; otherwise it chooses abort. In phase two it announces the decision. A
+  prepared participant cannot safely choose on its own when the coordinator decision is unavailable,
+  so it can hold resources while waiting. <strong>Follow-up:</strong> Does replication fix it?
+  Replicating coordinator state improves availability, but participants still need protocol support
+  and can be unable to learn a decision during a partition.
+</p>
+
+<h3>3. Is a saga an ACID transaction?</h3>
+<p>
+  No. Each step can be a local ACID transaction, but the whole saga usually exposes committed
+  intermediate state and reaches consistency through forward actions or compensation. It needs
+  explicit concurrency controls for saga isolation anomalies. <strong>Follow-up:</strong> Name one
+  control. Use a reservation, semantic pending state, version check, or reread before pivot.
+</p>
+
+<h3>4. What is a compensating transaction?</h3>
+<p>
+  It is a new domain action that counteracts an earlier committed effect. It is not a byte-for-byte
+  rollback. Refund and charge both remain in the ledger, and concurrency may prevent restoration of
+  the exact previous state. Compensation itself must be idempotent, durable, retryable where safe,
+  and auditable. <strong>Follow-up:</strong> Must compensation run in reverse order? Often, but
+  domain dependencies can require another order or allow parallel steps.
+</p>
+
+<h3>5. Orchestration or choreography?</h3>
+<p>
+  Choreography is reasonable for a few stable reactions and maximizes participant autonomy.
+  Orchestration makes complex branches, timers, compensation, visibility, and operator controls
+  explicit. A hybrid often orchestrates the critical business flow and choreographs optional
+  analytics and notifications. <strong>Follow-up:</strong> Is the orchestrator a single point of
+  failure? Only if state is not durable or the deployment has one unrecoverable instance. Its
+  unavailability can delay progress without losing it.
+</p>
+
+<h3>6. What is a pivot transaction?</h3>
+<p>
+  It is the point of commitment after which the saga should move forward rather than unwind earlier
+  compensable steps. The exact pivot is a business decision. Before it, the design emphasizes
+  compensation; after it, actions should be idempotent and retryable.
+  <strong>Follow-up:</strong> Give an example. Order confirmation can be the pivot after inventory
+  and payment authorization.
+</p>
+
+<h3>7. How does an inbox create an effectively-once effect?</h3>
+<p>
+  The consumer atomically stores the message ID, applies its domain effect, and writes any outgoing
+  event. Redelivery finds the stored receipt and does not repeat the effect. This needs a unique
+  constraint, stable producer identity, sufficient retention, and one local transaction.
+  <strong>Follow-up:</strong> Why is an in-memory set insufficient? It is lost on restart and is not
+  shared atomically with durable business state.
+</p>
+
+<h3>8. What should a service do after a payment timeout?</h3>
+<p>
+  Record Unknown, preserve the stable payment key, and query or retry using that same identity. A
+  timeout does not prove failure. Reconciliation compares provider records and internal state. A new
+  key can create a second authorization. <strong>Follow-up:</strong> When do you involve a human?
+  When automated evidence remains ambiguous past the risk deadline or the amount exceeds policy.
+</p>
+
+<h3>9. Does transactional outbox guarantee event order?</h3>
+<p>
+  It guarantees atomic presence of business state and event intent. Ordering depends on database log
+  order or polling selection, relay concurrency, broker partitioning, retries, and consumer
+  behavior. Use an aggregate routing key and aggregate version for per-aggregate order. Global order
+  is costly and usually unnecessary. <strong>Follow-up:</strong> What does a consumer do on a
+  version gap? Pause that aggregate and fetch, replay, or rebuild rather than silently apply
+  dependent later state.
+</p>
+
+<h3>10. What does exactly once mean in a distributed workflow?</h3>
+<p>
+  The statement is incomplete until its scope is named. A broker may atomically commit input offsets
+  and output messages, while an external HTTP effect remains outside. Durable workflow replay can
+  preserve decisions, while an activity can repeat after its result is lost. Prefer at-least-once
+  delivery with idempotent business effects and reconciliation. <strong>Follow-up:</strong> What
+  breaks dedupe? New keys, expired records, non-atomic receipt storage, or effects outside the
+  dedupe store.
+</p>
+
+<h3>11. How do you monitor a saga system?</h3>
+<p>
+  Track completion and cancellation rates, duration percentiles, oldest nonterminal workflow, outbox
+  age, broker lag, duplicate hits, unknown outcomes, failed compensation, and reconciliation
+  mismatches. Correlate logs and traces with workflow, command, event, and external reference IDs.
+  Alert on sustained failure to converge, not every retry. <strong>Follow-up:</strong> Why is broker
+  lag insufficient? The broker can be current while a provider result remains unknown or business
+  state is inconsistent.
+</p>
+
+<h3>12. When would you choose one database over a saga?</h3>
+<p>
+  When the data has one cohesive owner, needs one atomic invariant, and can scale and operate within
+  the same transactional store. Distribution adds failure states, messages, dedupe, compensation,
+  and operator burden. Service boundaries should follow business ownership, not a rule that every
+  table needs a service. <strong>Follow-up:</strong> When must you distribute? Independent
+  ownership, scaling, regulatory isolation, or external participants can justify it.
+</p>
+
+<h3>13. How do you safely change a running durable workflow?</h3>
+<p>
+  Keep event contracts backward compatible, make code read old and new state, introduce new states
+  before writing them, and retire old handling only after no old history remains. Replay-based
+  engines need deterministic version markers. <strong>Follow-up:</strong> Why can normal rollback
+  fail? Persisted histories may contain events that the older code cannot interpret or replay.
+</p>
+
+<h3>14. What happens if compensation fails?</h3>
+<p>
+  Compensation is another distributed workflow. Persist its progress, retry only safe transient
+  failures with limits, retain the original recovery inputs, and move persistent or ambiguous cases
+  to a visible blocked state with an owner. Reconciliation must continue checking the obligation.
+  <strong>Follow-up:</strong> Should the system report Canceled first? Only if the API distinguishes
+  cancellation requested from fully compensated; never hide an active charge or reservation.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">20.</span> Revision cheat sheet</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Need</th>
+        <th>Remember</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One resource</td>
+        <td>Prefer one local ACID transaction</td>
+      </tr>
+      <tr>
+        <td>Atomic compatible resources</td>
+        <td>2PC: prepare promises, durable decision, possible blocking</td>
+      </tr>
+      <tr>
+        <td>Independent or long-running work</td>
+        <td>Saga: local commits plus semantic recovery</td>
+      </tr>
+      <tr>
+        <td>Complex workflow</td>
+        <td>Orchestrator with durable explicit state</td>
+      </tr>
+      <tr>
+        <td>Few loose reactions</td>
+        <td>Choreography, but map the complete event flow</td>
+      </tr>
+      <tr>
+        <td>Database plus message</td>
+        <td>Transactional outbox, at-least-once relay</td>
+      </tr>
+      <tr>
+        <td>Duplicate consumer delivery</td>
+        <td>Inbox and domain effect in one transaction</td>
+      </tr>
+      <tr>
+        <td>External command retry</td>
+        <td>Stable idempotency key plus payload digest</td>
+      </tr>
+      <tr>
+        <td>Timeout</td>
+        <td>Outcome Unknown, not Failed</td>
+      </tr>
+      <tr>
+        <td>Ordering</td>
+        <td>State scope, route by aggregate, carry aggregate version</td>
+      </tr>
+      <tr>
+        <td>Compensation</td>
+        <td>New auditable action, not historical erasure</td>
+      </tr>
+      <tr>
+        <td>Pivot</td>
+        <td>After it, prefer idempotent forward completion</td>
+      </tr>
+      <tr>
+        <td>Exactly once</td>
+        <td>Name boundary; external effects still need idempotency</td>
+      </tr>
+      <tr>
+        <td>Durable workflow</td>
+        <td>Persist state, timers, attempts, and next intent</td>
+      </tr>
+      <tr>
+        <td>Operations</td>
+        <td>Observe age and convergence, not only error counts</td>
+      </tr>
+      <tr>
+        <td>Last safety net</td>
+        <td>Reconcile authoritative systems and audit repairs</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="final-checklist"><span class="num">21.</span> Production review checklist</h2>
+<ul>
+  <li>The business invariant, atomic boundary, and acceptable pending states are written.</li>
+  <li>Every forward step has retry, timeout, unknown-outcome, and compensation behavior.</li>
+  <li>The pivot and every irreversible side effect are explicit.</li>
+  <li>Business change and outgoing event intent share one transaction.</li>
+  <li>Consumer effect, inbox receipt, and resulting outbox share one transaction.</li>
+  <li>Command keys are stable, scoped, digest-bound, retained, and unique.</li>
+  <li>Per-aggregate ordering and version-gap behavior are tested.</li>
+  <li>Timers and progress survive process, zone, and deployment failure.</li>
+  <li>Late results and cancellation races have state transitions.</li>
+  <li>Compensation has reserved capacity and a manual escalation path.</li>
+  <li>Unknown external results have query and reconciliation paths.</li>
+  <li>Schema and workflow upgrades remain compatible with retained history.</li>
+  <li>Metrics expose oldest pending intent and business convergence.</li>
+  <li>Messages, logs, dead letters, backups, and audits follow privacy policy.</li>
+  <li>Restore, redelivery, replay, and reconciliation are exercised regularly.</li>
+</ul>
+
+<h2 id="references"><span class="num">22.</span> Primary official references</h2>
+<ul>
+  <li>
+    <a href="https://jakarta.ee/specifications/transactions/2.0/jakarta-transactions-spec-2.0.html"
+      >Jakarta Transactions 2.0 Specification</a
+    >
+    - transaction managers, resource enlistment, XAResource, synchronization, and two-phase commit.
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/en/java/javase/21/docs/api/java.transaction.xa/javax/transaction/xa/XAResource.html"
+      >Java SE XAResource API</a
+    >
+    - prepare, commit, rollback, recovery scanning, transaction branches, and heuristic outcomes.
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/sql-prepare-transaction.html"
+      >PostgreSQL: PREPARE TRANSACTION</a
+    >
+    - durable preparation, later completion, warnings, and two-phase transaction behavior.
+  </li>
+  <li>
+    <a href="https://www.postgresql.org/docs/current/view-pg-prepared-xacts.html"
+      >PostgreSQL: pg_prepared_xacts</a
+    >
+    - official catalog view for monitoring currently prepared transactions.
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-MAX-PREPARED-TRANSACTIONS"
+      >PostgreSQL: max_prepared_transactions</a
+    >
+    - prepared-transaction capacity configuration and operational cautions.
+  </li>
+  <li>
+    <a href="https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/saga/saga"
+      >Microsoft Azure Architecture Center: Saga distributed transactions pattern</a
+    >
+    - local transactions, orchestration, choreography, pivot and retryable steps, and anomalies.
+  </li>
+  <li>
+    <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/compensating-transaction"
+      >Microsoft Azure Architecture Center: Compensating Transaction pattern</a
+    >
+    - semantic undo, idempotent compensation, progress recording, and manual intervention.
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga-orchestration.html"
+      >AWS Prescriptive Guidance: Saga orchestration pattern</a
+    >
+    - coordinator responsibilities, applicability, local steps, and failure handling.
+  </li>
+  <li>
+    <a
+      href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html"
+      >AWS Prescriptive Guidance: Transactional outbox pattern</a
+    >
+    - dual-write avoidance, relay options, ordering, and duplicate delivery.
+  </li>
+  <li>
+    <a
+      href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html"
+      >Debezium: Outbox Event Router</a
+    >
+    - outbox schema mapping, unique event IDs, aggregate routing keys, payloads, and tracing.
+  </li>
+  <li>
+    <a href="https://kafka.apache.org/documentation/#semantics"
+      >Apache Kafka official documentation: delivery semantics</a
+    >
+    - at-most-once, at-least-once, transactions, idempotent producers, and exactly-once boundaries.
+  </li>
+  <li>
+    <a href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md"
+      >CloudEvents 1.0.2 Specification</a
+    >
+    - interoperable event context attributes, event identity, source, type, time, and data
+    contracts.
+  </li>
+  <li>
+    <a href="https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/"
+      >OpenTelemetry semantic conventions: messaging spans</a
+    >
+    - producer, consumer, creation, settlement, and messaging trace relationships.
+  </li>
+  <li>
+    <a href="https://docs.temporal.io/workflows">Temporal official documentation: Workflows</a>
+    - durable workflow execution, event history, deterministic replay, timers, and signals.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
