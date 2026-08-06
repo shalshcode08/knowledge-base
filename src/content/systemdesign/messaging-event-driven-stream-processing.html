@@ -1,0 +1,1324 @@
+<h1>Messaging, Event-Driven Architecture, and Stream Processing - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to messages, queues, event logs, delivery guarantees, consumer state,
+  replay, schema evolution, stream-time reasoning, production operations, and interview design.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The mental model</h2>
+<p class="lead">
+  Messaging moves durable facts or requested work through time. It lets a producer finish without
+  requiring every consumer to be available at that exact moment.
+</p>
+
+<div class="analogy">
+  <p>
+    Think of a restaurant order rail. A waiter places a ticket on the rail, the kitchen accepts it,
+    one station claims the work, and the ticket remains evidence of what was requested. A broadcast
+    announcement is different: several stations may each need their own copy. An append-only event
+    log is more like a dated order book: readers keep bookmarks and can revisit earlier entries.
+    Queue, publish-subscribe, and log systems solve related but different problems.
+  </p>
+</div>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Precise meaning</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Message</td>
+        <td>A transport envelope carrying data and metadata between participants</td>
+        <td>An inventory reservation request</td>
+      </tr>
+      <tr>
+        <td>Command</td>
+        <td>A request for one owner to attempt an action, named in the imperative</td>
+        <td><code>ReserveInventory</code></td>
+      </tr>
+      <tr>
+        <td>Event</td>
+        <td>An immutable statement that something already happened, named in the past tense</td>
+        <td><code>InventoryReserved</code></td>
+      </tr>
+      <tr>
+        <td>Queue</td>
+        <td>A work channel where competing consumers normally divide messages</td>
+        <td>Email delivery jobs</td>
+      </tr>
+      <tr>
+        <td>Publish-subscribe</td>
+        <td>One publication is independently delivered to multiple subscriptions</td>
+        <td>Order events consumed by billing, analytics, and notifications</td>
+      </tr>
+      <tr>
+        <td>Append-only log</td>
+        <td>An ordered retained sequence addressed by a logical position</td>
+        <td>A partition containing order lifecycle events</td>
+      </tr>
+      <tr>
+        <td>Broker</td>
+        <td>Infrastructure that accepts, stores, routes, and delivers messages</td>
+        <td>A replicated queue or log service</td>
+      </tr>
+      <tr>
+        <td>Stream processor</td>
+        <td>A continuous computation over records, often with keyed state and time semantics</td>
+        <td>Five-minute payment-failure counts by merchant</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key">
+  <strong>The central correctness rule</strong>
+  <p>
+    A broker can promise how it stores and redelivers bytes. Only the application can make the
+    resulting business effect correct. Define the unit of ordering, the durable acknowledgement
+    point, the duplicate strategy, and the recovery procedure before choosing a product.
+  </p>
+</div>
+
+<h2 id="why-messaging"><span class="num">01.</span> The problem messaging solves</h2>
+<p>
+  Direct RPC couples caller success to the immediate availability and latency of the callee.
+  Messaging inserts a durable handoff. The producer can receive an acknowledgement after the broker
+  stores the message, while consumers process later at a rate their capacity permits. This provides
+  temporal decoupling, buffers finite bursts, supports fan-out, and preserves replayable evidence.
+</p>
+
+<p>Messaging does not remove coupling. It changes its form:</p>
+<ul>
+  <li>Producers and consumers still share event meaning, identifiers, and schema contracts.</li>
+  <li>A queue moves waiting time into broker lag and may make failure less visible to a caller.</li>
+  <li>Asynchronous completion requires status, reconciliation, and user-facing pending states.</li>
+  <li>A durable broker becomes critical infrastructure with capacity and recovery obligations.</li>
+  <li>Events can spread sensitive data to more stores and teams than a direct response would.</li>
+</ul>
+
+<h3 id="choose-interaction">Choose the interaction from the business contract</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Interaction</th>
+        <th>Use when</th>
+        <th>Do not assume</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Direct RPC</td>
+        <td>The caller needs an immediate answer to continue and the dependency is bounded</td>
+        <td>Timeout means the remote write did not happen</td>
+      </tr>
+      <tr>
+        <td>Work queue</td>
+        <td>One worker should perform each independent task and horizontal workers share load</td>
+        <td>Queue depth can absorb unbounded sustained overload</td>
+      </tr>
+      <tr>
+        <td>Event bus</td>
+        <td>Multiple owners react independently to a completed fact</td>
+        <td>Publisher knows every future consumer</td>
+      </tr>
+      <tr>
+        <td>Retained log</td>
+        <td>Ordering per key, replay, independent positions, or stream processing matters</td>
+        <td>There is one global order across all partitions</td>
+      </tr>
+      <tr>
+        <td>Change feed</td>
+        <td>Downstream systems need committed data changes from a source of truth</td>
+        <td>Low-level row changes form a stable domain API</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="message-contract"><span class="num">02.</span> Message and event contracts</h2>
+<p class="lead">
+  A reliable event is self-identifying, traceable, versionable, and explicit about when and where
+  the fact occurred.
+</p>
+
+<figure class="code">
+  <figcaption><b>A transport-neutral event envelope</b></figcaption>
+  <pre><code>{
+  "id": "evt_01K...",
+  "type": "com.shop.order.accepted.v2",
+  "source": "urn:service:orders",
+  "subject": "orders/ord_4821",
+  "occurredAt": "2026-08-03T09:15:22.481Z",
+  "publishedAt": "2026-08-03T09:15:22.509Z",
+  "schemaVersion": 2,
+  "correlationId": "checkout_701",
+  "causationId": "cmd_988",
+  "tenantId": "tenant_12",
+  "contentType": "application/json",
+  "data": {
+    "orderId": "ord_4821",
+    "customerId": "cus_91",
+    "currency": "INR",
+    "totalMinor": 249900
+  }
+}</code></pre>
+</figure>
+
+<ul>
+  <li><strong>id</strong> gives one logical event a stable identity across redelivery.</li>
+  <li><strong>type</strong> describes business meaning, not the producing class name.</li>
+  <li><strong>source</strong> identifies the authority that emitted it.</li>
+  <li><strong>subject</strong> identifies the aggregate or entity and often guides routing.</li>
+  <li>
+    <strong>occurredAt</strong> is business event time; <strong>publishedAt</strong> is transport
+    time.
+  </li>
+  <li>
+    <strong>correlationId</strong> follows one business flow; <strong>causationId</strong> links
+    cause.
+  </li>
+  <li>
+    <strong>tenantId</strong> supports authorization, quotas, routing, and deletion workflows.
+  </li>
+  <li><strong>schemaVersion</strong> is useful only with documented compatibility rules.</li>
+</ul>
+
+<p>
+  Do not place retry count, broker offset, or consumer-specific status in the immutable business
+  payload. Those belong in transport headers or consumer state. Do not copy full customer records
+  into every event when stable identifiers or purpose-limited fields are sufficient.
+</p>
+
+<h3 id="commands-events">Commands and events are not interchangeable</h3>
+<p>
+  <code>ChargePayment</code> has an intended handler, may be rejected, and should carry an
+  idempotency identity. <code>PaymentCharged</code> says the charge already succeeded and must not
+  be rejected by consumers. An event named <code>ProcessPayment</code> hides whether it is a fact or
+  a request. An event should contain the data required to interpret the fact, but it should not
+  expose an unstable internal object graph.
+</p>
+
+<h2 id="broker-internals"><span class="num">03.</span> Broker internals and durable handoff</h2>
+<p>
+  A producer serializes a message, selects a destination and often a partition key, then sends it to
+  a broker leader. The broker validates authorization and size, appends bytes to storage, replicates
+  according to policy, and acknowledges at a configured durability point. Consumers fetch or receive
+  messages, apply business logic, make effects durable, and acknowledge or advance a position.
+</p>
+
+<figure class="code">
+  <figcaption><b>Durable handoff timeline</b></figcaption>
+  <pre><code>Producer       Broker leader       Replica        Consumer       Database
+   | PUT m           |                |               |              |
+   |----------------&gt;| append         |               |              |
+   |                 | replicate m    |               |              |
+   |                 |---------------&gt;| persist       |              |
+   | ack accepted    |&lt;---------------|               |              |
+   |&lt;----------------|                |               |              |
+   |                 | deliver m      |--------------&gt;| begin        |
+   |                 |                |               | write effect |
+   |                 |                |               |-------------&gt;|
+   |                 |                |               | commit       |
+   |                 | ack m          |&lt;--------------|              |</code></pre>
+</figure>
+
+<p>
+  Each arrow can fail independently. If the producer loses the broker acknowledgement, it may send
+  the same logical message again. If the consumer commits its database change and crashes before
+  acknowledgement, the broker redelivers. If the broker acknowledges before required replicas or
+  storage are durable, an accepted message may disappear during failure. Correctness follows from
+  explicitly handling every ambiguous boundary.
+</p>
+
+<h3 id="push-pull">Push and pull delivery</h3>
+<ul>
+  <li>
+    Pull lets consumers choose fetch rate, batch size, and position. It naturally exposes lag but
+    may add polling latency when traffic is sparse.
+  </li>
+  <li>
+    Push can reduce idle polling and simplify endpoints, but the broker needs delivery flow control,
+    retry policy, endpoint authentication, and overload behavior.
+  </li>
+  <li>
+    Either model needs bounded in-flight messages. Unlimited prefetch merely moves backlog into
+    consumer memory where it is less durable and less observable.
+  </li>
+</ul>
+
+<h2 id="topics-partitions"><span class="num">04.</span> Topics, partitions, keys, and ordering</h2>
+<p>
+  A topic is a named logical stream. A partition is one independently ordered shard of that stream.
+  Producers normally compute a partition from a key. All events for one order can use
+  <code>orderId</code>, preserving order for that order while many orders process in parallel.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Key choice</th>
+        <th>Benefit</th>
+        <th>Risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Order ID</td>
+        <td>Lifecycle order for one order and broad distribution</td>
+        <td>Queries by customer require a separate view</td>
+      </tr>
+      <tr>
+        <td>Customer ID</td>
+        <td>Ordered customer history</td>
+        <td>Large customers can create hot partitions</td>
+      </tr>
+      <tr>
+        <td>Tenant ID</td>
+        <td>Simple tenant isolation and export</td>
+        <td>One large tenant can dominate one shard</td>
+      </tr>
+      <tr>
+        <td>Random</td>
+        <td>Even distribution for independent work</td>
+        <td>No per-entity ordering</td>
+      </tr>
+      <tr>
+        <td>Constant</td>
+        <td>One total order</td>
+        <td>One partition limits throughput and availability</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Ordering is usually guaranteed only within one partition and only as observed in that log. Retries
+  can reorder sends unless the producer protocol sequences them. Concurrent consumers can finish
+  effects out of order even when delivery was ordered. A slow message can block later work for the
+  same partition. State the required scope precisely: per order, per account, per device, or global.
+  Global order is expensive and rarely required.
+</p>
+
+<h3 id="partition-count">Partition count is a capacity decision</h3>
+<p>
+  More partitions allow more parallel consumers and write leaders, but increase metadata,
+  connections, open files, replication work, recovery time, and cross-partition coordination. A
+  consumer group can actively process no more partitions than it has useful members. Partition count
+  should cover forecast peak throughput, failure headroom, and future consumers without creating
+  tiny operational units. Changing the partition count may change key mapping, so designs that
+  depend on stable partition placement need an explicit migration.
+</p>
+
+<h2 id="consumer-groups">
+  <span class="num">05.</span> Consumers, groups, offsets, and rebalancing
+</h2>
+<p>
+  A subscription identifies an independent copy of delivery. Within a competing consumer group,
+  partitions or messages are assigned across members so work is divided. Different groups each
+  observe the stream independently. An offset is a consumer's logical next position in a partition,
+  not proof that every external side effect succeeded.
+</p>
+
+<figure class="code">
+  <figcaption><b>Consumer state machine</b></figcaption>
+  <pre><code>JOINING -&gt; ASSIGNED -&gt; FETCHING -&gt; PROCESSING -&gt; COMMITTING
+   ^          |                         |              |
+   |          +----- lease lost -------+--------------+
+   +-------------------- REVOKED / REBALANCING -------+</code></pre>
+</figure>
+
+<p>
+  Membership changes, crashes, timeouts, partition-count changes, and deployments can trigger a
+  rebalance. Ownership transfers must fence the old owner before the new owner acts. During
+  revocation a consumer should stop accepting new work, finish or cancel bounded in-flight work,
+  persist safe positions, and release partition-local resources. Long blocking handlers can miss
+  heartbeats and cause repeated rebalances, creating a feedback loop.
+</p>
+
+<h3 id="offset-commit">Commit position after the correct durable boundary</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Sequence</th>
+        <th>Failure result</th>
+        <th>Guarantee</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Commit offset, then perform effect</td>
+        <td>Crash between steps loses the effect</td>
+        <td>At-most-once tendency</td>
+      </tr>
+      <tr>
+        <td>Perform effect, then commit offset</td>
+        <td>Crash between steps repeats the effect</td>
+        <td>At-least-once tendency</td>
+      </tr>
+      <tr>
+        <td>Atomically record message ID and effect in one database transaction</td>
+        <td>Redelivery sees prior completion</td>
+        <td>Effectively-once database effect</td>
+      </tr>
+      <tr>
+        <td>Atomically commit output records, state, and input position in one supported domain</td>
+        <td>Recovery exposes one committed result</td>
+        <td>Exactly-once within that domain</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="delivery-semantics"><span class="num">06.</span> Delivery and processing guarantees</h2>
+<p class="lead">
+  Delivery count, processing count, and business-effect count are different measurements.
+</p>
+
+<h3>At-most-once</h3>
+<p>
+  A message is processed zero or one time. Loss is possible, duplication is avoided. This can be
+  appropriate for replaceable telemetry or high-frequency presence signals where an older sample has
+  little value.
+</p>
+
+<h3>At-least-once</h3>
+<p>
+  A message is retried until acknowledged, so duplicates are possible. It is the common durable
+  baseline because losing accepted business work is often worse than detecting a duplicate. It
+  requires idempotent effects or explicit deduplication.
+</p>
+
+<h3>Effectively-once</h3>
+<p>
+  Delivery may repeat, but the observable business result is the same as applying the logical
+  message once. A unique constraint on <code>(consumer, message_id)</code> in the same transaction
+  as the effect is a strong pattern. A remote email or card charge needs that remote system to honor
+  a stable idempotency key, or it remains outside the atomic boundary.
+</p>
+
+<h3>Exactly-once claims</h3>
+<p>
+  Ask: exactly once for which records, state, sink, failure model, and retention period? A stream
+  engine may atomically checkpoint operator state and source positions. A broker may atomically
+  publish output and commit input positions. Neither automatically includes an arbitrary database,
+  HTTP API, email provider, or human action. Even a correct transaction can be observed more than
+  once by a client that retries a response. Use the narrow product guarantee, then design
+  idempotency and reconciliation at every boundary outside it.
+</p>
+
+<figure class="code">
+  <figcaption><b>Database consumer with atomic deduplication</b></figcaption>
+  <pre><code>BEGIN
+  INSERT INTO consumed_message(consumer_name, message_id)
+  VALUES ('inventory-projector', :message_id)
+  ON CONFLICT DO NOTHING
+
+  IF inserted_row_count = 1 THEN
+    UPDATE inventory_view
+       SET reserved = reserved + :quantity
+     WHERE sku = :sku
+  END IF
+COMMIT
+
+acknowledge message only after COMMIT succeeds</code></pre>
+</figure>
+
+<h2 id="idempotency"><span class="num">07.</span> Idempotency, deduplication, and ambiguity</h2>
+<p>
+  An operation is idempotent when repeating the same logical request has the same intended effect as
+  performing it once. It does not mean every response byte or timestamp is identical. The identity
+  must represent user intent, not a transport attempt. A retry must reuse the same key; a new intent
+  needs a new key.
+</p>
+
+<ul>
+  <li>Use a database uniqueness constraint, not a check-then-insert race.</li>
+  <li>Store status and canonical result so duplicates receive the original outcome.</li>
+  <li>Scope keys by tenant and operation to prevent cross-tenant collisions.</li>
+  <li>Retain dedupe state at least as long as messages can be retried or replayed.</li>
+  <li>Hash or validate request payloads so one key cannot silently represent two commands.</li>
+  <li>Define what happens when processing is still in progress or previously failed.</li>
+</ul>
+
+<p>
+  A short in-memory cache is not durable deduplication. It is lost on restart and differs across
+  replicas. A Bloom filter may cheaply reject probable repeats only if false positives cannot drop
+  required work, or if it is followed by an authoritative lookup.
+</p>
+
+<h2 id="retries-dlq">
+  <span class="num">08.</span> Retries, poison messages, and dead-letter handling
+</h2>
+<p>
+  Retry only failures likely to change without modifying the message: temporary network failure,
+  rate limiting, or dependency unavailability. Validation errors, unsupported versions, and broken
+  invariants require correction, quarantine, or operator action. Use capped exponential backoff with
+  jitter and a total attempt and age budget.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Action</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Transient 503</td>
+        <td>Delayed bounded retry</td>
+        <td>Immediate retry can amplify overload</td>
+      </tr>
+      <tr>
+        <td>Schema validation failure</td>
+        <td>Quarantine with evidence</td>
+        <td>Time does not repair incompatible data</td>
+      </tr>
+      <tr>
+        <td>One hot key blocks partition</td>
+        <td>Pause key, route to repair flow if ordering permits</td>
+        <td>Skipping may violate per-key order</td>
+      </tr>
+      <tr>
+        <td>Expired business deadline</td>
+        <td>Record terminal expiry and compensate if needed</td>
+        <td>Late success may be harmful</td>
+      </tr>
+      <tr>
+        <td>Unknown handler defect</td>
+        <td>Stop rollout, preserve message, alert</td>
+        <td>Mass retry burns capacity without learning</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  A dead-letter queue is a quarantine, not a trash can. Store original identity, destination,
+  schema, failure classification, attempts, first and last failure time, sanitized diagnostics, and
+  ownership. Protect it like production data. Provide tools to inspect, correct, redrive with the
+  same identity, skip with approval, and audit every action. Alert on age and rate, not only count.
+</p>
+
+<h2 id="retention-compaction"><span class="num">09.</span> Retention, replay, and compaction</h2>
+<p>
+  Queue messages are often removed after acknowledgement. A retained log keeps records by time or
+  size regardless of individual readers; consumers store their own positions. Replay resets a
+  position or writes into a controlled new destination. It is a production write workload, not a
+  free read.
+</p>
+
+<ul>
+  <li>Retention must exceed the longest expected outage, audit, and rebuild window.</li>
+  <li>Replay capacity must not starve current traffic or overwhelm downstream side effects.</li>
+  <li>Consumers need deterministic logic or versioned projections to explain changed results.</li>
+  <li>External effects must remain idempotent during replay.</li>
+  <li>Privacy deletion must account for logs, compacted values, backups, and derived stores.</li>
+</ul>
+
+<p>
+  Key compaction retains a recent value per key but is not immediate and does not necessarily erase
+  every historical byte at once. Tombstones express deletion in a compacted stream and must remain
+  long enough for slow consumers to observe them. Compaction is useful for rebuilding current
+  configuration or entity state; time retention is needed for a complete audit history.
+</p>
+
+<h2 id="schema-evolution"><span class="num">10.</span> Schema evolution and compatibility</h2>
+<p>
+  Events outlive deployments. Producers and consumers roll independently, retained records may be
+  replayed years later, and several schema versions coexist. A schema registry can store versions,
+  identifiers, and compatibility policy, but governance still requires ownership and semantic
+  review.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Compatibility</th>
+        <th>Question</th>
+        <th>Typical safe change</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Backward</td>
+        <td>Can the new reader consume old data?</td>
+        <td>Add an optional field with a documented default</td>
+      </tr>
+      <tr>
+        <td>Forward</td>
+        <td>Can the old reader consume new data?</td>
+        <td>Reader ignores an unknown optional field</td>
+      </tr>
+      <tr>
+        <td>Full</td>
+        <td>Do both directions work?</td>
+        <td>Conservative additive change supported by both</td>
+      </tr>
+      <tr>
+        <td>Semantic</td>
+        <td>Does the same field still mean the same thing?</td>
+        <td>Clarification that does not change valid interpretation</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Renaming a field is usually remove plus add. Changing rupees to paise without changing the field
+  name is syntactically compatible but semantically catastrophic. Changing an enum from open text to
+  a closed generated type can break older readers. For breaking meaning, publish a new event type or
+  version, dual-publish during migration if necessary, observe consumers, backfill safely, and
+  retire only after retention and rollback windows close.
+</p>
+
+<h2 id="stream-processing"><span class="num">11.</span> Stream-processing model</h2>
+<p>
+  A stream processor continuously reads records, transforms them, groups by key, maintains state,
+  and emits results. Stateless <code>map</code> and <code>filter</code> operations are easy to
+  replay. Stateful joins, aggregations, and pattern detection require durable state plus a
+  consistent input position.
+</p>
+
+<figure class="code">
+  <figcaption><b>Order analytics pipeline</b></figcaption>
+  <pre><code>order events
+  -&gt; validate envelope
+  -&gt; assign event timestamp
+  -&gt; key by merchantId
+  -&gt; five-minute tumbling window
+  -&gt; aggregate accepted value and failure count
+  -&gt; join merchant risk tier
+  -&gt; emit dashboard metric and anomaly event</code></pre>
+</figure>
+
+<h3 id="time-models">Event time, processing time, and ingestion time</h3>
+<ul>
+  <li><strong>Event time</strong> is when the business event occurred at the source.</li>
+  <li><strong>Ingestion time</strong> is when platform infrastructure first accepted the event.</li>
+  <li><strong>Processing time</strong> is the worker clock when an operator handles it.</li>
+</ul>
+
+<p>
+  Processing-time windows are simple and low latency, but results change with queueing, restart, and
+  replay. Event-time windows better match business questions such as sales per minute, but require
+  timestamps, out-of-order policy, watermarks, state retention, and late-data correction.
+</p>
+
+<h3 id="windows">Windows</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Window</th>
+        <th>Shape</th>
+        <th>Use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tumbling</td>
+        <td>Fixed, non-overlapping intervals</td>
+        <td>Orders per calendar minute</td>
+      </tr>
+      <tr>
+        <td>Sliding</td>
+        <td>Fixed length evaluated at a smaller step</td>
+        <td>Error rate over the last five minutes each minute</td>
+      </tr>
+      <tr>
+        <td>Session</td>
+        <td>Activity separated by an inactivity gap</td>
+        <td>User browsing sessions</td>
+      </tr>
+      <tr>
+        <td>Global with trigger</td>
+        <td>Unbounded logical group emitted by custom rule</td>
+        <td>Specialized cumulative state</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="watermarks">Watermarks and late data</h3>
+<p>
+  A watermark is an estimate that event time has progressed to a value. When the watermark passes a
+  window end, the engine may emit its result. It is not proof that no older event can arrive. Choose
+  allowed lateness from measured source delay and business correction cost. Late events can be
+  dropped with a metric, routed to a repair stream, or update a previously emitted result through an
+  upsert or retraction. Idle input partitions must be identified, or one silent partition can hold
+  the combined watermark back indefinitely.
+</p>
+
+<figure class="code">
+  <figcaption><b>Out-of-order event-time example</b></figcaption>
+  <pre><code>arrival order:  event(10:00:05), event(10:00:02), watermark(10:00:04)
+
+The 10:00:02 event is valid before the watermark arrives.
+An event for 10:00:03 arriving after this watermark is late by policy.
+The system must define drop, side output, or correction behavior.</code></pre>
+</figure>
+
+<h2 id="state-recovery"><span class="num">12.</span> Stateful recovery and checkpoints</h2>
+<p>
+  Stateful processing must recover operator state and input positions to one consistent logical
+  point. A checkpoint captures keyed state, timers, source positions, and sometimes in-flight data.
+  On failure, workers restore a completed checkpoint and replay later records. Replay is expected;
+  the framework's guarantee depends on coordinated source, state, and sink behavior.
+</p>
+
+<ul>
+  <li>Checkpoint interval trades recovery replay against steady storage and coordination cost.</li>
+  <li>
+    Checkpoint timeout detects snapshots that cannot finish, but repeated failure needs action.
+  </li>
+  <li>Backpressure can delay aligned barriers and make recovery protection stale.</li>
+  <li>Savepoints support planned migration but do not replace regular failure checkpoints.</li>
+  <li>State schema evolution must be tested before deploying code that restores old snapshots.</li>
+  <li>External sinks need idempotent upsert, transactions, or a commit protocol.</li>
+</ul>
+
+<p>
+  If a job counts each input in restored operator state exactly once, that does not mean each record
+  physically traversed the network once. Recovery may replay it, while the restored state and source
+  position make the final result equivalent to one application. Be precise in interviews and design
+  documents.
+</p>
+
+<h2 id="flow-control"><span class="num">13.</span> Batching, flow control, and backpressure</h2>
+<p>
+  Batching amortizes syscalls, compression, replication, and network overhead. Larger batches
+  improve throughput until they increase wait time, memory, retry size, and tail latency too far.
+  Batch by both count and bytes, then flush on a time bound. A ten-message batch of images and a
+  ten-message batch of IDs do not cost the same.
+</p>
+
+<p>
+  Backpressure is a feedback signal that slows upstream production. A bounded consumer should limit
+  fetched bytes, in-flight records, processing concurrency, and per-key queues. If an upstream
+  source cannot slow, the system needs admission control, durable spill with a strict limit, or load
+  shedding. Pausing fetch does not fix a dependency that remains permanently below arrival rate.
+</p>
+
+<figure class="code">
+  <figcaption><b>Bounded Python notification worker</b></figcaption>
+  <pre><code>semaphore = asyncio.Semaphore(40)
+
+async def handle(message):
+    async with semaphore:
+        event = validate(message)
+        result = await provider.send(
+            key=event.id,
+            recipient=event.data["recipient"],
+            deadline=event.data["expiresAt"],
+        )
+        await store_outcome(event.id, result)
+        await message.ack()
+
+# The adapter must stop fetching when the bounded task set is full.
+# ack happens only after the durable outcome.</code></pre>
+</figure>
+
+<h2 id="order-pipeline"><span class="num">14.</span> Complete order-event pipeline</h2>
+<p class="lead">
+  Assumptions: 2,000 orders per second at peak, bursts to 5,000, strict order lifecycle per order,
+  no duplicate charge, analytics may be eventually consistent, and accepted orders must survive a
+  zone failure.
+</p>
+
+<ol>
+  <li>
+    The order API validates authentication, price version, and an idempotency key. In one local
+    transaction it writes the order and an outbox record.
+  </li>
+  <li>
+    An outbox relay publishes <code>OrderAccepted</code> keyed by order ID. Duplicate publication is
+    allowed because event ID is stable.
+  </li>
+  <li>
+    The replicated broker acknowledges only after the required durable replica policy. Partitions
+    distribute order keys across zones.
+  </li>
+  <li>
+    Payment, inventory, notifications, search, and analytics use independent consumer groups. One
+    slow analytics deployment cannot consume payment's position.
+  </li>
+  <li>
+    Payment uses event ID as a scoped idempotency key with the payment provider and stores canonical
+    outcome before acknowledgement.
+  </li>
+  <li>
+    Inventory atomically records message ID and reservation. It emits a new outcome through its own
+    outbox rather than publishing inside an open database transaction.
+  </li>
+  <li>
+    A workflow correlates outcomes and transitions order state. Timeouts create explicit events and
+    late outcomes enter reconciliation rather than silently overwriting terminal state.
+  </li>
+  <li>
+    Analytics uses event time and an allowed-lateness policy. Corrections upsert by window and key.
+  </li>
+</ol>
+
+<h3 id="order-failures">Failure decisions</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Visible state</th>
+        <th>Recovery</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Broker unavailable during checkout</td>
+        <td>Order remains accepted with unpublished outbox row</td>
+        <td>Relay retries; age alert protects promised completion time</td>
+      </tr>
+      <tr>
+        <td>Relay publishes twice</td>
+        <td>Same event ID appears twice</td>
+        <td>Consumers deduplicate at effect boundary</td>
+      </tr>
+      <tr>
+        <td>Payment commits but reply is lost</td>
+        <td>Outcome temporarily unknown</td>
+        <td>Retry same key or query provider; never issue a new charge identity</td>
+      </tr>
+      <tr>
+        <td>Consumer group rebalance</td>
+        <td>Short lag rise</td>
+        <td>Fence old owner and resume from committed position</td>
+      </tr>
+      <tr>
+        <td>Bad schema reaches inventory</td>
+        <td>Partition may stop at poison event</td>
+        <td>Quarantine with audit; deploy compatible handler; controlled redrive</td>
+      </tr>
+      <tr>
+        <td>Analytics is offline six hours</td>
+        <td>Orders continue; dashboard is stale</td>
+        <td>Replay retained log within isolated catch-up capacity</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="notification-worker"><span class="num">15.</span> Notification worker design</h2>
+<p>
+  Notification commands use a work queue because one worker should attempt each channel delivery.
+  Partition by a hash that spreads recipients, but use a recipient-specific sequence when channel
+  order matters. The payload carries template ID and safe variables, not rendered secrets. A worker
+  validates consent, current preferences, expiry, and tenant authorization before calling the
+  provider.
+</p>
+
+<figure class="code">
+  <figcaption><b>TypeScript handler with explicit outcome states</b></figcaption>
+  <pre><code>async function deliver(job: NotificationJob): Promise&lt;void&gt; {
+  const prior = await outcomes.find(job.messageId);
+  if (prior?.terminal) return;
+
+  const policy = await preferences.authorize(job.tenantId, job.recipient, job.channel);
+  if (!policy.allowed || Date.now() &gt;= job.expiresAt) {
+    await outcomes.recordTerminal(job.messageId, "suppressed");
+    return;
+  }
+
+  const result = await provider.send(job, { idempotencyKey: job.messageId });
+  await outcomes.recordTerminal(job.messageId, result.providerId);
+}</code></pre>
+</figure>
+
+<p>
+  Retriable provider failures go to delayed retry with jitter. Invalid addresses and permanent
+  rejection become terminal outcomes. Tenant quotas prevent one campaign from delaying security
+  notifications. Metrics separate accepted, delivered, provider-rejected, suppressed, expired,
+  retrying, and unknown. Delivery receipts are events, not proof a human read the message.
+</p>
+
+<h2 id="observability"><span class="num">16.</span> Observability and troubleshooting</h2>
+<p>
+  Queue depth alone is insufficient. A quiet queue may be healthy or may have stopped accepting
+  writes. A large retained log is normal; consumer lag is the relevant signal. Monitor each stage
+  from production through useful business effect.
+</p>
+
+<ul>
+  <li>
+    Produce request rate, bytes, batch size, compression, errors, retries, and acknowledgement
+    latency.
+  </li>
+  <li>
+    Broker disk, network, replica health, under-replication, leader changes, and partition skew.
+  </li>
+  <li>Consumer lag in records, bytes, and estimated time, plus oldest unprocessed event age.</li>
+  <li>
+    Fetch rate, processing latency, acknowledgement latency, rebalance count, and assignment churn.
+  </li>
+  <li>
+    Retry and dead-letter rate by reason, attempt, event type, version, tenant, and deployment.
+  </li>
+  <li>
+    Stream watermark delay, late records, checkpoint duration, failure, state size, and
+    backpressure.
+  </li>
+  <li>
+    Useful outcomes such as paid orders and sent notifications, not only technical acknowledgements.
+  </li>
+</ul>
+
+<p>
+  Trace context may cross asynchronous boundaries, but one event can fan out to thousands of spans.
+  Use links from consumer spans to producer context, sample intentionally, and preserve message ID,
+  partition, offset, consumer group, and schema version in structured logs. Do not place full
+  message payloads, tokens, or personal data in labels or logs.
+</p>
+
+<h3 id="lag-playbook">Lag investigation playbook</h3>
+<ol>
+  <li>Confirm whether arrival rate rose or service rate fell and identify affected partitions.</li>
+  <li>Compare oldest age with business deadlines; record count alone hides message cost.</li>
+  <li>Check broker throttling, replica health, consumer rebalances, pauses, and fetch limits.</li>
+  <li>
+    Inspect handler latency, downstream saturation, hot keys, poison retries, and recent changes.
+  </li>
+  <li>Stop retry amplification and nonessential producers before scaling blindly.</li>
+  <li>Add consumers only when partitions and dependencies have capacity.</li>
+  <li>Recover in controlled ramps; verify useful throughput and reconcile expired work.</li>
+</ol>
+
+<h2 id="security"><span class="num">17.</span> Security, privacy, and trust boundaries</h2>
+<ul>
+  <li>Authenticate producers, consumers, brokers, administrators, and replay tools separately.</li>
+  <li>
+    Authorize publish and consume per destination, consumer identity, environment, and tenant scope.
+  </li>
+  <li>
+    Encrypt transport and storage; rotate keys without making retained data unreadable unexpectedly.
+  </li>
+  <li>
+    Validate size, type, schema, required claims, and safe numeric ranges before allocation or use.
+  </li>
+  <li>Treat every message as untrusted input even when it came from an internal service.</li>
+  <li>
+    Protect against decompression bombs, parser abuse, injection, deserialization gadgets, and SSRF.
+  </li>
+  <li>
+    Use quotas for bytes, records, partitions, connections, retries, and replay to resist abuse.
+  </li>
+  <li>Do not trust a payload tenant ID without binding it to authenticated producer authority.</li>
+  <li>
+    Minimize personal data and document retention, residency, access, deletion, and legal hold.
+  </li>
+  <li>
+    Audit destination changes, permission changes, offset resets, DLQ redrives, and data exports.
+  </li>
+</ul>
+
+<p>
+  Event fan-out expands the trust boundary. A consumer should receive only fields needed for its
+  purpose. Encryption at the broker does not prevent an authorized but overprivileged consumer from
+  reading data. For highly sensitive fields, use tokenization, purpose-specific topics, field-level
+  encryption with controlled keys, or fetch-on-demand through an authorization boundary.
+</p>
+
+<h2 id="performance"><span class="num">18.</span> Capacity, scalability, latency, and cost</h2>
+<p>
+  Estimate records per second, average and p99 record bytes, replication factor, retention, read
+  fan-out, compression, peak-to-average ratio, and failure headroom. One 2 KB event at 20,000 events
+  per second is about 40 MB/s before protocol overhead. With replication factor three, broker-side
+  network and disk write work is at least roughly 120 MB/s before indexes and filesystem effects.
+  Seven-day raw retention is about 24.2 TB before compression:
+</p>
+
+<figure class="code">
+  <figcaption><b>First-pass capacity formulas</b></figcaption>
+  <pre><code>ingress_bytes_per_second = events_per_second * average_event_bytes
+replicated_write_rate = ingress_bytes_per_second * replication_factor
+retained_bytes = ingress_bytes_per_second * retention_seconds / compression_ratio
+consumer_read_rate = ingress_bytes_per_second * number_of_full-stream_groups
+catch_up_time = backlog_bytes / spare_consumer_bytes_per_second
+required_service_rate &gt;= peak_arrival_rate / target_utilization</code></pre>
+</figure>
+
+<p>
+  Add protocol overhead, index and segment metadata, compaction work, uneven partitions, page cache,
+  retries, and re-replication. Size for losing a broker or zone while maintaining the
+  acknowledgement policy. Network egress from many consumer groups can cost more than ingress. Long
+  retention makes replay and audit powerful but increases storage, compliance scope, recovery time,
+  and deletion complexity.
+</p>
+
+<h2 id="failure-scenarios"><span class="num">19.</span> Failure scenarios and safer corrections</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Common mistake</th>
+        <th>Why it fails</th>
+        <th>Safer correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Publish after database commit with no outbox</td>
+        <td>Crash leaves committed data with no event</td>
+        <td>Atomic outbox plus idempotent relay</td>
+      </tr>
+      <tr>
+        <td>Acknowledge before effect is durable</td>
+        <td>Crash loses business work</td>
+        <td>Acknowledge after commit</td>
+      </tr>
+      <tr>
+        <td>Assume at-least-once means no loss and no duplicates</td>
+        <td>Redelivery is part of recovery</td>
+        <td>Deduplicate at effect boundary</td>
+      </tr>
+      <tr>
+        <td>Use event bus for immediate validation</td>
+        <td>Caller cannot know authoritative result</td>
+        <td>Use synchronous owner decision or explicit pending workflow</td>
+      </tr>
+      <tr>
+        <td>Retry poison message immediately forever</td>
+        <td>Hot loop blocks partition and wastes capacity</td>
+        <td>Classify, bound, quarantine, repair, and redrive</td>
+      </tr>
+      <tr>
+        <td>Increase consumers beyond partition count</td>
+        <td>Extra consumers remain idle</td>
+        <td>Measure partition and dependency bottlenecks</td>
+      </tr>
+      <tr>
+        <td>Put every entity on one partition for global order</td>
+        <td>One shard caps throughput and enlarges failure scope</td>
+        <td>Define narrow ordering key</td>
+      </tr>
+      <tr>
+        <td>Reset offsets directly in production</td>
+        <td>Replays side effects and changes live ownership</td>
+        <td>Use reviewed replay group or isolated destination</td>
+      </tr>
+      <tr>
+        <td>Log complete payloads</td>
+        <td>Duplicates secrets and personal data</td>
+        <td>Log identifiers and sanitized diagnostics</td>
+      </tr>
+      <tr>
+        <td>Call any broker workflow exactly once</td>
+        <td>External effects may be outside transaction domain</td>
+        <td>Name exact boundary and reconcile beyond it</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="testing"><span class="num">20.</span> Testing strategy</h2>
+<h3>Unit and property tests</h3>
+<ul>
+  <li>Envelope and schema validation, including unknown fields, bounds, and malicious payloads.</li>
+  <li>Idempotency state transitions for new, in-progress, completed, failed, and expired keys.</li>
+  <li>Partition-key stability and distribution using realistic skewed identifiers.</li>
+  <li>Window assignment, watermark, late-data, deduplication, and timer behavior.</li>
+  <li>
+    Property: any number of identical deliveries creates at most one terminal business effect.
+  </li>
+</ul>
+
+<h3>Integration and contract tests</h3>
+<ul>
+  <li>Use a real compatible broker and database, not only mocks of acknowledgement behavior.</li>
+  <li>Verify old and new producer and consumer versions against retained contract fixtures.</li>
+  <li>Crash after receive, after effect commit, before acknowledgement, and during rebalance.</li>
+  <li>Test relay duplicates, broker failover, revoked ownership, and expired retention.</li>
+  <li>Restore stream state from the previous deployed checkpoint format.</li>
+</ul>
+
+<h3>Load, fault, and recovery tests</h3>
+<ul>
+  <li>Measure throughput and p99 under representative message-size and key skew distributions.</li>
+  <li>Burst above capacity and verify bounded memory, honest lag, and protected dependencies.</li>
+  <li>
+    Lose a broker or zone and verify acknowledgement durability and reduced-capacity headroom.
+  </li>
+  <li>Pause one downstream dependency and confirm retries do not create a storm.</li>
+  <li>Build a retention-sized backlog, catch up safely, and keep current traffic healthy.</li>
+  <li>Replay a full projection and compare checksums, counts, and business invariants.</li>
+</ul>
+
+<h2 id="decision-framework"><span class="num">21.</span> Design decision checklist</h2>
+<ol>
+  <li>Define command, event, request-response, or continuous-query semantics.</li>
+  <li>Name the source of truth and atomic transaction boundary.</li>
+  <li>Choose work sharing, fan-out, or retained replay behavior.</li>
+  <li>Define message identity, aggregate key, ordering scope, and partition strategy.</li>
+  <li>State durability acknowledgement, replication, retention, and disaster assumptions.</li>
+  <li>Choose delivery guarantee and business-effect deduplication.</li>
+  <li>Specify acknowledgement, retry, poison-message, deadline, and redrive behavior.</li>
+  <li>Define schema ownership, compatibility, rollout, and retirement.</li>
+  <li>Bound batch, bytes, in-flight work, lag, and downstream concurrency.</li>
+  <li>Plan observability, security, privacy, capacity, replay, and recovery tests.</li>
+</ol>
+
+<h2 id="exercises"><span class="num">22.</span> Hands-on exercises</h2>
+<h3>Exercise 1: duplicate-safe inventory consumer</h3>
+<p>
+  Design tables and pseudocode for inventory reservations. Inject a crash after the inventory update
+  but before broker acknowledgement. Expected reasoning: message identity and effect must commit
+  atomically; redelivery detects the prior result; acknowledgement follows commit; insufficient
+  stock is a stored terminal outcome, not a transient retry.
+</p>
+
+<h3>Exercise 2: partition a chat stream</h3>
+<p>
+  Require message order within a conversation, 100,000 concurrent rooms, and one celebrity room at
+  20% of traffic. Expected reasoning: conversation ID gives correct normal ordering but creates a
+  hot key. Discuss a dedicated partition, ordered substreams with sequence merge, admission control,
+  or relaxing order for independent event types. Do not silently hash one conversation across
+  shards.
+</p>
+
+<h3>Exercise 3: repair late analytics</h3>
+<p>
+  Process mobile purchase events that can arrive 30 minutes late. Expected reasoning: use event
+  time, observed delay distribution, watermark policy, allowed lateness, upsertable window results,
+  late side output, and a batch reconciliation path. Compare latency and state cost at 2, 10, and 60
+  minutes of allowed lateness.
+</p>
+
+<h3>Exercise 4: disaster replay</h3>
+<p>
+  Rebuild a search projection from seven days of events without hurting checkout. Expected
+  reasoning: isolated consumer identity, rate and concurrency limits, replay capacity, deterministic
+  versioned transformation, shadow destination, completeness checks, cutover, rollback, and privacy
+  deletions applied before exposure.
+</p>
+
+<h2 id="interview"><span class="num">23.</span> Interview questions and model answers</h2>
+<h3>1. Queue versus publish-subscribe versus log?</h3>
+<p>
+  A work queue divides tasks among competing workers. Publish-subscribe gives independent
+  subscriptions their own delivery. A retained log stores ordered partitions and lets consumers own
+  positions and replay. Products can support several modes, so describe required semantics rather
+  than selecting by label.
+</p>
+
+<h3>2. Does a message broker make a system loosely coupled?</h3>
+<p>
+  It reduces temporal and location coupling, but producers and consumers remain coupled through
+  semantics, schema, identifiers, ordering, and operational expectations. Undocumented events can
+  create hidden coupling worse than a versioned API.
+</p>
+
+<h3>3. What does at-least-once mean?</h3>
+<p>
+  The system retries unacknowledged messages, so an accepted message should eventually be delivered
+  under stated failure assumptions, but delivery and processing can repeat. Consumers must make
+  effects idempotent or deduplicate durably.
+</p>
+
+<h3>4. How do you prevent duplicate payments?</h3>
+<p>
+  Carry one stable payment-intent identity through every retry, use it as a scoped idempotency key
+  at the payment authority, store canonical outcomes, and query ambiguous results. Broker offset
+  alone cannot prevent duplicates at an external provider.
+</p>
+
+<h3>5. Why commit the offset after the database transaction?</h3>
+<p>
+  Committing first can lose the effect if the process crashes. Committing the effect first can cause
+  redelivery, so the database transaction must also record message identity or use an idempotent
+  operation. Then redelivery is safe.
+</p>
+
+<h3>6. What ordering does a partitioned log provide?</h3>
+<p>
+  It normally provides one append order within each partition. There is no single order across
+  partitions. Consumer concurrency, retry, and external side effects can still complete out of
+  order, so key by the smallest entity that needs order and serialize effects for that key.
+</p>
+
+<h3>7. What happens during a consumer-group rebalance?</h3>
+<p>
+  Assignments are revoked and redistributed as membership changes. Consumers must stop old
+  ownership, settle bounded work, store safe positions, and resume from committed positions. Slow
+  handlers and missed heartbeats can cause churn; cooperative transfer can reduce disruption but
+  does not remove fencing needs.
+</p>
+
+<h3>8. How do you handle a poison message?</h3>
+<p>
+  Classify it, stop unbounded immediate retry, preserve evidence, and quarantine it with ownership.
+  Decide whether order allows later records to continue. Fix data or code, then redrive using the
+  same identity under rate limits and audit.
+</p>
+
+<h3>9. What is event time?</h3>
+<p>
+  It is when the business event occurred, unlike processing time when a worker handles it. Event
+  time gives stable replayable analytics but requires watermarks, late-event policy, and retained
+  state.
+</p>
+
+<h3>10. What is a watermark?</h3>
+<p>
+  It is a progress estimate for event time. When it passes a window, the engine can emit results.
+  Older events can still arrive, so the design must define allowed lateness and correction. A slow
+  or idle input can hold the combined watermark back.
+</p>
+
+<h3>11. Can exactly-once processing call an HTTP API exactly once?</h3>
+<p>
+  Not automatically. Framework transactions usually cover their source, state, and supported sink.
+  An arbitrary HTTP side effect is outside that boundary. It needs a stable idempotency key, outcome
+  query, durable intent, and reconciliation.
+</p>
+
+<h3>12. How do you choose a partition key?</h3>
+<p>
+  Start from ordering and state-locality requirements, then test distribution against real skew.
+  Prefer the narrow business entity that needs ordering. Plan for hot keys, tenant isolation,
+  resharding, and the fact that changing partition count may remap keys.
+</p>
+
+<h3>13. What does consumer lag tell you?</h3>
+<p>
+  It estimates unprocessed distance between produced and consumed positions. Track records, bytes,
+  and oldest age because costs vary. Lag reveals imbalance but not root cause; correlate arrival,
+  processing, dependency, broker, and rebalance signals.
+</p>
+
+<h3>14. How do schemas evolve safely?</h3>
+<p>
+  Define backward, forward, and semantic compatibility; use contract checks; prefer additive
+  optional fields; roll readers before writers when required; support mixed versions; and give
+  breaking meaning a new version or event type. Retained old events must remain readable.
+</p>
+
+<h3>15. Why is a DLQ not enough?</h3>
+<p>
+  It prevents one bad message from retrying forever, but it can silently lose business work. A safe
+  quarantine needs alerts, ownership, diagnostics, retention, correction, audited redrive,
+  completeness checks, and a decision about ordering.
+</p>
+
+<h3>16. Design an order event pipeline.</h3>
+<p>
+  Clarify throughput, ordering, durability, duplicate, and latency requirements. Use an atomic
+  outbox, replicated partitioned log keyed by order, independent consumer groups, durable
+  idempotency at effects, versioned envelopes, bounded retries, quarantine, lag objectives,
+  reconciliation, secure ACLs, and recovery tests. State every exact transaction boundary.
+</p>
+<p><strong>Follow-up:</strong> What changes if analytics can lose data?</p>
+<p>
+  Analytics might use a cheaper at-most-once path or shorter retention, but payment and inventory
+  guarantees should remain independent. The answer must follow explicit business loss tolerance, not
+  a broker-wide default.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">24.</span> Revision cheat sheet</h2>
+<ul>
+  <li>A command requests an action; an event states an immutable past fact.</li>
+  <li>Queues divide work, subscriptions fan out, and retained logs support independent replay.</li>
+  <li>Messaging reduces temporal coupling but adds schema and operational coupling.</li>
+  <li>Broker acknowledgement point determines accepted-message durability.</li>
+  <li>Ordering is normally per partition, not global and not automatically per external effect.</li>
+  <li>Key by the smallest entity that requires ordering and test real skew.</li>
+  <li>Consumer offsets are positions, not proof of business completion.</li>
+  <li>Commit effects before acknowledgement and make redelivery safe.</li>
+  <li>At-least-once permits duplicates; effectively-once deduplicates observable effects.</li>
+  <li>Ask exactly once within which transaction domain and failure model.</li>
+  <li>Stable idempotency identity must survive retries and replays.</li>
+  <li>Bound retries by attempts, age, backoff, jitter, and business deadline.</li>
+  <li>A DLQ is an owned, monitored, auditable quarantine.</li>
+  <li>Retention enables outage recovery and replay but increases cost and privacy scope.</li>
+  <li>Schema compatibility includes meaning, not only parseability.</li>
+  <li>Event time supports replayable business results; processing time follows runtime delay.</li>
+  <li>A watermark is a progress estimate and needs a late-data policy.</li>
+  <li>Stateful recovery coordinates state, timers, source position, and sink behavior.</li>
+  <li>Batch by count and bytes with a time bound.</li>
+  <li>Backpressure must propagate; otherwise shed or durably bound work.</li>
+  <li>Observe oldest event age, useful outcomes, retries, rebalances, and checkpoint health.</li>
+  <li>Replay is a production workload that needs isolation and correctness checks.</li>
+  <li>Use atomic outbox for database-to-broker dual writes.</li>
+  <li>Secure every producer, consumer, administrative reset, and redrive path.</li>
+</ul>
+
+<h2 id="references"><span class="num">25.</span> Primary official references</h2>
+<ul>
+  <li>
+    <a href="https://kafka.apache.org/documentation/">Apache Kafka official documentation</a>
+    - topics, partitions, replication, producers, consumers, delivery, retention, and compaction.
+  </li>
+  <li>
+    <a href="https://kafka.apache.org/protocol.html">Apache Kafka protocol guide</a>
+    - requests, responses, record batches, offsets, and group coordination protocol details.
+  </li>
+  <li>
+    <a href="https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md"
+      >CloudEvents core specification</a
+    >
+    - interoperable event context attributes, identity, source, type, subject, time, and data.
+  </li>
+  <li>
+    <a href="https://www.asyncapi.com/docs/reference/specification/latest"
+      >AsyncAPI specification</a
+    >
+    - language-neutral documentation for channels, operations, messages, servers, and security.
+  </li>
+  <li>
+    <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/"
+      >Apache Flink official time documentation</a
+    >
+    - event time, processing time, watermarks, and late-event reasoning.
+  </li>
+  <li>
+    <a
+      href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/checkpointing/"
+      >Apache Flink official checkpointing documentation</a
+    >
+    - state, source replay, durable checkpoint storage, and processing guarantees.
+  </li>
+  <li>
+    <a href="https://www.reactive-streams.org/">Reactive Streams specification</a>
+    - asynchronous stream processing with non-blocking backpressure.
+  </li>
+  <li>
+    <a
+      href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Flow.html"
+      >Java SE Flow API</a
+    >
+    - publisher, subscriber, subscription, demand, and cancellation interfaces.
+  </li>
+  <li>
+    <a href="https://docs.python.org/3/library/asyncio-queue.html"
+      >Python standard library asyncio queues</a
+    >
+    - bounded asynchronous queues, waiting producers, task completion, and shutdown behavior.
+  </li>
+  <li>
+    <a href="https://protobuf.dev/programming-guides/proto3/">Protocol Buffers language guide</a>
+    - field evolution, unknown fields, reserved identifiers, enums, and compatibility constraints.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9110.html">IETF RFC 9110: HTTP Semantics</a>
+    - idempotent methods and the limits of request retry assumptions at HTTP boundaries.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>

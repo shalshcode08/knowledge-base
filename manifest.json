@@ -134,12 +134,28 @@
           "path": "systemdesign/distributed-systems-time-ordering-consistency"
         },
         {
+          "title": "Replication, Partitioning, Sharding, and Quorum Systems",
+          "path": "systemdesign/replication-partitioning-sharding-quorum-systems"
+        },
+        {
           "title": "Coordination, Consensus, Leader Election, Leases, and Distributed Locks",
           "path": "systemdesign/coordination-consensus-leases-locks"
         },
         {
           "title": "Resilience, Retries, Backpressure, and Overload Control",
           "path": "systemdesign/resilience-retries-backpressure-overload"
+        },
+        {
+          "title": "Messaging, Event-Driven Architecture, and Stream Processing",
+          "path": "systemdesign/messaging-event-driven-stream-processing"
+        },
+        {
+          "title": "Observability, SRE, Capacity Planning, and Incident Response",
+          "path": "systemdesign/observability-sre-capacity-planning-incident-response"
+        },
+        {
+          "title": "Distributed Transactions, Sagas, Outbox, and Reliable Workflows",
+          "path": "systemdesign/distributed-transactions-sagas-outbox-reliable-workflows"
         },
         {
           "title": "Architecture Styles, Modular Monoliths, Microservices, and Service Boundaries",
