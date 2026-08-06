@@ -1,0 +1,1715 @@
+<h1>Replication, Partitioning, Sharding, and Quorum Systems - Complete Notes</h1>
+<p class="subtitle">
+  A language-neutral guide to copying and distributing data, choosing quorum behavior, moving
+  partitions safely, generating identifiers, and reasoning about correctness during replica,
+  network, and routing failures.
+</p>
+
+<h2 id="mental-model"><span class="num">00.</span> The map, copies, and evidence mental model</h2>
+<p class="lead">
+  Partitioning decides where a record belongs, replication decides how many failure domains hold a
+  copy, and a quorum decides how much evidence an operation needs before it can succeed.
+</p>
+
+<div class="analogy">
+  <p>
+    Imagine a library with several buildings. A catalog rule sends books A to F to one building and
+    G to L to another. That is partitioning. Keeping three copies of an important book in separate
+    buildings is replication. Requiring two librarians to confirm an update before accepting it is a
+    quorum rule. The catalog, copy policy, and confirmation rule solve different problems and can
+    fail independently.
+  </p>
+</div>
+
+<figure class="code">
+  <figcaption><b>Three decisions on every request</b></figcaption>
+  <pre><code>order_id = "ord-4821"
+        |
+        v
+partition function or partition map
+        |
+        v
+logical partition P17
+        |
+        v
+replica placement: zone-a/node-4, zone-b/node-8, zone-c/node-2
+        |
+        v
+coordination rule: leader ack, all acks, or W of N acks
+
+Routing answers "where?"
+Replication answers "which copies?"
+Acknowledgement answers "how much evidence is enough?"</code></pre>
+</figure>
+
+<div class="key">
+  <strong>Replication is not a backup</strong>
+  <p>
+    Replicas quickly copy valid writes, accidental deletes, corruption, and malicious changes. A
+    backup preserves an independently restorable historical state. Production systems commonly need
+    replication for availability and backups for recovery.
+  </p>
+</div>
+
+<h2 id="terminology"><span class="num">01.</span> Precise terminology and prerequisites</h2>
+<p class="lead">
+  Clear terms prevent architecture discussions from mixing data layout, consistency, and physical
+  deployment.
+</p>
+
+<dl>
+  <dt>Replica</dt>
+  <dd>A maintained copy of some logical data, with a defined update and recovery protocol.</dd>
+  <dt>Replication factor, N</dt>
+  <dd>The intended number of replicas for a logical item or partition.</dd>
+  <dt>Leader, primary, or source</dt>
+  <dd>The replica authorized to order writes for a replication group.</dd>
+  <dt>Follower, secondary, or standby</dt>
+  <dd>
+    A replica that applies changes ordered by a leader. Whether it may serve reads is a policy.
+  </dd>
+  <dt>Replication log</dt>
+  <dd>
+    An ordered record of changes or state transitions that another replica can replay. It may be a
+    physical byte-level log or a logical record-level log.
+  </dd>
+  <dt>Replication lag</dt>
+  <dd>
+    The distance between a source and replica. Measure it in log positions, bytes, operations, and
+    wall-clock age because any single measure can hide a different problem.
+  </dd>
+  <dt>Partition</dt>
+  <dd>A logical subset of data selected by a deterministic placement rule.</dd>
+  <dt>Shard</dt>
+  <dd>
+    Commonly, a partition placed on an independently scalable storage group. Product terminology
+    varies, so state whether "shard" means a logical range, replica group, or server.
+  </dd>
+  <dt>Horizontal partitioning</dt>
+  <dd>Splitting rows or records, usually by a partition key.</dd>
+  <dt>Vertical partitioning</dt>
+  <dd>Splitting columns, features, or ownership boundaries into separately stored groups.</dd>
+  <dt>Partition key or shard key</dt>
+  <dd>The value used to select a logical partition. It need not be the record's unique ID.</dd>
+  <dt>Partition map</dt>
+  <dd>A versioned mapping from key ranges or tokens to replica groups.</dd>
+  <dt>Coordinator</dt>
+  <dd>
+    The node that receives a request and gathers enough replica responses for the chosen policy.
+  </dd>
+  <dt>Quorum</dt>
+  <dd>
+    A required subset of participants. In quorum replication, R is the read response count and W is
+    the write acknowledgement count out of N replicas.
+  </dd>
+  <dt>Failure domain</dt>
+  <dd>
+    Infrastructure likely to fail together, such as one disk, host, rack, zone, region, power feed,
+    network path, or administrative account.
+  </dd>
+  <dt>Hotspot and skew</dt>
+  <dd>
+    A hotspot is a placement receiving disproportionate work. Skew is uneven data size, request
+    rate, or request cost across placements.
+  </dd>
+</dl>
+
+<div class="warn">
+  <strong>A successful write is defined by the protocol</strong>
+  <p>
+    An acknowledgement might mean buffered in memory, appended to an operating-system cache, flushed
+    to durable media, persisted on one node, or persisted in several failure domains. Ask exactly
+    what an acknowledgement proves before making durability claims.
+  </p>
+</div>
+
+<h2 id="problem"><span class="num">02.</span> Problems being solved and invariants</h2>
+<p class="lead">
+  Replication and sharding are tools for explicit requirements, not automatic upgrades.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>Likely technique</th>
+        <th>New cost or risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Survive a machine or zone loss</td>
+        <td>Replicas across independent failure domains</td>
+        <td>Write coordination, lag, failover, extra storage</td>
+      </tr>
+      <tr>
+        <td>Scale read throughput</td>
+        <td>Read replicas or independently readable replicas</td>
+        <td>Staleness, consistency routing, replica saturation</td>
+      </tr>
+      <tr>
+        <td>Exceed one node's storage or write capacity</td>
+        <td>Horizontal sharding</td>
+        <td>Routing, cross-shard operations, rebalancing</td>
+      </tr>
+      <tr>
+        <td>Place data near users or satisfy residency rules</td>
+        <td>Region-aware replication and placement</td>
+        <td>Wide-area latency, partitions, policy complexity</td>
+      </tr>
+      <tr>
+        <td>Keep independent data lifecycles or access controls</td>
+        <td>Vertical partitioning</td>
+        <td>Joins and atomic updates may cross boundaries</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Before selecting a topology, write the invariants in observable terms:</p>
+<ul>
+  <li>An acknowledged paid order must survive loss of any one zone.</li>
+  <li>Two successful requests must never allocate the same public order ID.</li>
+  <li>A user must read their own confirmed message within two seconds.</li>
+  <li>A tenant's records must remain in its approved region.</li>
+  <li>A partition move must not lose or expose records to the wrong tenant.</li>
+</ul>
+
+<p>
+  Some invariants require consensus, transactions, uniqueness constraints, or single-writer
+  ownership. Replication by itself does not create those guarantees. If two replicas accept
+  conflicting inventory decrements without coordination, having more copies preserves the conflict
+  rather than preventing overselling.
+</p>
+
+<h2 id="leader-follower"><span class="num">03.</span> Leader-follower replication</h2>
+<p class="lead">
+  A leader establishes one write order; followers replay that order to maintain copies.
+</p>
+
+<figure class="code">
+  <figcaption><b>Typical write path</b></figcaption>
+  <pre><code>Client          Leader              Follower A          Follower B
+  | PUT x=9        |                     |                   |
+  |---------------&gt;| append log at 842  |                   |
+  |                 |-------------------&gt;| apply 842         |
+  |                 |---------------------------------------&gt;| apply 842
+  |                 |&lt;-------------------| ack               |
+  | success         |  acknowledgement policy satisfied     |
+  |&lt;----------------|                     |                   |</code></pre>
+</figure>
+
+<h3 id="replication-log">Replication log and apply pipeline</h3>
+<ol>
+  <li>
+    The leader validates a command against its current state and assigns an order or log position.
+  </li>
+  <li>
+    The leader appends the change to its log. Durability depends on the configured flush point.
+  </li>
+  <li>Followers fetch or receive log records, persist them, and apply them in order.</li>
+  <li>The leader acknowledges after its configured local and remote conditions are satisfied.</li>
+  <li>Followers expose applied state to reads only under their serving policy.</li>
+</ol>
+
+<p>
+  Physical replication replays storage-level changes and is usually tightly coupled to an engine
+  version and layout. Logical replication sends record-level operations and supports filtering or
+  transformation more easily, but it must preserve schema compatibility and transaction semantics. A
+  snapshot or base copy supplies the starting state; the log carries changes after the snapshot's
+  checkpoint.
+</p>
+
+<h3 id="sync-async">Synchronous and asynchronous acknowledgement</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>Success usually waits for</th>
+        <th>Benefit</th>
+        <th>Main trade-off</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Asynchronous</td>
+        <td>Leader persistence only</td>
+        <td>Lower latency and remote failure isolation</td>
+        <td>A failover can lose acknowledged but unreplicated writes</td>
+      </tr>
+      <tr>
+        <td>Synchronous receive</td>
+        <td>Remote receipt or log persistence</td>
+        <td>Better failure tolerance</td>
+        <td>Does not always mean remote apply or read visibility</td>
+      </tr>
+      <tr>
+        <td>Synchronous apply</td>
+        <td>Remote apply to queryable state</td>
+        <td>Stronger immediate read behavior</td>
+        <td>Write latency includes slow follower apply</td>
+      </tr>
+      <tr>
+        <td>Geographic synchronous</td>
+        <td>Another region or fault domain</td>
+        <td>Low data-loss objective across regional loss</td>
+        <td>Wide-area round trips and reduced write availability</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="read-replicas">Read replicas and session correctness</h3>
+<p>
+  Read replicas scale workloads that tolerate their lag, such as product browsing or analytics. They
+  are unsafe as an invisible replacement for the leader when the next request must observe a
+  just-confirmed write. Three practical read-your-writes strategies are:
+</p>
+<ul>
+  <li>Route the user's bounded session to the leader after a write.</li>
+  <li>
+    Return a commit position and wait until a chosen replica has applied at least that position.
+  </li>
+  <li>Use a consistency-aware read API that selects a sufficiently current replica or rejects.</li>
+</ul>
+
+<p>
+  Lag can come from network delay, a slow disk, long transactions, schema work, apply conflicts,
+  insufficient CPU, or a follower serving too many queries. A follower that is healthy at the
+  process level can still be unfit for freshness-sensitive traffic.
+</p>
+
+<h3 id="failover">Failover state machine</h3>
+<figure class="code">
+  <figcaption><b>Promotion with an explicit epoch</b></figcaption>
+  <pre><code>LEADER_ACTIVE(epoch 41)
+        |
+        | failure detector suspects leader
+        v
+ELECTION_OR_OPERATOR_DECISION
+        |
+        | choose sufficiently current candidate, obtain epoch 42
+        v
+NEW_LEADER_FENCED(epoch 42)
+        |
+        | publish routing, reject epoch 41 writes
+        v
+RECOVER_FOLLOWERS_AND_RECONCILE_OLD_LEADER</code></pre>
+</figure>
+
+<p>
+  Failure detection is suspicion, not proof. A paused or partitioned old leader may still accept
+  writes. Safe promotion therefore needs a mechanism such as consensus membership, an epoch, a
+  fencing token, or storage-level exclusivity that makes the old writer unable to commit. Promotion
+  policy must consider replay position, missing acknowledged writes, recovery time, and whether the
+  candidate belongs to an independent failure domain.
+</p>
+
+<div class="warn">
+  <strong>Failover can trade availability for data loss</strong>
+  <p>
+    Automatically promoting an asynchronous follower may meet a recovery-time target while violating
+    a zero-data-loss claim. Record the old leader's last durable position, the promoted position,
+    and any divergent writes so operators can reconcile rather than silently discard evidence.
+  </p>
+</div>
+
+<h2 id="multi-leader"><span class="num">04.</span> Multi-leader replication</h2>
+<p class="lead">
+  Multiple leaders improve local write availability, but concurrent writers can create legitimate
+  versions that no timestamp can safely interpret by itself.
+</p>
+
+<p>
+  Multi-leader topologies appear in multi-region systems, intermittently connected clients, and
+  migration bridges. Each leader accepts local writes, then exchanges them with peers. They are
+  useful when applications can name a deterministic merge or constrain each entity to one home
+  writer. They are dangerous when business invariants require a single global order.
+</p>
+
+<figure class="code">
+  <figcaption><b>Concurrent profile edits</b></figcaption>
+  <pre><code>Initial: {email: old@example.com, phone: 111}
+
+Region A, disconnected: set email = new@example.com
+Region B, disconnected: set phone = 222
+
+Whole-record last-write-wins may discard one independent edit.
+Field-aware merge can preserve both because fields do not conflict.
+
+But two concurrent changes to the same shipping address require
+business resolution, not merely a larger timestamp.</code></pre>
+</figure>
+
+<h3 id="conflict-detection">Conflict detection</h3>
+<p>
+  A system needs metadata that distinguishes causally newer versions from concurrent versions.
+  Version vectors, per-record generations, operation identifiers, and hybrid logical metadata are
+  examples. Wall-clock timestamps alone are vulnerable to skew, clock rollback, coarse resolution,
+  and a malicious or misconfigured writer.
+</p>
+
+<h3 id="merge-strategies">Merge strategies</h3>
+<ul>
+  <li>
+    <strong>Avoid:</strong> assign each entity a home leader, or serialize invariant-sensitive
+    operations.
+  </li>
+  <li>
+    <strong>Last-write-wins:</strong> simple convergence, but can silently lose valid concurrent
+    work.
+  </li>
+  <li>
+    <strong>Field merge:</strong> useful when independently changed fields have stable semantics.
+  </li>
+  <li>
+    <strong>Set union:</strong> useful for additions, but removals need tombstones or richer
+    metadata.
+  </li>
+  <li>
+    <strong>Application merge:</strong> retain siblings and apply domain rules or request human
+    review.
+  </li>
+  <li>
+    <strong>Convergent data type:</strong> use a proven CRDT whose operations have required
+    algebraic properties.
+  </li>
+</ul>
+
+<p>
+  Conflict resolution must be deterministic, associative where order can vary, idempotent under
+  replay, and explicit about deletes. Test the merge of A with B in both orders, duplicate delivery,
+  three-way concurrency, and a delete racing with an update.
+</p>
+
+<h2 id="leaderless"><span class="num">05.</span> Leaderless replication</h2>
+<p class="lead">
+  A coordinator sends operations directly to several replicas and reconciles their possibly
+  different versions.
+</p>
+
+<figure class="code">
+  <figcaption><b>Leaderless write with N = 3 and W = 2</b></figcaption>
+  <pre><code>Client -&gt; Coordinator
+              |---- write v8 ----&gt; Replica A: ack
+              |---- write v8 ----&gt; Replica B: unavailable
+              |---- write v8 ----&gt; Replica C: ack
+              |
+              +---- two durable acknowledgements -&gt; success
+
+Replica B needs a hint, read repair, or anti-entropy later.</code></pre>
+</figure>
+
+<p>
+  Leaderless does not mean coordination-free. The coordinator still chooses replicas, gathers
+  acknowledgements, handles timeouts, compares version metadata, and may repair stale copies. It
+  avoids one permanent write leader, but moves conflict and convergence work into every request and
+  background maintenance.
+</p>
+
+<h3 id="read-repair">Read repair</h3>
+<p>
+  A coordinator reads version metadata or digests from replicas. If responses disagree, it fetches
+  enough full values to choose or merge the correct result, returns according to the consistency
+  policy, and updates stale replicas. Blocking repair improves the replicas involved but adds tail
+  latency. Asynchronous repair shortens the client path but leaves a longer inconsistency window.
+</p>
+
+<h3 id="anti-entropy">Anti-entropy repair</h3>
+<p>
+  Background anti-entropy compares replicas independently of client reads. Hierarchical hash trees
+  can locate differing ranges without transferring the full dataset. Matching root hashes avoid deep
+  comparison; mismatching branches are recursively narrowed, then differing records are streamed.
+  Anti-entropy is essential for cold keys that normal reads never repair.
+</p>
+
+<h3 id="hinted-handoff">Hinted handoff</h3>
+<p>
+  When a target replica is temporarily unavailable, a coordinator can store a durable hint
+  containing the missed mutation and destination. It replays the hint after recovery. Hints reduce
+  the stale window, but retention can expire, the coordinator can fail, and replay can overload the
+  returning node. Hinted handoff is a best-effort bridge, not a replacement for scheduled repair.
+</p>
+
+<div class="note">
+  <strong>Tombstones are part of convergence</strong>
+  <p>
+    In an eventually replicated store, deleting a value usually creates a versioned tombstone. If
+    the tombstone is discarded before every replica has learned it, an old value can return during
+    repair. Tombstone retention, maximum outage, repair cadence, and replacement procedures must be
+    designed together.
+  </p>
+</div>
+
+<h2 id="quorums"><span class="num">06.</span> Quorum reads, writes, and their limits</h2>
+<p class="lead">
+  Quorum arithmetic describes intersecting replica sets; it does not automatically provide a
+  complete consistency guarantee.
+</p>
+
+<p>For N replicas, a common rule is:</p>
+<figure class="code">
+  <figcaption><b>Intersection conditions</b></figcaption>
+  <pre><code>R + W &gt; N     every read set intersects every completed write set
+W &gt; N / 2     any two write sets intersect
+
+Example N = 3:
+R=2, W=2      balanced quorum
+R=1, W=3      fast reads, writes require every replica
+R=3, W=1      fast writes, reads require every replica</code></pre>
+</figure>
+
+<p>
+  Intersection gives a reader access to at least one replica that accepted a completed write only
+  when the same replica membership is used, responses represent durable versions, and conflict
+  metadata correctly identifies the latest version. A coordinator must actually inspect enough
+  versions. Blindly returning the fastest response defeats the argument.
+</p>
+
+<h3 id="tunable-consistency">Tunable consistency</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Operation policy</th>
+        <th>Availability</th>
+        <th>Latency</th>
+        <th>Suitable example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>ONE</td>
+        <td>High while any suitable replica responds</td>
+        <td>Usually low</td>
+        <td>Approximate feed counters where staleness is acceptable</td>
+      </tr>
+      <tr>
+        <td>QUORUM</td>
+        <td>Tolerates a minority of failures</td>
+        <td>Waits for a majority and reconciliation</td>
+        <td>User-visible profile state with bounded conflict handling</td>
+      </tr>
+      <tr>
+        <td>ALL</td>
+        <td>Any unavailable replica can block</td>
+        <td>Bound by slowest replica</td>
+        <td>Rare operations where every replica must observe before success</td>
+      </tr>
+      <tr>
+        <td>LOCAL_QUORUM</td>
+        <td>Survives local minority failure</td>
+        <td>Avoids wide-area path</td>
+        <td>Region-local requests with asynchronous cross-region convergence</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="sloppy-quorum">Sloppy quorums</h3>
+<p>
+  A strict quorum uses the designated N replicas. A sloppy quorum can accept writes on healthy
+  fallback nodes outside that preference list when designated replicas are unreachable, often with
+  hints for later handoff. This improves write availability, but read and write sets might not
+  overlap during a partition. Saying "R plus W exceeds N" is then insufficient without defining the
+  replica set, fallback behavior, and repair path.
+</p>
+
+<h3 id="quorum-not-linearizability">Why quorum is not automatically linearizable</h3>
+<ul>
+  <li>Two writers may concurrently create versions unless writes use a serialization protocol.</li>
+  <li>Last-write-wins can select a clock-skewed older business value.</li>
+  <li>A timed-out write may have reached a quorum even though the client sees failure.</li>
+  <li>Membership changes can create disjoint quorums if configurations are changed unsafely.</li>
+  <li>Sloppy placement can remove the expected read-write intersection.</li>
+  <li>Deletes and expired conflict metadata can resurrect state.</li>
+</ul>
+
+<p>
+  Linearizable registers normally need a protocol that orders writes and makes reads discover the
+  latest completed order, such as consensus, a correctly implemented quorum register with versioned
+  write-back, or a leader protected by epochs. Quorum count is one ingredient.
+</p>
+
+<h3 id="failure-tolerance">Failure tolerance</h3>
+<p>
+  With N = 2f + 1 and majority reads or writes, up to f unavailable replicas can be tolerated for
+  that operation. This assumes failures do not take a shared rack or zone containing most replicas.
+  Replica count without independent placement gives false confidence. A three-replica set with two
+  copies in one failed zone might have only one surviving copy.
+</p>
+
+<h2 id="replica-placement"><span class="num">07.</span> Replica placement and topology</h2>
+<p class="lead">
+  Copies should fail independently while remaining close enough to meet latency and cost targets.
+</p>
+
+<p>A placement policy should state:</p>
+<ul>
+  <li>how many replicas belong to each partition;</li>
+  <li>which host, rack, zone, and region combinations are forbidden;</li>
+  <li>whether reads prefer local replicas and when they may cross regions;</li>
+  <li>how much failure capacity remains during maintenance;</li>
+  <li>which residency, encryption-key, and tenant policies constrain placement;</li>
+  <li>how replacement and decommission preserve temporary over-replication.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Placement for N = 3 across three zones</b></figcaption>
+  <pre><code>Region east
+  zone a: P17 replica on node a4
+  zone b: P17 replica on node b8
+  zone c: P17 replica on node c2
+
+Maintenance rule:
+  never drain another P17 replica while one is unavailable
+
+Capacity rule:
+  surviving two zones must handle P17 read, write, repair, and failover load</code></pre>
+</figure>
+
+<h2 id="partitioning"><span class="num">08.</span> Horizontal and vertical partitioning</h2>
+<p class="lead">
+  Partitioning makes a subset independently manageable, but every split introduces operations that
+  no longer fit inside one boundary.
+</p>
+
+<h3 id="horizontal">Horizontal partitioning</h3>
+<p>
+  Rows are divided by a key, such as <code>tenant_id</code>, <code>conversation_id</code>, or a hash
+  of <code>order_id</code>. It scales storage and request throughput when common operations use that
+  key. It makes cross-partition joins, constraints, sorting, and transactions more expensive.
+</p>
+
+<h3 id="vertical">Vertical partitioning</h3>
+<p>
+  Columns or domains are separated. A user profile might keep public display fields in one store,
+  authentication secrets in a highly restricted service, and large avatars in object storage. This
+  can reduce row width, isolate sensitive data, and give components independent lifecycles. It also
+  turns previously local reads and atomic updates into multi-system workflows.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Split</th>
+        <th>Good fit</th>
+        <th>Weakness</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tenant</td>
+        <td>Isolation, residency, tenant-local queries</td>
+        <td>One large tenant can dominate a shard</td>
+      </tr>
+      <tr>
+        <td>Entity ID hash</td>
+        <td>Even point reads and writes</td>
+        <td>Range queries scatter</td>
+      </tr>
+      <tr>
+        <td>Time range</td>
+        <td>Retention, recent-window queries, archival</td>
+        <td>Current range becomes a write hotspot</td>
+      </tr>
+      <tr>
+        <td>Feature or columns</td>
+        <td>Security and independent scaling</td>
+        <td>Cross-boundary reads and consistency</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="range-hash"><span class="num">09.</span> Range, hash, and directory partitioning</h2>
+
+<h3 id="range-partitioning">Range partitioning</h3>
+<p>
+  A partition owns a contiguous interval such as dates 2026-07-01 through 2026-07-31 or customer IDs
+  1000 through 1999. Range scans and pruning are efficient. Boundaries can follow retention or
+  geography. Monotonic keys direct new writes to the highest range, however, creating a hot
+  partition unless ranges are split or the leading key spreads traffic.
+</p>
+
+<h3 id="hash-partitioning">Hash partitioning</h3>
+<figure class="code">
+  <figcaption><b>Fixed-bucket placement</b></figcaption>
+  <pre><code>bucket = stable_hash(partition_key) mod bucket_count
+partition = partition_map[bucket]
+
+Requirements:
+  stable_hash is identical across clients and versions
+  partition_map has an explicit version
+  bucket_count changes only through a migration protocol</code></pre>
+</figure>
+<p>
+  Hashing usually spreads independent keys more evenly, but destroys natural order. A query lacking
+  the partition key may contact every partition. Hashing does not fix a single hot key because every
+  request for that key still selects one logical partition.
+</p>
+
+<h3 id="directory-partitioning">Directory or lookup partitioning</h3>
+<p>
+  A metadata service maps a key or tenant to a shard. It allows intentional placement, fast tenant
+  moves, and exceptions for large tenants. The directory becomes critical infrastructure, so cache
+  entries need versions, updates need atomic publication, and stale routers need redirect or retry
+  behavior.
+</p>
+
+<h2 id="consistent-hashing"><span class="num">10.</span> Consistent hashing and virtual nodes</h2>
+<p class="lead">
+  Consistent hashing limits how many key ranges move when membership changes; it does not remove the
+  need for an authoritative map or safe data transfer.
+</p>
+
+<p>
+  Hash both keys and node tokens into a circular token space. Moving clockwise from a key token
+  finds an owner; following owners can provide replicas. Adding a node takes selected token ranges
+  instead of recomputing every key under a new modulo. Removing a node hands its ranges to
+  successors.
+</p>
+
+<figure class="code">
+  <figcaption><b>Token ring sketch</b></figcaption>
+  <pre><code>                  token 0
+                    |
+             N4 ----+---- N1
+            /                 \
+         key K                   key M
+            \                 /
+             N3 ----------- N2
+
+owner(K) = first assigned token clockwise from hash(K)
+replicas(K) = next distinct eligible failure-domain owners</code></pre>
+</figure>
+
+<p>
+  One token per physical node can produce uneven ownership and large movements. Virtual nodes assign
+  many smaller token ranges to each physical node. They smooth capacity differences and stream from
+  many peers during replacement, but increase metadata, repair pairings, and the number of ranges
+  affected by one machine failure. Modern systems may instead use many fixed logical partitions and
+  place those partitions through a central or consensus-backed map.
+</p>
+
+<h2 id="partition-map"><span class="num">11.</span> Routing and versioned partition maps</h2>
+<p class="lead">
+  Data can be correct on storage nodes and still appear unavailable because routers disagree about
+  ownership.
+</p>
+
+<figure class="code">
+  <figcaption><b>Router behavior with stale metadata</b></figcaption>
+  <pre><code>function route(request):
+    map = local_partition_map
+    target = map.owner(hash(request.partition_key))
+    response = target.send(request, map.version)
+
+    if response is STALE_MAP(new_version, hint):
+        refresh_map_at_least(new_version)
+        retry_once_with_same_idempotency_key(request)
+
+    return response</code></pre>
+</figure>
+
+<p>
+  Common routing models are client-side routing, a stateless proxy, or forwarding by any storage
+  node. Client routing saves a hop but spreads metadata logic into every client. A proxy centralizes
+  it but needs independent scaling. Forwarding simplifies clients but consumes storage-node network
+  capacity and may add unpredictable hops.
+</p>
+
+<p>
+  Maps need monotonically increasing versions or epochs. A destination should reject a request that
+  would write under an obsolete ownership epoch, and it should return enough metadata for the router
+  to refresh. Unbounded redirect loops indicate metadata convergence failure and must be surfaced.
+</p>
+
+<h2 id="indexes-fanout">
+  <span class="num">12.</span> Secondary indexes, fan-out, and cross-shard work
+</h2>
+
+<h3 id="local-index">Local secondary indexes</h3>
+<p>
+  Each shard indexes only its own records. Writes remain local, but a query by an attribute that
+  does not include the shard key must scatter to shards, merge results, and enforce a global limit
+  or sort. Tail latency approaches the slowest required shard, and partial failures need explicit
+  semantics.
+</p>
+
+<h3 id="global-index">Global secondary indexes</h3>
+<p>
+  A global index maps an alternate key, such as <code>customer_email</code>, to record IDs or
+  shards. It avoids scatter but is itself partitioned and replicated. Synchronous index maintenance
+  makes writes more expensive and may require distributed transactions. Asynchronous maintenance
+  permits stale or missing entries and needs reconciliation.
+</p>
+
+<h3 id="scatter-gather">Safe scatter-gather</h3>
+<ul>
+  <li>Set an overall deadline and per-shard concurrency limit.</li>
+  <li>Push filters and local top-K limits down to each shard.</li>
+  <li>Merge using stable sort keys and a deterministic tie-breaker.</li>
+  <li>Use continuation tokens containing map version and per-shard cursors.</li>
+  <li>Define whether missing shards produce an error, partial result, or stale fallback.</li>
+  <li>Prevent one user query from fanning out into unbounded internal requests.</li>
+</ul>
+
+<div class="warn">
+  <strong>Offset pagination breaks across moving shards</strong>
+  <p>
+    Independent writes and moves change shard ordering between pages. Prefer cursor pagination with
+    an immutable sort tuple, such as <code>(created_at, order_id)</code>, and state what consistency
+    snapshot the cursor represents.
+  </p>
+</div>
+
+<h2 id="hotspots"><span class="num">13.</span> Hotspots, skew, and tenant placement</h2>
+<p class="lead">
+  Equal bytes do not imply equal work, and equal request counts do not imply equal cost.
+</p>
+
+<p>Measure at least these distributions per logical partition and physical node:</p>
+<ul>
+  <li>stored bytes, live rows, tombstones, and compaction work;</li>
+  <li>reads, writes, scans, fan-out participation, and bytes transferred;</li>
+  <li>CPU time, disk I/O, cache hit ratio, queue depth, and tail latency;</li>
+  <li>replication lag, repair backlog, hint volume, and migration traffic;</li>
+  <li>top keys and tenants, using privacy-safe sampling and bounded cardinality.</li>
+</ul>
+
+<h3 id="hotspot-corrections">Corrections by hotspot type</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Cause</th>
+        <th>Safer correction</th>
+        <th>Trade-off</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Monotonic leading key</td>
+        <td>Hash prefix, time buckets with sub-buckets, or randomized ID</td>
+        <td>Range reads must merge buckets</td>
+      </tr>
+      <tr>
+        <td>Single celebrity or room key</td>
+        <td>Read cache, replicated materialization, or split derived data</td>
+        <td>Invalidation and merge complexity</td>
+      </tr>
+      <tr>
+        <td>Large tenant</td>
+        <td>Dedicated placement or sub-shard within tenant</td>
+        <td>Special routing and operational policy</td>
+      </tr>
+      <tr>
+        <td>Expensive query class</td>
+        <td>Admission control, precomputation, or workload isolation</td>
+        <td>Freshness or feature limits</td>
+      </tr>
+      <tr>
+        <td>Unequal node capacity</td>
+        <td>Weighted placement and capacity-aware balancing</td>
+        <td>More complex failure calculations</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p>
+  Salting a hot key must preserve a way to find all salts. For write-heavy counters, choose a fixed
+  shard count, update one shard, then sum shards for reads. This raises read cost and only supports
+  invariants that tolerate distributed counter semantics.
+</p>
+
+<h2 id="rebalancing"><span class="num">14.</span> Rebalancing, resharding, and online migration</h2>
+<p class="lead">
+  Moving ownership is a consistency protocol with bulk data transfer, not merely a file copy.
+</p>
+
+<h3 id="migration-state-machine">A safe range-migration state machine</h3>
+<figure class="code">
+  <figcaption><b>Move range R from shard A to shard B</b></figcaption>
+  <pre><code>1. PREPARE(epoch 70)
+   B allocates capacity; A remains authoritative.
+
+2. SNAPSHOT_AND_COPY
+   Copy a consistent snapshot of R to B; record source log position L.
+
+3. CATCH_UP
+   Stream changes after L. Verify checksums and counts by subrange.
+
+4. DUAL_APPLY_OR_FORWARD(epoch 70)
+   Keep B current while A still serves authoritative traffic.
+
+5. CUTOVER(epoch 71)
+   Atomically publish B as owner. A rejects epoch 70 writes and redirects.
+
+6. OBSERVE_AND_REPAIR
+   Compare source and destination; monitor errors, lag, and stale routing.
+
+7. CLEANUP_AFTER_GRACE
+   Delete A's old copy only after rollback window, backups, and map convergence.</code></pre>
+</figure>
+
+<p>
+  Alternative protocols briefly pause writes at cutover or use change-data capture rather than dual
+  writes. A raw application dual write is unsafe because one destination can succeed and the other
+  fail. The migration controller needs durable progress, idempotent steps, retries, and a single
+  ownership epoch.
+</p>
+
+<h3 id="migration-controls">Production controls</h3>
+<ul>
+  <li>Throttle migration below disk, network, compaction, and replica-repair headroom.</li>
+  <li>Limit concurrent moves that share a source, destination, rack, or network path.</li>
+  <li>
+    Pause automatically when customer latency, error rate, or replication lag breaches limits.
+  </li>
+  <li>Validate counts, hashes, sampled records, tombstones, and secondary indexes.</li>
+  <li>Keep old data read-only until the rollback and stale-router window closes.</li>
+  <li>Make cancellation resume-safe; never infer completion only from a missing worker process.</li>
+</ul>
+
+<p>
+  Resharding can amplify I/O because copied data competes with foreground traffic, replication,
+  compaction, and backup. Plan temporary free space for source, destination, logs, and retained old
+  copies. Test rebalancing while a node fails, not only on an idle healthy cluster.
+</p>
+
+<h2 id="identifiers"><span class="num">15.</span> Globally unique identifier strategies</h2>
+<p class="lead">
+  An identifier can provide uniqueness, locality, or approximate order, but each additional meaning
+  changes its failure and privacy properties.
+</p>
+
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>Strength</th>
+        <th>Failure or cost</th>
+        <th>Good fit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Single database sequence</td>
+        <td>Simple uniqueness and total allocation order</td>
+        <td>Central dependency, contention, visible volume</td>
+        <td>One write authority with moderate allocation rate</td>
+      </tr>
+      <tr>
+        <td>Range or hi-lo allocation</td>
+        <td>Clients allocate locally from reserved blocks</td>
+        <td>Gaps, stranded ranges, allocation-service recovery</td>
+        <td>Shards needing numeric IDs without per-ID coordination</td>
+      </tr>
+      <tr>
+        <td>UUIDv4</td>
+        <td>Decentralized, random 122-bit payload</td>
+        <td>Large index, random locality, collision still probabilistic</td>
+        <td>Public opaque IDs and independent writers</td>
+      </tr>
+      <tr>
+        <td>UUIDv7</td>
+        <td>Standard time-ordered layout with random bits</td>
+        <td>Leaks creation time and needs rollback handling</td>
+        <td>Rough time locality when timestamp exposure is acceptable</td>
+      </tr>
+      <tr>
+        <td>Snowflake-style integer</td>
+        <td>Compact, decentralized, roughly time ordered</td>
+        <td>Worker-ID coordination, clock rollback, topology leakage</td>
+        <td>High-rate internal event or entity creation</td>
+      </tr>
+      <tr>
+        <td>Random token</td>
+        <td>Unpredictability with sufficient entropy</td>
+        <td>Longer representation and collision calculation</td>
+        <td>Capability or externally enumerable resource IDs</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="sequence-allocation">Sequence block allocation</h3>
+<figure class="code">
+  <figcaption><b>Hi-lo idea</b></figcaption>
+  <pre><code>allocator atomically reserves block 8301
+worker can issue IDs 8301000 through 8301999 locally
+
+crash after ID 8301042:
+  unused IDs become gaps, but must never be reassigned
+
+Uniqueness requires durable non-overlapping block ownership.
+Gap-free numbering is a different, much more expensive requirement.</code></pre>
+</figure>
+
+<h3 id="snowflake">Snowflake-style bit layout</h3>
+<figure class="code">
+  <figcaption><b>Illustrative layout, not a universal standard</b></figcaption>
+  <pre><code>| time since custom epoch | worker ID | per-tick sequence |
+
+on generate:
+  now = clock_millis()
+  if now &lt; last_time:
+      reject, wait, or use a proved rollback strategy
+  if now == last_time and sequence exhausted:
+      wait for next tick with a deadline
+  persist or safely retain last_time where restart can reuse worker ID</code></pre>
+</figure>
+
+<p>
+  Worker IDs must be unique among simultaneously active generators. A lease without fencing can let
+  an old process and replacement share one ID. Clock rollback can duplicate the same
+  time-worker-sequence tuple. Never silently set a backward clock to the last seen value without
+  proving the sequence space cannot repeat across restart.
+</p>
+
+<h3 id="uuid-variants">UUID choices and ordering leakage</h3>
+<p>
+  RFC 9562 defines UUID formats including random UUIDv4 and Unix-time-based UUIDv7. A UUID is an
+  identifier, not an authorization secret unless it is generated with adequate unpredictability and
+  protected as a capability. Time-ordered IDs can improve some index-locality patterns but reveal
+  approximate creation time and may let observers estimate activity. Sequential IDs additionally
+  enable enumeration and expose rough counts. Use an opaque public ID when those leaks matter.
+</p>
+
+<h2 id="order-design"><span class="num">16.</span> End-to-end sharded order system</h2>
+<p class="lead">
+  The following design is suitable for tenant-local order access with high write volume; it does not
+  pretend that every cross-tenant query is cheap.
+</p>
+
+<h3 id="order-assumptions">Requirements and assumptions</h3>
+<ul>
+  <li>40,000 writes per second at peak and 200,000 point reads per second.</li>
+  <li>Orders average 3 KiB including indexed metadata before replication.</li>
+  <li>Most customer and support reads include <code>tenant_id</code> and <code>order_id</code>.</li>
+  <li>A confirmed order must survive one zone loss; region disaster RPO is under one minute.</li>
+  <li>Per-order state transitions require optimistic version checks.</li>
+  <li>Cross-tenant analytics may be minutes stale and runs from a separate replicated pipeline.</li>
+</ul>
+
+<h3 id="order-capacity">First-pass capacity</h3>
+<figure class="code">
+  <figcaption><b>Approximate daily storage and shard load</b></figcaption>
+  <pre><code>40,000 writes/s * 86,400 s/day * 3 KiB = about 9.9 TiB/day logical at peak all day
+
+If measured peak-to-average ratio is 4:
+  average raw growth is about 2.5 TiB/day
+
+With replication factor 3:
+  about 7.5 TiB/day before indexes, logs, compaction, and backups
+
+With 128 logical partitions:
+  ideal peak average per partition = 312.5 writes/s
+  provision above p99 partition load, not ideal average</code></pre>
+</figure>
+
+<h3 id="order-layout">Keys and placement</h3>
+<ul>
+  <li>
+    Partition key: stable hash of <code>(tenant_id, order_id)</code> into 128 logical partitions.
+  </li>
+  <li>Directory: versioned map from logical partition to one three-zone replica group.</li>
+  <li>Replication: one leader and two followers per group, synchronously durable in two zones.</li>
+  <li>
+    ID: UUIDv7 or a fenced generator, plus tenant ID in authorization context, not inferred from ID.
+  </li>
+  <li>
+    Customer history: a separate tenant-bucketed index, maintained through a durable event log.
+  </li>
+  <li>Analytics: asynchronous export, so broad scans do not overload transactional shards.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><b>Create-order flow</b></figcaption>
+  <pre><code>Client
+  | POST order with tenant credential and idempotency key
+  v
+API gateway -&gt; authenticate, rate limit, bind tenant context
+  v
+Order router -&gt; hash tenant_id + order_id, read map epoch 71
+  v
+P17 leader -&gt; check idempotency and expected state
+  |          append order + outbox in one local transaction
+  |          replicate durably to second zone
+  v
+Client receives order ID, committed version, and partition epoch
+
+Async indexer consumes outbox and updates customer-history view.
+Reconciler checks source orders against derived index.</code></pre>
+</figure>
+
+<h3 id="order-replica-failure">Replica failure behavior</h3>
+<p>
+  If one follower fails, the leader and other follower can still satisfy the two-zone
+  acknowledgement rule, but the group has no further fault margin. Alert on under-replication,
+  reserve recovery bandwidth, and block planned maintenance for that group. Reads requiring
+  read-your-writes use the leader or an applied-position check. Stale-tolerant reads can use
+  followers within a lag budget.
+</p>
+
+<h3 id="order-network-partition">Network partition behavior</h3>
+<p>
+  A minority side cannot elect or remain an authorized leader. The majority side increments the
+  group epoch and continues if its placement and durability policy are satisfied. The isolated old
+  leader must be fenced from durable storage or reject writes after losing its authority lease. When
+  connectivity returns, it rejoins as a follower from a known log point or receives a new snapshot.
+</p>
+
+<h3 id="ambiguous-write">Ambiguous client timeout</h3>
+<figure class="code">
+  <figcaption><b>Timeout after commit</b></figcaption>
+  <pre><code>Client       Leader       Follower
+  | request    |             |
+  |-----------&gt;| commit v12  |
+  |            |-------------&gt;| durable ack
+  |            | success     |
+  X response lost
+
+Retry with same idempotency key:
+  leader returns recorded result for v12
+
+Retry with a new key:
+  could create a duplicate order</code></pre>
+</figure>
+
+<h3 id="order-reshard">Online partition split</h3>
+<p>
+  If P17 is hot, split its hash interval into P17a and P17b rather than increasing the global
+  modulo. Copy and catch up P17b to a new replica group, cut over with a new map epoch, and keep
+  redirects on the source. Customer-history indexes store record IDs and use the current directory,
+  avoiding a rewrite of every index entry when physical ownership changes.
+</p>
+
+<h2 id="production"><span class="num">17.</span> Production deployment and operations</h2>
+
+<h3 id="deployment">Deployment rules</h3>
+<ul>
+  <li>Roll one replica per group at a time and prove quorum headroom before each drain.</li>
+  <li>
+    Use readiness checks for log catch-up and serving eligibility, not process existence alone.
+  </li>
+  <li>Keep replication protocol and on-disk format compatibility through mixed-version rollout.</li>
+  <li>Canary both storage nodes and routers because stale routing has different failure modes.</li>
+  <li>Freeze balancing during risky schema changes, incident response, or constrained capacity.</li>
+  <li>
+    Restore backups into isolation and verify application-level records, not only file checksums.
+  </li>
+</ul>
+
+<h3 id="observability">Observability</h3>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Signals</th>
+        <th>Diagnostic question</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Replication</td>
+        <td>lag bytes/time, apply rate, log retention, under-replicated groups</td>
+        <td>Is data received but not applied, or not received?</td>
+      </tr>
+      <tr>
+        <td>Quorum</td>
+        <td>responses by consistency level, unavailable, timeout, conflict rate</td>
+        <td>Which replica or domain prevents enough evidence?</td>
+      </tr>
+      <tr>
+        <td>Distribution</td>
+        <td>bytes, QPS, CPU, disk, p99 latency by partition and tenant</td>
+        <td>Is imbalance caused by data, traffic, or request cost?</td>
+      </tr>
+      <tr>
+        <td>Repair</td>
+        <td>hint age, replay rate, repair coverage, mismatched ranges</td>
+        <td>Can replicas converge before tombstones expire?</td>
+      </tr>
+      <tr>
+        <td>Migration</td>
+        <td>bytes copied, catch-up lag, checksum failures, stale-map redirects</td>
+        <td>Is cutover safe and have routers converged?</td>
+      </tr>
+      <tr>
+        <td>IDs</td>
+        <td>worker lease conflicts, clock rollback, sequence exhaustion, collisions</td>
+        <td>Can two generators issue the same bit tuple?</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="troubleshooting">Troubleshooting playbook</h3>
+<ol>
+  <li>Classify impact by tenants, partitions, regions, operations, and consistency levels.</li>
+  <li>
+    Capture map epoch, replication group, coordinator, and operation ID from a failing request.
+  </li>
+  <li>Compare leader log position with each replica's received, durable, and applied position.</li>
+  <li>Check whether latency comes from quorum wait, disk queue, network, repair, or migration.</li>
+  <li>Pause rebalancing and expensive repairs if they amplify foreground impact.</li>
+  <li>
+    Restore quorum by recovering the safest current member, not simply the fastest-to-start copy.
+  </li>
+  <li>Reconcile ambiguous writes through operation IDs and authoritative logs.</li>
+  <li>
+    After mitigation, validate convergence and restore fault margin before closing the incident.
+  </li>
+</ol>
+
+<h2 id="security"><span class="num">18.</span> Security, privacy, abuse, and trust boundaries</h2>
+<p class="lead">
+  Replication multiplies sensitive copies, and routing metadata can become an authorization hazard.
+</p>
+
+<ul>
+  <li>
+    Authenticate and mutually authorize replication peers. Network reachability alone must not grant
+    permission to stream or replace data.
+  </li>
+  <li>
+    Encrypt transport and storage, rotate credentials, and scope keys by environment, region, or
+    tenant where the threat model requires it.
+  </li>
+  <li>
+    Derive tenant authorization from verified identity, then compare it with the record. Never trust
+    a user-provided shard or tenant routing hint as authorization.
+  </li>
+  <li>
+    Protect partition maps, repair commands, snapshot endpoints, and rebalancing controls as
+    privileged control-plane operations with audited changes.
+  </li>
+  <li>
+    Apply deletion and retention to replicas, hints, logs, indexes, snapshots, backups, and
+    migration leftovers. Track proof of completion under applicable policy.
+  </li>
+  <li>
+    Keep regional replicas and temporary migration copies inside residency boundaries. A short-lived
+    copy is still a data transfer.
+  </li>
+  <li>
+    Rate-limit fan-out and expensive consistency levels. Attackers can turn one public request into
+    work on every shard or replica.
+  </li>
+</ul>
+
+<p>
+  Sequential and time-based IDs reveal information. Do not expose internal shard numbers, worker
+  IDs, region codes, exact creation times, or business volume unless intended. An unguessable ID
+  reduces enumeration but does not replace object-level authorization.
+</p>
+
+<h2 id="performance"><span class="num">19.</span> Performance, scalability, and cost</h2>
+
+<h3 id="write-cost">Write cost</h3>
+<p>
+  A logical write may cause N replica writes, log I/O, secondary index writes, compaction, change
+  capture, backup traffic, and later repair. The client latency is set by the required
+  acknowledgement path, while total resource cost includes every asynchronous copy. Batching
+  improves throughput but increases queueing delay and the amount retried after failure.
+</p>
+
+<h3 id="tail-latency">Tail latency</h3>
+<p>
+  Waiting for all replicas makes latency track the slowest. Waiting for a quorum tracks an order
+  statistic, such as the second-fastest of three, but only if stragglers are cancelled or safely
+  ignored. Scatter-gather across many shards makes at least one slow response increasingly likely.
+  Measure complete operation percentiles, not average per-node latency.
+</p>
+
+<h3 id="capacity-headroom">Failure and maintenance headroom</h3>
+<p>
+  Size normal operation so a failed domain's traffic can move without saturating survivors. Include
+  log catch-up, hint replay, repair, rebuild, and reshard traffic in the failure model. A cluster at
+  70 percent disk throughput may have no safe headroom when one of three zones disappears and the
+  other two absorb its work.
+</p>
+
+<h3 id="cost-model">Cost model</h3>
+<figure class="code">
+  <figcaption><b>Useful first-order model</b></figcaption>
+  <pre><code>stored bytes = logical bytes * replication factor
+             + indexes + retained logs + tombstones + migration overlap
+
+network bytes = replication + repair + cross-region reads
+              + backups + rebalancing + client traffic
+
+operating cost = steady resources + failure headroom
+               + control plane + on-call and migration complexity</code></pre>
+</figure>
+
+<h2 id="failures"><span class="num">20.</span> Failure scenarios and safer responses</h2>
+<div class="tbl">
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>Unsafe reaction</th>
+        <th>Safer response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Leader unreachable from one zone</td>
+        <td>Promote a leader on every side</td>
+        <td>Allow only an authorized quorum side and fence the old epoch</td>
+      </tr>
+      <tr>
+        <td>Follower lag grows</td>
+        <td>Keep sending freshness-sensitive reads</td>
+        <td>Remove from that read class, diagnose receive versus apply lag</td>
+      </tr>
+      <tr>
+        <td>Quorum write times out</td>
+        <td>Retry with a new operation ID</td>
+        <td>Retry idempotently or query outcome by original ID</td>
+      </tr>
+      <tr>
+        <td>Returning replica has old values</td>
+        <td>Trust its process health</td>
+        <td>Keep non-serving until catch-up and repair prove consistency</td>
+      </tr>
+      <tr>
+        <td>Hot partition</td>
+        <td>Add replicas expecting writes to spread</td>
+        <td>Split write ownership or change key design if semantics allow</td>
+      </tr>
+      <tr>
+        <td>Stale partition map</td>
+        <td>Accept write at old owner</td>
+        <td>Reject stale epoch, refresh, and retry idempotently</td>
+      </tr>
+      <tr>
+        <td>Migration interrupted</td>
+        <td>Delete source because copy started</td>
+        <td>Resume durable phase state; source remains authority until cutover</td>
+      </tr>
+      <tr>
+        <td>Clock moves backward on ID worker</td>
+        <td>Continue with reset sequence</td>
+        <td>Stop, wait safely, or use a proved logical-time fallback</td>
+      </tr>
+      <tr>
+        <td>Repair after tombstone expiry</td>
+        <td>Merge old value as live</td>
+        <td>Keep repair interval below retention and replace stale nodes safely</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 id="mistakes"><span class="num">21.</span> Common mistakes and corrections</h2>
+<ul>
+  <li>
+    <strong>Mistake:</strong> "Three replicas means no data loss."
+    <strong>Correction:</strong> define acknowledgement durability, failure-domain placement, and
+    failover position.
+  </li>
+  <li>
+    <strong>Mistake:</strong> treating read replicas as always current. <strong>Correction:</strong>
+    expose lag and route by the operation's freshness requirement.
+  </li>
+  <li>
+    <strong>Mistake:</strong> last-write-wins by wall clock for payments.
+    <strong>Correction:</strong>
+    use idempotent state transitions, versions, and an authoritative order.
+  </li>
+  <li>
+    <strong>Mistake:</strong> quoting R + W greater than N as proof of strong consistency.
+    <strong>Correction:</strong> state membership, versioning, read selection, concurrent-write, and
+    repair behavior.
+  </li>
+  <li>
+    <strong>Mistake:</strong> sharding before measuring one-node limits.
+    <strong>Correction:</strong>
+    first optimize data model and indexes, then shard for demonstrated scale or isolation needs.
+  </li>
+  <li>
+    <strong>Mistake:</strong> choosing a shard key only for even storage.
+    <strong>Correction:</strong>
+    include request rate, request cost, locality, fan-out, and future growth.
+  </li>
+  <li>
+    <strong>Mistake:</strong> changing <code>hash(key) mod N</code> when adding a node.
+    <strong>Correction:</strong> use stable logical partitions or consistent hashing plus controlled
+    migration.
+  </li>
+  <li>
+    <strong>Mistake:</strong> deleting source data immediately after cutover.
+    <strong>Correction:</strong>
+    retain it through map convergence, verification, and rollback grace.
+  </li>
+  <li>
+    <strong>Mistake:</strong> assuming globally unique means globally ordered.
+    <strong>Correction:</strong> define uniqueness and ordering separately.
+  </li>
+</ul>
+
+<h2 id="testing"><span class="num">22.</span> Testing strategy</h2>
+
+<h3 id="unit-property-tests">Unit and property tests</h3>
+<ul>
+  <li>Partition function is deterministic across supported versions and languages.</li>
+  <li>Every key maps to exactly one active logical owner for a given epoch.</li>
+  <li>Replica placement never repeats a forbidden failure domain.</li>
+  <li>Conflict merge is deterministic, idempotent, and order-independent where required.</li>
+  <li>ID generator does not duplicate across sequence exhaustion, restart, and clock rollback.</li>
+  <li>Quorum calculator handles unavailable, delayed, duplicate, and stale responses.</li>
+</ul>
+
+<h3 id="integration-tests">Integration and compatibility tests</h3>
+<ul>
+  <li>Bootstrap from snapshot plus log while writes continue.</li>
+  <li>Read-your-writes token waits for apply position and respects a deadline.</li>
+  <li>Mixed-version routers interpret map epochs and hash encodings identically.</li>
+  <li>Schema changes replay on old and new replicas through a rolling upgrade.</li>
+  <li>Secondary index reconciliation repairs lost, duplicate, and stale entries.</li>
+  <li>Tenant authorization remains enforced through redirects and forwarded requests.</li>
+</ul>
+
+<h3 id="fault-tests">Fault, partition, and recovery tests</h3>
+<ul>
+  <li>Kill leader before local flush, after local flush, and after each remote acknowledgement.</li>
+  <li>
+    Partition leader from clients, followers, or only one zone; verify exactly one write authority.
+  </li>
+  <li>Delay one replica without failing it to reveal tail-latency and queue effects.</li>
+  <li>Expire hints, withhold reads, and prove anti-entropy repairs a cold key.</li>
+  <li>Crash every migration phase and prove restart reaches a safe state.</li>
+  <li>Restore an old snapshot and verify it cannot serve until log catch-up and fencing.</li>
+</ul>
+
+<h3 id="load-tests">Load and capacity tests</h3>
+<ul>
+  <li>Use realistic key popularity, tenant skew, read-write ratio, payloads, and fan-out.</li>
+  <li>Measure healthy load, one-zone load, rebuild load, and migration load.</li>
+  <li>Run a soak test long enough to expose compaction, log retention, and repair interaction.</li>
+  <li>Test hot-key limits separately because uniform generators conceal them.</li>
+  <li>
+    Verify throttles protect foreground SLOs and that pausing migration actually reduces work.
+  </li>
+</ul>
+
+<h2 id="exercises"><span class="num">23.</span> Hands-on exercises and scenarios</h2>
+
+<h3>Exercise 1: Quorum history</h3>
+<p>
+  Model N = 3, R = 2, W = 2. Delay replica C, time out a write after A and C persist it, then read A
+  and B. Explain why the client cannot assume the write failed and how version comparison returns
+  the newest state. Expected reasoning: timeout is ambiguous; the read set intersects the persisted
+  write set at A; idempotency prevents duplicate effects.
+</p>
+
+<h3>Exercise 2: Select a chat partition key</h3>
+<p>
+  Compare <code>user_id</code>, <code>conversation_id</code>, and <code>message_id</code>. Expected
+  reasoning: conversation ID preserves ordered room reads and participant fan-out, but a huge public
+  room is hot. Add time or sequence sub-buckets only with an ordered merge plan.
+</p>
+
+<h3>Exercise 3: Failover drill</h3>
+<p>
+  Disconnect the leader from two followers but leave it reachable to some clients. Expected
+  reasoning: the isolated leader must lose authority, the majority chooses a new epoch, stale writes
+  are rejected, and the old node returns through catch-up rather than immediate service.
+</p>
+
+<h3>Exercise 4: Online range move</h3>
+<p>
+  Implement an in-memory source, destination, change log, and versioned router. Inject a crash at
+  each migration phase. Expected result: each restart resumes idempotently, one epoch has one owner,
+  and no acknowledged record disappears.
+</p>
+
+<h3>Exercise 5: ID risk review</h3>
+<p>
+  Choose IDs for public orders and internal events. Expected reasoning: opaque random or suitable
+  UUID for public enumeration resistance, time-oriented ID only when ordering and leakage are
+  acceptable, and authorization independent of both.
+</p>
+
+<h3>Exercise 6: Capacity under zone loss</h3>
+<p>
+  Given three zones at 45 percent CPU each, estimate surviving load when one zone fails and repair
+  begins. Expected reasoning: remaining zones receive about 1.5 times foreground share before repair
+  overhead, so validate CPU, disk, connection, and network headroom under the combined workload.
+</p>
+
+<h2 id="interview"><span class="num">24.</span> Interview questions and detailed model answers</h2>
+
+<h3>1. What is the difference between replication and partitioning?</h3>
+<p>
+  Partitioning divides the dataset so different subsets can scale or be managed independently.
+  Replication copies a subset so it survives failures or serves more reads. A sharded database
+  usually combines both: each shard owns part of the key space and each shard has several replicas.
+</p>
+<p><strong>Follow-up:</strong> Why can adding replicas fail to increase write throughput?</p>
+<p>
+  Every write may still pass through one leader and be copied to more nodes. Scaling write ownership
+  generally requires additional partitions, while replicas add durability or read capacity.
+</p>
+
+<h3>2. Compare leader-follower, multi-leader, and leaderless replication.</h3>
+<p>
+  Leader-follower simplifies write ordering but leader availability and failover matter.
+  Multi-leader supports local writes in several sites but needs conflict avoidance or merge.
+  Leaderless sends to multiple replicas and uses quorum plus reconciliation, improving some failure
+  behavior while adding version and repair complexity. The workload's invariants and partition
+  tolerance select among them.
+</p>
+<p><strong>Follow-up:</strong> Which would you choose for bank balances?</p>
+<p>
+  Prefer one serialized authority per account or a transactional consensus-backed design.
+  Uncoordinated last-write-wins replicas are inappropriate for preserving a balance invariant.
+</p>
+
+<h3>3. What does synchronous replication guarantee?</h3>
+<p>
+  Only what its acknowledgement point defines. It may wait for remote receipt, durable log flush, or
+  apply. Ask how many replicas, which failure domains, and what happens when they are unavailable.
+  Synchronous replication improves durability but increases latency and can reduce write
+  availability.
+</p>
+
+<h3>4. Explain R + W greater than N.</h3>
+<p>
+  It makes every read set intersect every completed write set under one stable designated replica
+  set. The reader can then encounter at least one replica with the write. Correctness still depends
+  on durable acknowledgements, version comparison, membership, concurrent writes, deletes, and
+  repair. It is not a one-line proof of linearizability.
+</p>
+<p><strong>Follow-up:</strong> What changes with sloppy quorum?</p>
+<p>
+  Fallback nodes may not belong to the normal preference list, so read and write sets can be
+  disjoint during a partition. Hinted handoff and repair restore convergence later.
+</p>
+
+<h3>5. What is replication lag and how do you measure it?</h3>
+<p>
+  It is the distance from source state to a replica. Track received, durable, and applied log
+  positions, byte backlog, estimated time lag, and apply throughput. Time-only lag can look small
+  during no traffic; byte-only lag does not show user-visible age.
+</p>
+
+<h3>6. Why is last-write-wins risky?</h3>
+<p>
+  "Last" is often selected by a wall clock that can skew or move backward. A later timestamp can
+  overwrite a causally newer or independently valid update. It also hides conflicts instead of
+  resolving their business meaning. Use causal metadata and domain merge rules when losing a version
+  is unacceptable.
+</p>
+
+<h3>7. Compare range and hash partitioning.</h3>
+<p>
+  Range partitioning preserves order and allows pruning but monotonic inserts can hotspot. Hash
+  partitioning spreads keys but turns range queries into scatter-gather. Choose from access
+  patterns, not only evenness, and state how rebalancing changes ownership.
+</p>
+
+<h3>8. What problem does consistent hashing solve?</h3>
+<p>
+  It reduces remapping when membership changes compared with a direct modulo by node count. Virtual
+  nodes improve distribution granularity. It does not solve hot keys, durability, safe transfer,
+  membership agreement, or routing authorization.
+</p>
+
+<h3>9. How do you choose a shard key?</h3>
+<p>
+  Start from dominant reads, writes, invariants, and locality. Estimate key cardinality, data and
+  traffic skew, growth, hot tenants, range-query needs, fan-out, and move cost. A good key keeps
+  common atomic work local and spreads the constrained resource. Validate it with production-like
+  distributions.
+</p>
+
+<h3>10. How do secondary indexes work in a sharded system?</h3>
+<p>
+  A local index exists on each shard and requires scatter for queries missing the shard key. A
+  global index is another distributed mapping that avoids scatter but adds write consistency and
+  recovery work. State whether updates are transactional or asynchronous and how stale entries are
+  reconciled.
+</p>
+
+<h3>11. How do you move a shard online?</h3>
+<p>
+  Copy a consistent snapshot, stream changes after its checkpoint, verify destination catch-up, then
+  atomically publish a new ownership epoch. Reject stale writes, retain redirects, validate hashes,
+  and delete the old copy only after a rollback grace period. Every phase needs durable idempotent
+  progress.
+</p>
+
+<h3>12. What is read repair versus anti-entropy?</h3>
+<p>
+  Read repair fixes differing replicas discovered on a client read, sometimes before responding.
+  Anti-entropy scans and compares ranges in the background, so it covers cold data. Hints replay
+  missed writes after short outages but are best effort. A robust eventually consistent system needs
+  a repair plan independent of normal reads.
+</p>
+
+<h3>13. How would you handle one very large tenant?</h3>
+<p>
+  Detect it before saturation, then use dedicated placement or sub-shard the tenant by another
+  stable key. Preserve tenant-local authorization and query planning. Do not apply special routing
+  invisibly without map versioning, capacity reservation, and a move-back procedure.
+</p>
+
+<h3>14. Compare sequence, UUIDv4, UUIDv7, and Snowflake-style IDs.</h3>
+<p>
+  A sequence is simple and ordered but centralized. UUIDv4 is decentralized and random but wider and
+  less index-local. UUIDv7 is standardized and time-oriented but leaks time and needs correct clock
+  handling. Snowflake-style integers are compact and roughly ordered but require unique worker IDs,
+  sequence limits, and clock-rollback safety. None substitutes for authorization.
+</p>
+
+<h3>15. How does a network partition affect the order design?</h3>
+<p>
+  Only the side with authority for the latest epoch may accept writes. A minority refuses writes
+  rather than create two leaders. The majority can continue if it still satisfies durability
+  placement. Clients retry with idempotency keys because lost responses make outcomes ambiguous.
+  Recovery fences and catches up the old side before serving.
+</p>
+
+<h3>16. When should you not shard?</h3>
+<p>
+  Do not shard when one well-designed store meets measured capacity, reliability, and isolation
+  needs. Sharding adds routing, rebalancing, distributed query, testing, and on-call costs. Vertical
+  scaling, indexes, caching, archival, read replicas, or workload isolation may solve the actual
+  constraint first.
+</p>
+
+<h2 id="cheat-sheet"><span class="num">25.</span> Revision cheat sheet</h2>
+<ul>
+  <li>Partitioning chooses the subset; replication preserves copies; quorum chooses evidence.</li>
+  <li>Replicas are not backups. Replication also copies mistakes.</li>
+  <li>
+    An acknowledgement must name its memory, disk, apply, replica, and failure-domain boundary.
+  </li>
+  <li>
+    Leader-follower orders writes; multi-leader merges; leaderless reconciles replica versions.
+  </li>
+  <li>Lag has received, durable, applied, byte, and time dimensions.</li>
+  <li>Failover needs authority epochs and fencing, not failure suspicion alone.</li>
+  <li>R + W greater than N gives intersection under assumptions, not automatic linearizability.</li>
+  <li>Sloppy quorum improves availability but can remove normal read-write intersection.</li>
+  <li>Read repair covers read keys; anti-entropy covers cold ranges; hints cover short outages.</li>
+  <li>
+    Range partitioning helps scans; hash partitioning helps spread; directory maps help exceptions.
+  </li>
+  <li>Consistent hashing limits remapping but does not move data safely by itself.</li>
+  <li>
+    A hot key stays hot under hashing. Split its work or materialize reads when semantics allow.
+  </li>
+  <li>Global indexes avoid scatter but create another consistency and repair problem.</li>
+  <li>Online moves need snapshot, catch-up, epoch cutover, verification, grace, and cleanup.</li>
+  <li>Unique, ordered, opaque, and unguessable are different ID properties.</li>
+  <li>Test zone loss together with repair and migration load, not only isolated node crashes.</li>
+</ul>
+
+<h2 id="references"><span class="num">26.</span> Current primary official references</h2>
+<ul>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/warm-standby.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL documentation: Log-Shipping Standby Servers</a
+    >
+    - streaming, synchronous replication, standby operation, and failover foundations.
+  </li>
+  <li>
+    <a
+      href="https://www.postgresql.org/docs/current/ddl-partitioning.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >PostgreSQL documentation: Table Partitioning</a
+    >
+    - range, list, hash partitioning, pruning, maintenance, and partition-count trade-offs.
+  </li>
+  <li>
+    <a
+      href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Apache Cassandra documentation: Dynamo architecture</a
+    >
+    - consistent hashing, virtual nodes, replication, read repair, hints, and anti-entropy.
+  </li>
+  <li>
+    <a
+      href="https://cassandra.apache.org/doc/stable/cassandra/managing/operating/hints.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Apache Cassandra documentation: Hints</a
+    >
+    - hinted handoff lifecycle, retention, replay, and best-effort limitations.
+  </li>
+  <li>
+    <a
+      href="https://cassandra.apache.org/doc/latest/cassandra/managing/operating/repair.html"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Apache Cassandra documentation: Repair</a
+    >
+    - Merkle-tree comparison and full or incremental anti-entropy repair.
+  </li>
+  <li>
+    <a
+      href="https://www.mongodb.com/docs/manual/core/sharding-distribute-collection-data/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >MongoDB documentation: Distribute Collection Data</a
+    >
+    - ranged and hashed sharding and distribution behavior.
+  </li>
+  <li>
+    <a
+      href="https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/"
+      target="_blank"
+      rel="noopener noreferrer"
+      >MongoDB documentation: Sharded Cluster Balancer</a
+    >
+    - range migration, balancing thresholds, operational impact, zones, and capacity monitoring.
+  </li>
+  <li>
+    <a
+      href="https://www.amazon.science/publications/dynamo-amazons-highly-available-key-value-store"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Amazon Science: Dynamo, Amazon's Highly Available Key-value Store</a
+    >
+    - primary paper for consistent hashing, object versioning, sloppy quorum, hints, and
+    reconciliation.
+  </li>
+  <li>
+    <a href="https://www.rfc-editor.org/rfc/rfc9562.html" target="_blank" rel="noopener noreferrer"
+      >RFC 9562: Universally Unique IDentifiers</a
+    >
+    - current UUID layouts, generation requirements, collision discussion, and security
+    considerations.
+  </li>
+  <li>
+    <a
+      href="https://docs.cloud.google.com/spanner/docs/schema-design"
+      target="_blank"
+      rel="noopener noreferrer"
+      >Google Cloud Spanner documentation: Schema design best practices</a
+    >
+    - primary-key distribution, monotonic-key hotspots, UUID choices, and hash techniques.
+  </li>
+</ul>
+
+<footer class="doc-footer">
+  Last reviewed · July 2026 · part of <strong>knowledge-base</strong>
+</footer>
